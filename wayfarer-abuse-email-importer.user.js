@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Abuse Email Importer
 // @namespace    https://wayfarer.nianticlabs.com/new
-// @version      4.0.1
+// @version      4.1.0
 // @description  Imports Niantic Wayfarer/Spatial/OPR emails -- including Niantic Support "Reporting Abuse" tickets -- directly from Gmail via OAuth, or from .eml files -- using a port of bilde2910/OPR-Tools' email parser, and stores them for the Spatial Nominations Panel script (and other consumers) to search.
 // @author       you
 // @match        https://wayfarer.nianticlabs.com/new/mapview*
@@ -39,6 +39,16 @@
  * otherwise likely block a page-context request to googleapis.com. This
  * shouldn't change anything about the .eml/backup features below; @require'd
  * scripts and this script still share one execution context either way.
+ *
+ * v4.1.0 CHANGE FROM v4.0.0: this no longer has its own floating "Import
+ * Emails" button. Same move the Abuse Report Extractor script made in its
+ * own v1.1.0 -- the panel now opens via an "Import Abuse Report Emails"
+ * link injected into Map Mods - Base's side panel settings section
+ * (".wfmapmods-settings-links"), found the same debounced-MutationObserver
+ * way. The panel itself (Gmail connect, .eml dropzone, backup/maintenance)
+ * is unchanged -- only how it's opened changed, plus the existing Close
+ * button is now the only way to dismiss it since there's no toggle button
+ * to click a second time.
  *
  * v4 CHANGES FROM v3:
  *   - support@nianticlabs.com added to SUPPORTED_SENDERS, so Gmail sync now
@@ -115,15 +125,8 @@
   const CONCURRENCY = 5;
 
   const STYLE = `
-    #wei-btn{
-      position:fixed; bottom:20px; right:20px; z-index:9999;
-      background:#0a0e0c; color:#00e08a; border:1px solid #00e08a;
-      font-family:monospace; font-size:13px; padding:10px 16px; border-radius:6px;
-      cursor:pointer; box-shadow:0 4px 12px rgba(0,0,0,.4);
-    }
-    #wei-btn:hover{ background:#10160f; }
     #wei-panel{
-      position:fixed; bottom:70px; right:20px; z-index:9999;
+      position:fixed; bottom:20px; right:20px; z-index:9999;
       background:#0a0e0c; color:#d7f5e6; border:1px solid #223026; border-radius:8px;
       font-family:monospace; font-size:12.5px; padding:16px; width:420px; max-height:75vh;
       overflow-y:auto; box-shadow:0 8px 24px rgba(0,0,0,.5); display:none;
@@ -316,17 +319,51 @@
   // UI
   // ---------------------------------------------------------------------
 
-  function injectUI() {
-    if (document.getElementById('wei-btn')) return;
+  function loadAutoSyncSettings() {
+    return {
+      enabled: localStorage.getItem(AUTOSYNC_ENABLED_KEY) === 'true',
+      intervalMin: Number(localStorage.getItem(AUTOSYNC_INTERVAL_KEY)) || 15,
+    };
+  }
+  function saveAutoSyncSettings(enabled, intervalMin) {
+    localStorage.setItem(AUTOSYNC_ENABLED_KEY, String(enabled));
+    localStorage.setItem(AUTOSYNC_INTERVAL_KEY, String(intervalMin));
+  }
+
+  async function refreshCount() {
+    const countEl = document.getElementById('wei-count');
+    if (!countEl) return;
+    try {
+      const n = await WSTStorage.countEmails();
+      countEl.textContent = `${n} email(s) stored. Open the Spatial Nominations Panel to search them.`;
+    } catch (e) {
+      countEl.textContent = 'Could not read the email store.';
+    }
+  }
+
+  function updateGmailStatus() {
+    const gmailStatusEl = document.getElementById('wei-gmail-status');
+    if (!gmailStatusEl) return;
+    const lastSync = localStorage.getItem(LAST_SYNC_KEY);
+    const auto = loadAutoSyncSettings();
+    const autoSuffix = auto.enabled ? ` Auto-sync: every ${auto.intervalMin} min.` : '';
+    if (accessToken) {
+      gmailStatusEl.textContent = (lastSync
+        ? `Connected. Last synced ${new Date(Number(lastSync)).toLocaleString()}.`
+        : 'Connected. Never synced yet.') + autoSuffix;
+    } else {
+      gmailStatusEl.textContent = (lastSync
+        ? `Not connected this session. Last synced ${new Date(Number(lastSync)).toLocaleString()}.`
+        : 'Not connected.') + autoSuffix;
+    }
+  }
+
+  function buildPanel() {
+    if (document.getElementById('wei-panel')) return;
 
     const style = document.createElement('style');
     style.textContent = STYLE;
     document.head.appendChild(style);
-
-    const btn = document.createElement('button');
-    btn.id = 'wei-btn';
-    btn.textContent = '📥 Import Emails';
-    document.body.appendChild(btn);
 
     const panel = document.createElement('div');
     panel.id = 'wei-panel';
@@ -372,9 +409,7 @@
     const fileInput = panel.querySelector('#wei-file-input');
     const backupInput = panel.querySelector('#wei-backup-input');
     const logEl = panel.querySelector('#wei-log');
-    const countEl = panel.querySelector('#wei-count');
     const clientIdInput = panel.querySelector('#wei-client-id');
-    const gmailStatusEl = panel.querySelector('#wei-gmail-status');
     const progressEl = panel.querySelector('#wei-progress');
     const syncBtn = panel.querySelector('#wei-sync');
     const fullResyncBtn = panel.querySelector('#wei-full-resync');
@@ -384,35 +419,11 @@
       localStorage.setItem(CLIENT_ID_KEY, clientIdInput.value.trim());
     });
 
-    function updateGmailStatus() {
-      const lastSync = localStorage.getItem(LAST_SYNC_KEY);
-      const auto = loadAutoSyncSettings();
-      const autoSuffix = auto.enabled ? ` Auto-sync: every ${auto.intervalMin} min.` : '';
-      if (accessToken) {
-        gmailStatusEl.textContent = (lastSync
-          ? `Connected. Last synced ${new Date(Number(lastSync)).toLocaleString()}.`
-          : 'Connected. Never synced yet.') + autoSuffix;
-      } else {
-        gmailStatusEl.textContent = (lastSync
-          ? `Not connected this session. Last synced ${new Date(Number(lastSync)).toLocaleString()}.`
-          : 'Not connected.') + autoSuffix;
-      }
-    }
-
     function log(msg, cls) {
       const div = document.createElement('div');
       div.className = cls || '';
       div.textContent = msg;
       logEl.prepend(div);
-    }
-
-    async function refreshCount() {
-      try {
-        const n = await WSTStorage.countEmails();
-        countEl.textContent = `${n} email(s) stored. Open the Spatial Nominations Panel to search them.`;
-      } catch (e) {
-        countEl.textContent = 'Could not read the email store.';
-      }
     }
 
     // ---- .eml import (unchanged from v2) ----
@@ -595,17 +606,6 @@
     const autoSyncToggle = panel.querySelector('#wei-autosync-toggle');
     const autoSyncInterval = panel.querySelector('#wei-autosync-interval');
 
-    function loadAutoSyncSettings() {
-      return {
-        enabled: localStorage.getItem(AUTOSYNC_ENABLED_KEY) === 'true',
-        intervalMin: Number(localStorage.getItem(AUTOSYNC_INTERVAL_KEY)) || 15,
-      };
-    }
-    function saveAutoSyncSettings(enabled, intervalMin) {
-      localStorage.setItem(AUTOSYNC_ENABLED_KEY, String(enabled));
-      localStorage.setItem(AUTOSYNC_INTERVAL_KEY, String(intervalMin));
-    }
-
     function stopAutoSync() {
       if (autoSyncTimer) { clearInterval(autoSyncTimer); autoSyncTimer = null; }
     }
@@ -689,13 +689,16 @@
     });
 
     panel.querySelector('#wei-close').addEventListener('click', () => panel.classList.remove('open'));
-    btn.addEventListener('click', () => {
-      panel.classList.toggle('open');
-      if (panel.classList.contains('open')) { refreshCount(); updateGmailStatus(); }
-    });
 
     refreshCount();
     updateGmailStatus();
+  }
+
+  function togglePanel() {
+    buildPanel();
+    const panel = document.getElementById('wei-panel');
+    panel.classList.toggle('open');
+    if (panel.classList.contains('open')) { refreshCount(); updateGmailStatus(); }
   }
 
   // ---------------------------------------------------------------------
@@ -807,7 +810,73 @@
     }
   }
 
+  // ---------------------------------------------------------------------
+  // Map Mods - Base side panel integration -- same pattern as the Abuse
+  // Report Extractor script (and Report Wayspots' real
+  // insertReportingHistoryLinkIfReady()/insertReportingSettingsLinkIfReady()):
+  // appendChild a plain <a> into ".wfmapmods-settings-links" the first time
+  // it exists, found via a debounced MutationObserver gated on
+  // "#wfmapmods-side-panel". Replaces the old standalone floating button --
+  // the panel now opens from this link instead.
+  // ---------------------------------------------------------------------
+
+  const SETTINGS_LINK_ID = 'wei-settings-link';
+  let sidePanelObserver = null;
+  let sidePanelMutationScheduled = false;
+
+  function insertSettingsLinkIfReady() {
+    const settingsBody = document.querySelector('.wfmapmods-settings-links');
+    if (!settingsBody) return false;
+    if (document.getElementById(SETTINGS_LINK_ID)) return true;
+
+    const link = document.createElement('a');
+    link.id = SETTINGS_LINK_ID;
+    link.textContent = 'Import Abuse Report Emails';
+    link.style.cursor = 'pointer';
+
+    settingsBody.appendChild(link);
+
+    link.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      togglePanel();
+    });
+
+    return true;
+  }
+
+  function sidePanelMutationHandler() {
+    if (!document.querySelector('#wfmapmods-side-panel')) return;
+    if (insertSettingsLinkIfReady()) stopSidePanelWatcher();
+  }
+
+  function startSidePanelWatcher() {
+    if (sidePanelObserver) return;
+
+    sidePanelMutationHandler(); // covers the case it's already there
+
+    sidePanelObserver = new MutationObserver(() => {
+      if (sidePanelMutationScheduled) return;
+      sidePanelMutationScheduled = true;
+      setTimeout(() => {
+        sidePanelMutationScheduled = false;
+        sidePanelMutationHandler();
+      }, 50);
+    });
+
+    sidePanelObserver.observe(document.documentElement || document.body, {
+      childList: true,
+      subtree: true,
+    });
+  }
+
+  function stopSidePanelWatcher() {
+    if (sidePanelObserver) {
+      sidePanelObserver.disconnect();
+      sidePanelObserver = null;
+    }
+  }
+
   registerWithMapModsBase();
-  injectUI();
-  setInterval(injectUI, 2000);
+  buildPanel();
+  startSidePanelWatcher();
 })();
