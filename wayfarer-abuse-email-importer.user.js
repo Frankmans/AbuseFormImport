@@ -4,7 +4,7 @@
 // @version      4.0.0
 // @description  Imports Niantic Wayfarer/Spatial/OPR emails -- including Niantic Support "Reporting Abuse" tickets -- directly from Gmail via OAuth, or from .eml files -- using a port of bilde2910/OPR-Tools' email parser, and stores them for the Spatial Nominations Panel script (and other consumers) to search.
 // @author       you
-// @match        https://wayfarer.nianticlabs.com/new/nominations*
+// @match        https://wayfarer.nianticlabs.com/new/mapview*
 // @grant        GM_xmlhttpRequest
 // @connect      gmail.googleapis.com
 // @connect      accounts.google.com
