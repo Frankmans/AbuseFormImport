@@ -325,7 +325,16 @@
   // delimited by a pair of "----...----" rule lines around an
   // "Author | Month Day, Year | HH:MM +ZZZZ" header line.
   const HELPSHIFT_RULE_RE = /^-{3,}$/;
-  const HELPSHIFT_HEADER_RE = /^(.+?)\s*\|\s*(.+?)\s*\|\s*([\d:]{3,5}\s*[+-]\d{2}:?\d{2})$/;
+  // Author is (.*?), not (.+?): Helpshift renders the *reporter's own*
+  // messages in the thread with a blank author (just a leading space
+  // before the first "|", e.g. " | August 13, 2026 | 12:02 +0200") --
+  // confirmed against a real ticket where the original report submission
+  // itself (the message carrying the form fields we actually want) has a
+  // blank author. Requiring 1+ chars here silently dropped every message
+  // from the reporter, including that one -- which is why extraction was
+  // coming back empty for tickets where the report/reply text lives in a
+  // blank-author block rather than a named one.
+  const HELPSHIFT_HEADER_RE = /^(.*?)\s*\|\s*(.+?)\s*\|\s*([\d:]{3,5}\s*[+-]\d{2}:?\d{2})$/;
   const HELPSHIFT_CONVERSATION_ID_RE = /^Conversation ID:\s*#?(\d+)/;
 
   const parseHelpshiftThread = (plaintext) => {
