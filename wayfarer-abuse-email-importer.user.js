@@ -1,14 +1,13 @@
 // ==UserScript==
 // @name         Wayfarer Abuse Email Importer
 // @namespace    https://wayfarer.nianticlabs.com/new
-// @version      4.1.0
+// @version      4.2.0
 // @description  Imports Niantic Wayfarer/Spatial/OPR emails -- including Niantic Support "Reporting Abuse" tickets -- directly from Gmail via OAuth, or from .eml files -- using a port of bilde2910/OPR-Tools' email parser, and stores them for the Spatial Nominations Panel script (and other consumers) to search.
 // @author       you
 // @match        https://wayfarer.nianticlabs.com/new/mapview*
 // @grant        GM_xmlhttpRequest
 // @connect      gmail.googleapis.com
 // @connect      accounts.google.com
-// @require      https://gitlab.com/Tntnnbltn/wayfarer-addons/-/raw/main/wayfarer-map-mods-base.user.js
 // @require      https://raw.githubusercontent.com/Frankmans/AbuseFormImport/refs/heads/main/opr-email-lib.js
 // @require      https://raw.githubusercontent.com/Frankmans/AbuseFormImport/refs/heads/main/wst-storage.js
 // @run-at       document-idle
@@ -39,6 +38,22 @@
  * otherwise likely block a page-context request to googleapis.com. This
  * shouldn't change anything about the .eml/backup features below; @require'd
  * scripts and this script still share one execution context either way.
+ *
+ * v4.2.0 CHANGE FROM v4.1.0: dropped the @require for Tntnnbltn's
+ * wayfarer-map-mods-base.user.js that v4.0.0 added. @require doesn't share
+ * a running instance across scripts -- it re-fetches and re-executes the
+ * whole file separately inside *each* userscript that lists it. With both
+ * this script and the Abuse Report Extractor requiring it, that meant two
+ * independent copies of Base running side by side on the same page, each
+ * building its own "#wfmapmods-side-panel" (Base has no re-init guard
+ * against a *second*, separately-required copy). Base's real companion
+ * script, Report Wayspots, never @requires it either -- it's installed
+ * once, standalone, and every other script just assumes exactly one copy
+ * is already running and talks to it purely through the DOM contract
+ * (.wfmapmods-settings-links, the two bridge elements). This script now
+ * does the same: Map Mods - Base needs to be installed separately for the
+ * "Import Abuse Report Emails" link and publishPoiToMap() to have
+ * anywhere to go, but this script no longer bundles a copy of it in.
  *
  * v4.1.0 CHANGE FROM v4.0.0: this no longer has its own floating "Import
  * Emails" button. Same move the Abuse Report Extractor script made in its

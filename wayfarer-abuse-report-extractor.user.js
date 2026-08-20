@@ -1,11 +1,10 @@
 // ==UserScript==
 // @name         Wayfarer Abuse Report Extractor
 // @namespace    https://wayfarer.nianticlabs.com/new
-// @version      1.1.0
+// @version      1.2.0
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts the reported Wayspot name + coordinates, stores them locally, and exports as CSV.
 // @author       you
 // @match        https://wayfarer.nianticlabs.com/new/mapview*
-// @require      https://gitlab.com/Tntnnbltn/wayfarer-addons/-/raw/main/wayfarer-map-mods-base.user.js
 // @require      https://raw.githubusercontent.com/Frankmans/AbuseFormImport/refs/heads/main/opr-email-lib.js
 // @require      https://raw.githubusercontent.com/Frankmans/AbuseFormImport/refs/heads/main/wst-storage.js
 // @run-at       document-idle
@@ -49,6 +48,20 @@
  *   - No editing UI for the extracted name/coordinates -- the raw text
  *     columns in the CSV are there so corrections happen in a spreadsheet,
  *     not in-page. Say the word if you'd rather have inline editing.
+ *
+ * v1.2.0 CHANGE FROM v1.1.0: dropped the @require for Tntnnbltn's
+ * wayfarer-map-mods-base.user.js that pulled Base in directly. @require
+ * re-executes the whole required file separately inside *each* userscript
+ * that lists it, rather than sharing one running instance -- with both this
+ * script and the Abuse Email Importer requiring it, that meant two
+ * independent copies of Base on the same page, each building its own
+ * "#wfmapmods-side-panel" (Base has no re-init guard against a second,
+ * separately-required copy). Report Wayspots -- Base's real companion
+ * script -- never @requires it either: it's installed once, standalone,
+ * and talks to whatever single copy is already running purely through the
+ * DOM contract (.wfmapmods-settings-links, the bridge elements). This
+ * script now does the same -- Map Mods - Base needs to be installed
+ * separately for the settings-link and side panel to have anywhere to go.
  *
  * v1.1.0 CHANGE FROM v1.0.0: this no longer has its own floating button.
  * Confirmed against Report Wayspots v3.3.0's real source -- how it adds its
