@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Abuse Report Extractor
 // @namespace    https://wayfarer.nianticlabs.com/new
-// @version      1.2.0
+// @version      1.3.0
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts the reported Wayspot name + coordinates, stores them locally, and exports as CSV.
 // @author       you
 // @match        https://wayfarer.nianticlabs.com/new/mapview*
@@ -48,6 +48,14 @@
  *   - No editing UI for the extracted name/coordinates -- the raw text
  *     columns in the CSV are there so corrections happen in a spreadsheet,
  *     not in-page. Say the word if you'd rather have inline editing.
+ *
+ * v1.3.0 CHANGE FROM v1.2.0: the panel is now a real modal, styled with
+ * Base's own .wfmapmods-modal-* classes (backdrop, dialog, title, close
+ * button, buttons) instead of the old custom fixed-position dark/monospace
+ * box. Centered, white, blocks the rest of the page while open (click
+ * outside the dialog, Escape, or the × all close it) -- matching every
+ * other Map Mods - Base panel (Map options, Manual marker options, etc.)
+ * instead of looking and behaving like a standalone floating widget.
  *
  * v1.2.0 CHANGE FROM v1.1.0: dropped the @require for Tntnnbltn's
  * wayfarer-map-mods-base.user.js that pulled Base in directly. @require
@@ -248,63 +256,47 @@
   }
 
   // ---------------------------------------------------------------------
-  // UI -- same dark/monospace look as the importer script, "wae-" prefix
-  // so nothing collides with its "wei-" ids/classes. The panel itself is
-  // unchanged from before; what changed is how it's opened: instead of its
-  // own floating button, a link is injected into Map Mods - Base's own
-  // side panel settings section (.wfmapmods-settings-links), the same way
-  // Report Wayspots adds its "Reporting History" / "Reporting Settings"
-  // links -- confirmed against that real script (insertReportingHistory
-  // LinkIfReady / insertReportingSettingsLinkIfReady, both appending a
-  // plain <a> to that container). There's no dedicated modal API to reuse
-  // from Base -- Report Wayspots' openModal() is that script's own local
-  // helper, not something Base exposes -- so the panel keeps its own
-  // fixed-position box rather than becoming a true modal; only the trigger
-  // moved into Base's panel, plus a close button since there's no toggle
-  // button to click a second time anymore.
+  // UI -- opened via a link injected into Map Mods - Base's own side panel
+  // settings section (.wfmapmods-settings-links), the same way Report
+  // Wayspots adds its "Reporting History" / "Reporting Settings" links
+  // (insertReportingHistoryLinkIfReady / insertReportingSettingsLinkIfReady
+  // -- both appendChild a plain <a>, found via a debounced MutationObserver
+  // gated on "#wfmapmods-side-panel"). The panel itself is now a real
+  // modal built from Base's own CSS classes (.wfmapmods-modal-backdrop /
+  // -dialog / -title / -btn etc., confirmed against openModal() in Base's
+  // real source) instead of a custom floating box -- centered, white,
+  // blocks the rest of the page while open, closes on the × button,
+  // Escape, or a click on the backdrop outside the dialog, matching every
+  // other Map Mods - Base panel. "wae-" prefix throughout so nothing
+  // collides with the importer script's "wei-" ids/classes.
   // ---------------------------------------------------------------------
 
   const STYLE = `
-    #wae-panel{
-      position:fixed; bottom:20px; right:20px; z-index:9999;
-      background:#0a0e0c; color:#d7f5e6; border:1px solid #223026; border-radius:8px;
-      font-family:monospace; font-size:12.5px; padding:16px; width:520px; max-height:75vh;
-      overflow-y:auto; box-shadow:0 8px 24px rgba(0,0,0,.5); display:none;
+    #wae-panel .wae-dialog{
+      width:560px; max-width:calc(100vw - 24px);
     }
-    #wae-panel.open{ display:block; }
-    #wae-panel-header{ display:flex; align-items:flex-start; justify-content:space-between; gap:10px; }
-    #wae-panel h3{ margin:0 0 4px; font-size:14px; color:#d7f5e6; }
-    #wae-panel h4{ margin:14px 0 4px; font-size:12px; color:#a8c9b8; border-top:1px solid #223026; padding-top:10px; }
-    #wae-panel .wae-sub{ font-size:11px; color:#6b8579; margin-bottom:10px; }
-    #wae-close-btn{
-      background:none; border:none; color:#6b8579; cursor:pointer; font-family:monospace;
-      font-size:16px; line-height:1; padding:0 2px; margin:0;
-    }
-    #wae-close-btn:hover{ color:#d7f5e6; }
-    #wae-panel button{
-      background:#161d19; color:#d7f5e6; border:1px solid #223026; border-radius:4px;
-      padding:6px 10px; cursor:pointer; font-family:monospace; font-size:11.5px; margin-right:6px; margin-top:6px;
-    }
-    #wae-panel button.primary{ background:#00e08a; color:#04140d; border-color:#00e08a; }
-    #wae-panel button.danger{ color:#ff5d5d; border-color:#ff5d5d; }
+    #wae-panel .wae-sub{ font-size:11px; color:#6b7280; margin-bottom:8px; }
+    .wae-btn-row{ display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin:6px 0; }
+    .wae-btn-row .wfmapmods-modal-btn{ margin:0; }
+    .wae-btn-danger{ color:#dc2626; border-color:#dc2626; }
     #wae-panel button:disabled{ opacity:0.5; cursor:default; }
-    #wae-progress{ font-size:11px; color:#3ec6ff; margin:4px 0; min-height:14px; }
-    #wae-log{ margin-top:10px; max-height:120px; overflow-y:auto; font-size:11px; line-height:1.5; }
-    #wae-log div.ok{ color:#00e08a; }
-    #wae-log div.warn{ color:#e0c200; }
-    #wae-log div.err{ color:#ff5d5d; }
-    #wae-table-wrap{ margin-top:10px; max-height:260px; overflow:auto; border:1px solid #223026; border-radius:4px; }
+    #wae-progress{ font-size:11px; color:#2563eb; margin:4px 0; min-height:14px; }
+    #wae-log{ margin-top:8px; max-height:110px; overflow-y:auto; font-size:11px; line-height:1.5; }
+    #wae-log div.ok{ color:#16a34a; }
+    #wae-log div.warn{ color:#b45309; }
+    #wae-log div.err{ color:#dc2626; }
+    #wae-table-wrap{ margin-top:8px; max-height:260px; overflow:auto; border:1px solid #e5e7eb; border-radius:4px; }
     #wae-table{ width:100%; border-collapse:collapse; font-size:11px; }
     #wae-table th{
-      position:sticky; top:0; background:#10160f; color:#a8c9b8; text-align:left;
-      padding:5px 6px; border-bottom:1px solid #223026; white-space:nowrap;
+      position:sticky; top:0; background:#f9fafb; color:#374151; text-align:left;
+      padding:5px 6px; border-bottom:1px solid #e5e7eb; white-space:nowrap;
     }
     #wae-table td{
-      padding:5px 6px; border-bottom:1px solid #161d19; white-space:nowrap;
-      max-width:160px; overflow:hidden; text-overflow:ellipsis;
+      padding:5px 6px; border-bottom:1px solid #f3f4f6; white-space:nowrap;
+      max-width:160px; overflow:hidden; text-overflow:ellipsis; color:#111827;
     }
-    #wae-table td.wae-missing{ color:#6b8579; font-style:italic; }
-    #wae-table tr:hover td{ background:#10160f; }
+    #wae-table td.wae-missing{ color:#9ca3af; font-style:italic; }
+    #wae-table tr:hover td{ background:#f9fafb; }
   `;
 
   function log(container, msg, cls) {
@@ -381,26 +373,40 @@
 
     const panel = document.createElement('div');
     panel.id = 'wae-panel';
+    panel.className = 'wfmapmods-modal-backdrop';
+    panel.style.display = 'none';
     panel.innerHTML = `
-      <div id="wae-panel-header">
-        <h3>Wayfarer Abuse Report Extractor</h3>
-        <button id="wae-close-btn" title="Close">✕</button>
+      <div class="wfmapmods-modal-dialog wae-dialog">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+          <div class="wfmapmods-modal-title">Wayfarer Abuse Report Extractor</div>
+          <button type="button" id="wae-close-btn" class="wfmapmods-close-btn" title="Close" aria-label="Close">&times;</button>
+        </div>
+        <div class="wae-sub" id="wae-count">Loading...</div>
+
+        <div class="wae-btn-row">
+          <button id="wae-scan-btn" class="wfmapmods-modal-btn wfmapmods-modal-btn-primary">Scan Imported Emails</button>
+          <button id="wae-export-btn" class="wfmapmods-modal-btn" disabled>Export CSV</button>
+          <button id="wae-clear-btn" class="wfmapmods-modal-btn wae-btn-danger" disabled>Clear Extracted Data</button>
+        </div>
+        <div id="wae-progress"></div>
+
+        <div id="wae-table-container"></div>
+        <div id="wae-log"></div>
       </div>
-      <div class="wae-sub" id="wae-count">Loading...</div>
-
-      <button id="wae-scan-btn" class="primary">Scan Imported Emails</button>
-      <button id="wae-export-btn" disabled>⬇ Export CSV</button>
-      <button id="wae-clear-btn" class="danger" disabled>Clear Extracted Data</button>
-      <div id="wae-progress"></div>
-
-      <div id="wae-table-container"></div>
-      <div id="wae-log"></div>
     `;
     document.body.appendChild(panel);
 
-    panel.querySelector('#wae-close-btn').addEventListener('click', () => {
-      panel.classList.remove('open');
+    let pointerDownOnBackdrop = false;
+    panel.addEventListener('pointerdown', (ev) => {
+      pointerDownOnBackdrop = (ev.target === panel);
     });
+    panel.addEventListener('pointerup', (ev) => {
+      if (pointerDownOnBackdrop && ev.target === panel) closePanel();
+      pointerDownOnBackdrop = false;
+    });
+    panel.addEventListener('pointercancel', () => { pointerDownOnBackdrop = false; });
+
+    panel.querySelector('#wae-close-btn').addEventListener('click', closePanel);
 
     const progressEl = panel.querySelector('#wae-progress');
     const logEl = panel.querySelector('#wae-log');
@@ -455,11 +461,29 @@
     });
   }
 
+  function waeEscHandler(ev) {
+    if (ev.key === 'Escape') closePanel();
+  }
+
+  function openPanel() {
+    buildPanel();
+    const panel = document.getElementById('wae-panel');
+    panel.style.display = 'flex';
+    document.addEventListener('keydown', waeEscHandler);
+    refreshPanel();
+  }
+
+  function closePanel() {
+    const panel = document.getElementById('wae-panel');
+    if (panel) panel.style.display = 'none';
+    document.removeEventListener('keydown', waeEscHandler);
+  }
+
   function togglePanel() {
     buildPanel();
     const panel = document.getElementById('wae-panel');
-    panel.classList.toggle('open');
-    if (panel.classList.contains('open')) refreshPanel();
+    if (panel.style.display === 'none') openPanel();
+    else closePanel();
   }
 
   // ---------------------------------------------------------------------

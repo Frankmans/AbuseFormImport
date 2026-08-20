@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Abuse Email Importer
 // @namespace    https://wayfarer.nianticlabs.com/new
-// @version      4.2.0
+// @version      4.3.0
 // @description  Imports Niantic Wayfarer/Spatial/OPR emails -- including Niantic Support "Reporting Abuse" tickets -- directly from Gmail via OAuth, or from .eml files -- using a port of bilde2910/OPR-Tools' email parser, and stores them for the Spatial Nominations Panel script (and other consumers) to search.
 // @author       you
 // @match        https://wayfarer.nianticlabs.com/new/mapview*
@@ -38,6 +38,13 @@
  * otherwise likely block a page-context request to googleapis.com. This
  * shouldn't change anything about the .eml/backup features below; @require'd
  * scripts and this script still share one execution context either way.
+ *
+ * v4.3.0 CHANGE FROM v4.2.0: the panel is now a real modal, styled with
+ * Base's own .wfmapmods-modal-* classes (backdrop, dialog, title, close
+ * button, buttons) instead of the old custom fixed-position dark/monospace
+ * box. Centered, white, blocks the rest of the page while open (click
+ * outside the dialog, Escape, or the × all close it) -- matching every
+ * other Map Mods - Base panel instead of looking like a standalone widget.
  *
  * v4.2.0 CHANGE FROM v4.1.0: dropped the @require for Tntnnbltn's
  * wayfarer-map-mods-base.user.js that v4.0.0 added. @require doesn't share
@@ -140,46 +147,31 @@
   const CONCURRENCY = 5;
 
   const STYLE = `
-    #wei-panel{
-      position:fixed; bottom:20px; right:20px; z-index:9999;
-      background:#0a0e0c; color:#d7f5e6; border:1px solid #223026; border-radius:8px;
-      font-family:monospace; font-size:12.5px; padding:16px; width:420px; max-height:75vh;
-      overflow-y:auto; box-shadow:0 8px 24px rgba(0,0,0,.5); display:none;
+    #wei-panel .wei-dialog{
+      width:480px; max-width:calc(100vw - 24px);
     }
-    #wei-panel.open{ display:block; }
-    #wei-panel h3{ margin:0 0 4px; font-size:14px; color:#d7f5e6; }
-    #wei-panel h4{ margin:14px 0 4px; font-size:12px; color:#a8c9b8; border-top:1px solid #223026; padding-top:10px; }
-    #wei-panel .wei-sub{ font-size:11px; color:#6b8579; margin-bottom:10px; }
+    #wei-panel .wei-sub{ font-size:11px; color:#6b7280; margin-bottom:8px; }
     #wei-dropzone{
-      border:2px dashed #223026; border-radius:6px; padding:24px 10px; text-align:center;
-      color:#6b8579; margin-bottom:10px; cursor:pointer;
+      border:2px dashed #d1d5db; border-radius:6px; padding:20px 10px; text-align:center;
+      color:#6b7280; margin:6px 0; cursor:pointer; font-size:12px;
     }
-    #wei-dropzone.drag{ border-color:#00e08a; color:#00e08a; }
-    #wei-panel input[type=text]{
-      width:100%; box-sizing:border-box; background:#161d19; color:#d7f5e6;
-      border:1px solid #223026; border-radius:4px; padding:6px 8px; font-family:monospace;
-      font-size:12px; margin-bottom:6px;
+    #wei-dropzone.drag{ border-color:#2563eb; color:#2563eb; }
+    .wei-text-input{
+      width:100%; box-sizing:border-box; border:1px solid #d1d5db; border-radius:4px;
+      padding:5px 8px; font-size:12px; margin-bottom:6px; font-family:inherit;
     }
-    #wei-panel button{
-      background:#161d19; color:#d7f5e6; border:1px solid #223026; border-radius:4px;
-      padding:6px 10px; cursor:pointer; font-family:monospace; font-size:11.5px; margin-right:6px; margin-top:6px;
-    }
-    #wei-panel button.primary{ background:#00e08a; color:#04140d; border-color:#00e08a; }
-    #wei-panel button.danger{ color:#ff5d5d; border-color:#ff5d5d; }
+    .wei-btn-row{ display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin:6px 0; }
+    .wei-btn-row .wfmapmods-modal-btn{ margin:0; }
+    .wei-btn-danger{ color:#dc2626; border-color:#dc2626; }
     #wei-panel button:disabled{ opacity:0.5; cursor:default; }
-    #wei-gmail-status{ font-size:11px; color:#6b8579; margin:4px 0; }
-    .wei-autosync-row{ display:flex; align-items:center; gap:8px; font-size:11px; color:#d7f5e6; margin:6px 0; }
-    .wei-autosync-row select{
-      background:#161d19; color:#d7f5e6; border:1px solid #223026; border-radius:4px;
-      padding:3px 6px; font-family:monospace; font-size:11px;
-    }
-    #wei-progress{ font-size:11px; color:#3ec6ff; margin:4px 0; min-height:14px; }
+    .wei-autosync-row{ display:flex; align-items:center; gap:6px; font-size:12px; color:#374151; margin:6px 0; cursor:default; }
+    #wei-progress{ font-size:11px; color:#2563eb; margin:4px 0; min-height:14px; }
     #wei-log{
-      margin-top:10px; max-height:220px; overflow-y:auto; font-size:11px; line-height:1.5;
+      margin-top:8px; max-height:180px; overflow-y:auto; font-size:11px; line-height:1.5;
     }
-    #wei-log div.ok{ color:#00e08a; }
-    #wei-log div.skip{ color:#6b8579; }
-    #wei-log div.err{ color:#ff5d5d; }
+    #wei-log div.ok{ color:#16a34a; }
+    #wei-log div.skip{ color:#6b7280; }
+    #wei-log div.err{ color:#dc2626; }
   `;
 
   // ---------------------------------------------------------------------
@@ -382,41 +374,53 @@
 
     const panel = document.createElement('div');
     panel.id = 'wei-panel';
+    panel.className = 'wfmapmods-modal-backdrop';
+    panel.style.display = 'none';
     panel.innerHTML = `
-      <h3>Wayfarer Abuse Email Importer</h3>
-      <div class="wei-sub" id="wei-count">Loading...</div>
+      <div class="wfmapmods-modal-dialog wei-dialog">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+          <div class="wfmapmods-modal-title">Wayfarer Abuse Email Importer</div>
+          <button type="button" id="wei-close" class="wfmapmods-close-btn" title="Close" aria-label="Close">&times;</button>
+        </div>
+        <div class="wei-sub" id="wei-count">Loading...</div>
 
-      <h4>Connect Gmail</h4>
-      <input type="text" id="wei-client-id" placeholder="OAuth Client ID (ends in .apps.googleusercontent.com)">
-      <div id="wei-gmail-status">Not connected.</div>
-      <div id="wei-progress"></div>
-      <div>
-        <button id="wei-sync" class="primary">Sync new emails</button>
-        <button id="wei-full-resync">Force full re-sync</button>
-      </div>
-      <div class="wei-autosync-row">
-        <label><input type="checkbox" id="wei-autosync-toggle"> Auto-sync every</label>
-        <select id="wei-autosync-interval">
-          <option value="5">5 min</option>
-          <option value="15">15 min</option>
-          <option value="30">30 min</option>
-          <option value="60">60 min</option>
-        </select>
-      </div>
+        <div class="wfmapmods-modal-section">
+          <div class="wfmapmods-modal-section-header">Connect Gmail</div>
+          <input type="text" id="wei-client-id" class="wei-text-input" placeholder="OAuth Client ID (ends in .apps.googleusercontent.com)">
+          <div class="wei-sub" id="wei-gmail-status">Not connected.</div>
+          <div class="wei-sub" id="wei-progress"></div>
+          <div class="wei-btn-row">
+            <button id="wei-sync" class="wfmapmods-modal-btn wfmapmods-modal-btn-primary">Sync new emails</button>
+            <button id="wei-full-resync" class="wfmapmods-modal-btn">Force full re-sync</button>
+          </div>
+          <label class="wei-autosync-row">
+            <input type="checkbox" id="wei-autosync-toggle" class="wfmapmods-modal-checkbox"> Auto-sync every
+            <select id="wei-autosync-interval" class="wfmapmods-modal-select">
+              <option value="5">5 min</option>
+              <option value="15">15 min</option>
+              <option value="30">30 min</option>
+              <option value="60">60 min</option>
+            </select>
+          </label>
+        </div>
 
-      <h4>Or drop .eml files</h4>
-      <div id="wei-dropzone">Drop .eml files here, or click to choose</div>
-      <input type="file" id="wei-file-input" accept=".eml" multiple style="display:none;">
+        <div class="wfmapmods-modal-section">
+          <div class="wfmapmods-modal-section-header">Or drop .eml files</div>
+          <div id="wei-dropzone">Drop .eml files here, or click to choose</div>
+          <input type="file" id="wei-file-input" accept=".eml" multiple style="display:none;">
+        </div>
 
-      <h4>Backup / maintenance</h4>
-      <div>
-        <button id="wei-export">Export backup JSON</button>
-        <button id="wei-import-backup">Import backup JSON</button>
-        <input type="file" id="wei-backup-input" accept=".json,application/json" style="display:none;">
-        <button id="wei-clear" class="danger">Clear all stored emails</button>
-        <button id="wei-close">Close</button>
+        <div class="wfmapmods-modal-section" style="border-bottom:none; margin-bottom:0; padding-bottom:0;">
+          <div class="wfmapmods-modal-section-header">Backup / maintenance</div>
+          <div class="wei-btn-row">
+            <button id="wei-export" class="wfmapmods-modal-btn">Export backup JSON</button>
+            <button id="wei-import-backup" class="wfmapmods-modal-btn">Import backup JSON</button>
+            <input type="file" id="wei-backup-input" accept=".json,application/json" style="display:none;">
+            <button id="wei-clear" class="wfmapmods-modal-btn wei-btn-danger">Clear all stored emails</button>
+          </div>
+          <div id="wei-log"></div>
+        </div>
       </div>
-      <div id="wei-log"></div>
     `;
     document.body.appendChild(panel);
 
@@ -703,17 +707,46 @@
       await refreshCount();
     });
 
-    panel.querySelector('#wei-close').addEventListener('click', () => panel.classList.remove('open'));
+    let pointerDownOnBackdrop = false;
+    panel.addEventListener('pointerdown', (ev) => {
+      pointerDownOnBackdrop = (ev.target === panel);
+    });
+    panel.addEventListener('pointerup', (ev) => {
+      if (pointerDownOnBackdrop && ev.target === panel) closePanel();
+      pointerDownOnBackdrop = false;
+    });
+    panel.addEventListener('pointercancel', () => { pointerDownOnBackdrop = false; });
+
+    panel.querySelector('#wei-close').addEventListener('click', closePanel);
 
     refreshCount();
     updateGmailStatus();
   }
 
+  function weiEscHandler(ev) {
+    if (ev.key === 'Escape') closePanel();
+  }
+
+  function openPanel() {
+    buildPanel();
+    const panel = document.getElementById('wei-panel');
+    panel.style.display = 'flex';
+    document.addEventListener('keydown', weiEscHandler);
+    refreshCount();
+    updateGmailStatus();
+  }
+
+  function closePanel() {
+    const panel = document.getElementById('wei-panel');
+    if (panel) panel.style.display = 'none';
+    document.removeEventListener('keydown', weiEscHandler);
+  }
+
   function togglePanel() {
     buildPanel();
     const panel = document.getElementById('wei-panel');
-    panel.classList.toggle('open');
-    if (panel.classList.contains('open')) { refreshCount(); updateGmailStatus(); }
+    if (panel.style.display === 'none') openPanel();
+    else closePanel();
   }
 
   // ---------------------------------------------------------------------
