@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Wayfarer Abuse Email Importer
 // @namespace    https://wayfarer.nianticlabs.com/new
-// @version      4.3.0
-// @description  Imports Niantic Wayfarer/Spatial/OPR emails -- including Niantic Support "Reporting Abuse" tickets -- directly from Gmail via OAuth, or from .eml files -- using a port of bilde2910/OPR-Tools' email parser, and stores them for the Spatial Nominations Panel script (and other consumers) to search.
+// @version      4.4.0
+// @description  Imports Niantic Support "Reporting Abuse in Wayfarer" tickets from Gmail via OAuth, or from .eml files -- using a port of bilde2910/OPR-Tools' email parser -- and stores them for the Abuse Report Extractor script (and other consumers) to search.
 // @author       you
 // @match        https://wayfarer.nianticlabs.com/new/mapview*
 // @grant        GM_xmlhttpRequest
@@ -16,12 +16,12 @@
 // ==/UserScript==
 
 /*
- * Companion to wayfarer-spatial-nominations-panel.user.js. This script's
- * ONLY job is getting your raw emails into the shared IndexedDB store
+ * Companion to wayfarer-abuse-report-extractor.user.js. This script's ONLY
+ * job is getting your raw emails into the shared IndexedDB store
  * ("wst_email_store", see wst-storage.js) as parsed-but-unclassified
  * records -- headers + body, nothing more. It does NOT try to figure out
- * what kind of email something is, match decisions to nominations, or build
- * a submissions list -- that's the panel script's job (wst-business-logic.js).
+ * what kind of email something is or extract a Wayspot name/coordinates
+ * from it -- that's the extractor script's job.
  *
  * TWO WAYS IN:
  *   1. Connect Gmail -- OAuth (read-only) + the Gmail API, fetches matching
@@ -38,6 +38,18 @@
  * otherwise likely block a page-context request to googleapis.com. This
  * shouldn't change anything about the .eml/backup features below; @require'd
  * scripts and this script still share one execution context either way.
+ *
+ * v4.4.0 CHANGE FROM v4.3.0: SUPPORTED_SENDERS narrowed to just
+ * support@nianticlabs.com. Gmail sync now only screens for Niantic
+ * Support's Helpshift "Reporting Abuse in Wayfarer" ticket threads --
+ * dropped the general nomination/notification senders (notices@recon.
+ * nianticspatial.com, notices@wayfarer.nianticlabs.com, nominations@
+ * portals.ingress.com, hello@pokemongolive.com, ingress-support@
+ * nianticlabs.com, ingress-support@google.com). If you want those back for
+ * a different consumer later, they're in the version history, not gone
+ * from Gmail -- this only changes what this script's own sync pulls in.
+ * The .eml drop path is untouched: it still accepts whatever file you
+ * drop, since that's already a deliberate per-file choice, not a search.
  *
  * v4.3.0 CHANGE FROM v4.2.0: the panel is now a real modal, styled with
  * Base's own .wfmapmods-modal-* classes (backdrop, dialog, title, close
@@ -126,18 +138,14 @@
   'use strict';
 
   const GMAIL_SCOPE = 'https://www.googleapis.com/auth/gmail.readonly';
+  // Niantic Support's Helpshift ticket threads, e.g. "Reporting Abuse in
+  // Wayfarer" (confirmed real From address) -- see opr-email-lib.js's
+  // Style.SUPPORT / Type.ABUSE_REPORT_* for how they're classified once
+  // imported. Nomination-status notification senders (notices@recon.
+  // nianticspatial.com, nominations@portals.ingress.com, etc.) were
+  // dropped from here in v4.4.0 -- this script now only screens for
+  // abuse-report tickets, not general Wayfarer/Spatial/Ingress mail.
   const SUPPORTED_SENDERS = [
-    'notices@recon.nianticspatial.com',
-    'notices@wayfarer.nianticlabs.com',
-    'nominations@portals.ingress.com',
-    'hello@pokemongolive.com',
-    'ingress-support@nianticlabs.com',
-    'ingress-support@google.com',
-    // Niantic Support's Helpshift ticket threads, e.g. "Reporting Abuse in
-    // Wayfarer" (confirmed real From address). These are freeform support
-    // conversations rather than templated notifications -- see
-    // opr-email-lib.js's Style.SUPPORT / Type.ABUSE_REPORT_* for how
-    // they're classified once imported.
     'support@nianticlabs.com',
   ];
   const CLIENT_ID_KEY = 'wei_gmail_client_id';
@@ -342,7 +350,7 @@
     if (!countEl) return;
     try {
       const n = await WSTStorage.countEmails();
-      countEl.textContent = `${n} email(s) stored. Open the Spatial Nominations Panel to search them.`;
+      countEl.textContent = `${n} email(s) stored. Open the Abuse Report Extractor to scan them.`;
     } catch (e) {
       countEl.textContent = 'Could not read the email store.';
     }
@@ -460,9 +468,9 @@
 
     // Transient-only: used to add an "N abuse report ticket(s)" count to the
     // import log line. Never persisted -- stored records stay the
-    // deliberately-unclassified {headers, body} shape described up top, so a
-    // downstream plugin re-classifies from the raw email itself, the same
-    // way wst-business-logic.js already does.
+    // deliberately-unclassified {headers, body} shape described up top, so
+    // the extractor script re-classifies from the raw email itself, the
+    // same way this helper does.
     function isAbuseReportRecord(record) {
       try {
         // record.headers/body are already the decoded {name, value} pairs
