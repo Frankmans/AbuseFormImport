@@ -432,24 +432,70 @@
   };
 
   // Best-effort: "Provide details of the location(s)" reads as
-  // "<name>, <lat>,<lon>" in the one confirmed sample ("Bulskampveldroute
-  // Lattenkliever, 51.127125,3.368427"). Splits off whatever precedes the
-  // first coordinate match and treats it as the reported location's name.
-  // *** UNCONFIRMED beyond that one sample *** -- can't distinguish "a
-  // portal/Wayspot name" from e.g. a plain street address with no name
-  // attached, so treat this as a starting point for manual review in the
-  // exported CSV, not ground truth.
+  // "<name>, <lat>,<lon>" in one confirmed sample ("Bulskampveldroute
+  // Lattenkliever, 51.127125,3.368427"), and as "<name> (<lat>, <lon>)"
+  // -- one Wayspot per line -- in another. Splits off whatever precedes
+  // the first coordinate match on a single line and treats it as that
+  // location's name. *** UNCONFIRMED beyond those samples *** -- can't
+  // distinguish "a portal/Wayspot name" from e.g. a plain street address
+  // with no name attached, so treat this as a starting point for manual
+  // review in the exported CSV, not ground truth.
   const extractHelpshiftLocationName = (text) => {
     if (!text) return null;
     HELPSHIFT_COORD_RE.lastIndex = 0;
     const m = HELPSHIFT_COORD_RE.exec(text);
     if (!m) return text.trim() || null;
-    const before = text.slice(0, m.index).replace(/[,\s]+$/, "").trim();
+    const before = text.slice(0, m.index).replace(/[,\s(]+$/, "").trim();
     return before || null;
   };
 
+  // Splits a block of text into individual "location list" lines, one
+  // entry per line that contains a coordinate: "<name>, <lat>,<lng>" or
+  // "<name> (<lat>, <lng>)" -- the two formats confirmed in real tickets
+  // (single-location reports use the first; multi-location reports, and
+  // reply messages that list further Wayspots, have used either). A line
+  // with a coordinate but nothing recognizable before it still counts,
+  // with name left null, rather than being dropped -- the coordinate
+  // alone is still useful. A line with NO coordinate at all (a subheading
+  // like "street signs:", ordinary prose in a reply) is skipped.
+  //
+  // Map/street-view links (a https://www.google.com/maps/place/.../@
+  // <lat>,<lng>,... URL) are common in real replies as supplementary
+  // evidence for a location just named a line or two above -- not a new
+  // location by itself, but also not nothing: rather than drop it, it's
+  // folded into that entry's `comment` field. Only a NAMED line becomes
+  // the attachment target for a following link, so an unnamed bare
+  // coordinate (usually itself a wrapped correction split onto its own
+  // line, e.g. "Name, lat,lng (is actually here:\n<lat,lng>)") doesn't
+  // steal a comment meant for the location actually named above it.
+  const extractLocationLines = (text) => {
+    const out = [];
+    const lines = (text || "").split("\n");
+    let current = null;
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line) continue;
+      if (!/https?:\/\//i.test(line)) {
+        HELPSHIFT_COORD_RE.lastIndex = 0;
+        const m = HELPSHIFT_COORD_RE.exec(line);
+        if (m) {
+          const name = line.slice(0, m.index).replace(/[,\s(]+$/, "").trim() || null;
+          const entry = { name, latitude: m[1], longitude: m[2], comment: null };
+          out.push(entry);
+          if (name) current = entry;
+        }
+        continue;
+      }
+      if (current) {
+        current.comment = current.comment ? `${current.comment} ${line}` : line;
+      }
+    }
+    return out;
+  };
+
   // High-level convenience: given a classified ABUSE_REPORT_* email, pull
-  // out the transcript and the reporter's original form fields in one call.
+  // out the transcript, the reporter's original form fields, and every
+  // Wayspot reported anywhere in the thread in one call.
   const parseAbuseReportEmail = (email) => {
     const plaintext = email.getBody("text/plain") || "";
     const { conversationId, messages } = parseHelpshiftThread(plaintext);
@@ -465,23 +511,64 @@
     const reportDetails = fields["Abuse report details"] ?? null;
     const locationDetails = fields["Provide details of the location(s)"] ?? null;
 
-    // Every coordinate pair found across both fields, for anyone who wants
-    // to see everything the reporter mentioned (a "corrected" location is
-    // sometimes buried in reportDetails prose, separate from the
-    // structured locationDetails field).
+    // Every coordinate pair found across both fields, unfiltered/unnamed,
+    // for anyone who wants to see everything the reporter mentioned
+    // (a "corrected" location is sometimes buried in reportDetails prose --
+    // see the note on `locations` below).
     const coordinates = extractHelpshiftCoordinates(
       [locationDetails, reportDetails].filter(Boolean).join("\n")
     );
 
-    // locationName/primaryCoordinate: the best single guess for "the name
-    // and coordinates of what was reported", preferring the structured
-    // locationDetails field (see extractHelpshiftLocationName above) and
-    // only falling back to reportDetails' prose if that field had no
-    // coordinate in it at all.
-    const locationName = extractHelpshiftLocationName(locationDetails);
-    const locationCoords = extractHelpshiftCoordinates(locationDetails || "");
-    const reportCoords = extractHelpshiftCoordinates(reportDetails || "");
-    const primaryCoordinate = locationCoords[0] || reportCoords[0] || null;
+    // One entry per reported Wayspot, deduped by coordinate (rounded to
+    // 5dp -- ~1m -- so the same location quoted twice with slightly
+    // different trailing digits still collapses to one row). Sourced
+    // from:
+    //   1. the original form's structured locationDetails field, split
+    //      per line -- handles reports that list several Wayspots at
+    //      once, not just one.
+    //   2. every OTHER message in the thread (replies), scanned the same
+    //      line-by-line way, so Wayspots added in a later reply ("I see I
+    //      missed some: ...") are picked up too.
+    // Deliberately NOT scanning reportDetails/"Abuse report details" --
+    // that field is free prose, and can contain a *corrected* coordinate
+    // for the same Wayspot already listed in locationDetails rather than
+    // a distinct additional one (seen in a real ticket: "It is actually
+    // located here: <lat,lng>" a few lines after the location(s) field).
+    // Treating every number pair in there as a new location would
+    // silently invent a duplicate row with a garbage name.
+    const seen = new Set();
+    const locations = [];
+    const addLocation = (loc) => {
+      const key = `${Number(loc.latitude).toFixed(5)},${Number(loc.longitude).toFixed(5)}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      locations.push(loc);
+    };
+    extractLocationLines(locationDetails || "").forEach(addLocation);
+    messages.forEach((msg) => {
+      if (msg === reportMsg) return;
+      extractLocationLines(stripHelpshiftMarkup(msg.raw))
+        .filter((loc) => loc.name)
+        .forEach(addLocation);
+    });
+
+    // Fallback for tickets that don't match either per-line format at
+    // all: reuse the old single-best-guess logic (structured field first,
+    // then whatever coordinate turns up in reportDetails prose) so this
+    // doesn't regress on tickets the previous version already handled.
+    if (locations.length === 0) {
+      const fallbackName = extractHelpshiftLocationName(locationDetails);
+      const locationCoords = extractHelpshiftCoordinates(locationDetails || "");
+      const reportCoords = extractHelpshiftCoordinates(reportDetails || "");
+      const fallbackCoord = locationCoords[0] || reportCoords[0] || null;
+      if (fallbackCoord) locations.push({ name: fallbackName, latitude: fallbackCoord.latitude, longitude: fallbackCoord.longitude, comment: null });
+    }
+
+    // Back-compat single-value fields -- same meaning as before this
+    // function returned a list, kept for any existing caller that only
+    // wants "the" name/coordinate rather than all of them.
+    const locationName = locations[0] ? locations[0].name : null;
+    const primaryCoordinate = locations[0] ? { latitude: locations[0].latitude, longitude: locations[0].longitude } : null;
 
     return {
       conversationId,
@@ -490,6 +577,7 @@
       reportDetails,
       locationDetails,
       coordinates,
+      locations,
       locationName,
       primaryCoordinate,
       messages,

@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Wayfarer Abuse Report Extractor
 // @namespace    https://wayfarer.nianticlabs.com/new
-// @version      1.3.0
-// @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts the reported Wayspot name + coordinates, stores them locally, and exports as CSV.
+// @version      1.5.0
+// @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, and exports as CSV.
 // @author       you
 // @match        https://wayfarer.nianticlabs.com/new/mapview*
 // @require      https://raw.githubusercontent.com/Frankmans/AbuseFormImport/refs/heads/main/opr-email-lib.js
@@ -24,11 +24,14 @@
  *      in Wayfarer" Helpshift tickets -- see opr-email-lib.js's
  *      Style.SUPPORT section for how that classification works).
  *   3. Runs OPREmail.helpshift.parseAbuseReportEmail() on each one to pull
- *      out a best-guess Wayspot name + coordinate (see locationName /
- *      primaryCoordinate in that function -- *** BEST-EFFORT, only
- *      confirmed against one real sample *** -- the raw locationDetails/
+ *      out every reported Wayspot's name + coordinate (see `locations` in
+ *      that function -- *** BEST-EFFORT, only confirmed against a
+ *      handful of real samples *** -- the raw locationDetails/
  *      reportDetails text is kept alongside every row specifically so you
- *      can sanity-check or correct it by hand in the exported CSV).
+ *      can sanity-check or correct it by hand in the exported CSV). One
+ *      ticket can report several Wayspots at once, or have more added in
+ *      a later reply -- each becomes its own row, sharing the ticket's
+ *      conversationId/issueType/raw-text columns.
  *   4. Stores the extracted rows in their OWN IndexedDB database (
  *      "wf-abuse-report-extract-db", separate from the importer's raw-
  *      email store, and from Tntnnbltn's own "wayfarer-tools-db" -- there
@@ -48,6 +51,29 @@
  *   - No editing UI for the extracted name/coordinates -- the raw text
  *     columns in the CSV are there so corrections happen in a spreadsheet,
  *     not in-page. Say the word if you'd rather have inline editing.
+ *
+ * v1.5.0 CHANGE FROM v1.4.0: Street View / Maps links found near a
+ * location in a reply (real example: "'t Zudn, <lat,lng> (is here:
+ * <corrected lat,lng>, shows on street view: <url>)") used to be dropped
+ * outright as unreliable "new location" noise. They're kept now -- folded
+ * into a new `comment` field on whichever named location they were
+ * providing context for (see opr-email-lib.js's extractLocationLines) --
+ * and exposed as a new "Comment" CSV column, plus a hover-for-full-text
+ * 💬 indicator in the panel's table.
+ *
+ * v1.4.0 CHANGE FROM v1.3.0: a ticket reporting several Wayspots at once,
+ * or with more added in a later reply ("I see I missed some: ..."), now
+ * produces one CSV row per Wayspot instead of just one row for the
+ * ticket. This follows from opr-email-lib.js's parseAbuseReportEmail()
+ * now returning a `locations` array (deduped by coordinate) instead of a
+ * single locationName/primaryCoordinate guess -- see that file's own
+ * comments for how it's built (the original form's locationDetails field,
+ * split per line, plus every reply message scanned the same way).
+ * Because a ticket's row count can now change between scans, "Scan
+ * Imported Emails" rebuilds the extracted-data store from scratch each
+ * time (clearExtractedRecords() then a fresh write) rather than upserting
+ * -- upserting alone would've left old single-row ids behind as stale
+ * duplicates once a ticket started producing several rows.
  *
  * v1.3.0 CHANGE FROM v1.2.0: the panel is now a real modal, styled with
  * Base's own .wfmapmods-modal-* classes (backdrop, dialog, title, close
@@ -188,22 +214,33 @@
         parsed = OPREmail.helpshift.parseAbuseReportEmail(email);
       } catch (e) { continue; }
 
-      const coord = parsed.primaryCoordinate;
-      const id = parsed.conversationId ? `conv:${parsed.conversationId}` : `email:${record.id}`;
+      const idBase = parsed.conversationId ? `conv:${parsed.conversationId}` : `email:${record.id}`;
+      // parsed.locations is every Wayspot found anywhere in the thread --
+      // the original report can list several at once, and later replies
+      // ("I see I missed some: ...") can add more. One row per location,
+      // all sharing conversationId/ticketStatus/issueType/raw fields so
+      // they're still recognizable as one ticket in the CSV. A ticket
+      // with no parseable location at all still gets exactly one row (so
+      // it's not silently dropped from the scan), with everything
+      // location-related left null.
+      const locations = parsed.locations && parsed.locations.length ? parsed.locations : [null];
 
-      extracted.push({
-        id,
-        conversationId: parsed.conversationId || null,
-        ticketStatus: classification.type,
-        wayspotName: parsed.locationName || null,
-        latitude: coord ? Number(coord.latitude) : null,
-        longitude: coord ? Number(coord.longitude) : null,
-        issueType: parsed.issueType || null,
-        locationDetails: parsed.locationDetails || null,
-        reportDetails: parsed.reportDetails || null,
-        sourceEmailId: record.id,
-        sourceFilename: record.filename || null,
-        scannedAt: Date.now(),
+      locations.forEach((loc, i) => {
+        extracted.push({
+          id: locations.length > 1 ? `${idBase}:${i}` : idBase,
+          conversationId: parsed.conversationId || null,
+          ticketStatus: classification.type,
+          wayspotName: loc ? loc.name : null,
+          latitude: loc ? Number(loc.latitude) : null,
+          longitude: loc ? Number(loc.longitude) : null,
+          comment: loc ? (loc.comment || null) : null,
+          issueType: parsed.issueType || null,
+          locationDetails: parsed.locationDetails || null,
+          reportDetails: parsed.reportDetails || null,
+          sourceEmailId: record.id,
+          sourceFilename: record.filename || null,
+          scannedAt: Date.now(),
+        });
       });
     }
 
@@ -220,6 +257,7 @@
     ['wayspotName', 'Wayspot Name (best guess)'],
     ['latitude', 'Latitude'],
     ['longitude', 'Longitude'],
+    ['comment', 'Comment'],
     ['issueType', 'Issue Type'],
     ['locationDetails', 'Location Details (raw)'],
     ['reportDetails', 'Report Details (raw)'],
@@ -296,6 +334,7 @@
       max-width:160px; overflow:hidden; text-overflow:ellipsis; color:#111827;
     }
     #wae-table td.wae-missing{ color:#9ca3af; font-style:italic; }
+    #wae-table td.wae-comment{ text-align:center; cursor:help; max-width:24px; }
     #wae-table tr:hover td{ background:#f9fafb; }
   `;
 
@@ -320,11 +359,15 @@
           : '<td class="wae-missing">(none found)</td>';
         const lat = r.latitude !== null ? r.latitude.toFixed(6) : '<span class="wae-missing">-</span>';
         const lng = r.longitude !== null ? r.longitude.toFixed(6) : '<span class="wae-missing">-</span>';
+        const comment = r.comment
+          ? `<td class="wae-comment" title="${escapeHtml(r.comment)}">\uD83D\uDCAC</td>`
+          : '<td></td>';
         return `<tr>
           <td>${escapeHtml(r.conversationId || r.sourceEmailId)}</td>
           ${name}
           <td>${lat}</td>
           <td>${lng}</td>
+          ${comment}
           <td>${escapeHtml(r.ticketStatus.replace('ABUSE_REPORT_', ''))}</td>
         </tr>`;
       })
@@ -332,7 +375,7 @@
     return `
       <div id="wae-table-wrap">
         <table id="wae-table">
-          <thead><tr><th>Conversation</th><th>Wayspot Name</th><th>Lat</th><th>Lng</th><th>Status</th></tr></thead>
+          <thead><tr><th>Conversation</th><th>Wayspot Name</th><th>Lat</th><th>Lng</th><th></th><th>Status</th></tr></thead>
           <tbody>${rows}</tbody>
         </table>
       </div>`;
@@ -354,8 +397,9 @@
     }
     const withCoords = extracted.filter((r) => r.latitude !== null && r.longitude !== null).length;
     const withName = extracted.filter((r) => r.wayspotName).length;
+    const ticketCount = new Set(extracted.map((r) => r.conversationId || r.sourceEmailId)).size;
     if (countEl) {
-      countEl.textContent = `${extracted.length} abuse report(s) extracted -- ${withCoords} with coordinates, ${withName} with a name guess.`;
+      countEl.textContent = `${extracted.length} location(s) extracted from ${ticketCount} ticket(s) -- ${withCoords} with coordinates, ${withName} with a name guess.`;
     }
     if (tableEl) tableEl.innerHTML = renderTable(extracted);
     const exportBtn = document.getElementById('wae-export-btn');
@@ -421,9 +465,17 @@
         const extracted = await scanImportedEmails((done, total) => {
           progressEl.textContent = `Scanning imported emails... ${done}/${total}`;
         });
-        const { inserted, updated } = await putExtractedRecords(extracted);
+        // Rebuild from scratch rather than upsert: a ticket's row count can
+        // change between scans (a multi-location ticket now yields several
+        // "conv:X:0" / "conv:X:1" / ... rows instead of one "conv:X" row),
+        // and upserting alone would leave the old id's row behind as a
+        // stale duplicate. Source data is the already-imported emails, so
+        // a full rebuild is cheap and side-steps that entirely.
+        await clearExtractedRecords();
+        await putExtractedRecords(extracted);
         progressEl.textContent = '';
-        log(logEl, `✓ Scanned: found ${extracted.length} abuse report ticket(s) -- ${inserted} new, ${updated} updated.`, 'ok');
+        const ticketCount = new Set(extracted.map((r) => r.conversationId || r.sourceEmailId)).size;
+        log(logEl, `✓ Scanned: found ${extracted.length} location(s) across ${ticketCount} abuse report ticket(s).`, 'ok');
         const missingCoords = extracted.filter((r) => r.latitude === null).length;
         if (missingCoords) {
           log(logEl, `⚠ ${missingCoords} report(s) had no parseable coordinates -- check the raw columns in the CSV.`, 'warn');

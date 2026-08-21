@@ -79,9 +79,11 @@ time the page loads and kept in memory only, for the session.
    periodically without you opening the panel.
 3. Click **Abuse Report Extractor** in the side panel, then **Scan
    Imported Emails**.
-4. Review the table — rows missing a name or coordinates are flagged so
-   you can check the raw `Location Details` / `Report Details` columns by
-   hand — then **Export CSV**.
+4. Review the table — one row per reported Wayspot, so a ticket that
+   reports several (or has more added in a later reply) shows several
+   rows sharing the same `Conversation ID`. Rows missing a name or
+   coordinates are flagged so you can check the raw `Location Details` /
+   `Report Details` columns by hand — then **Export CSV**.
 
 ## What counts as an "abuse report" email
 
@@ -95,15 +97,48 @@ Dropped `.eml` files are accepted from any sender — screening happens at
 extraction time instead, via `opr-email-lib.js`'s `classify()`, which
 only keeps emails it recognizes as `ABUSE_REPORT_*`.
 
+## Multiple Wayspots per ticket
+
+A single ticket can report more than one Wayspot — either all at once in
+the original submission, or with more added in a later reply ("I see I
+missed some: ..."). The extractor picks up both:
+
+- The original form's **Provide details of the location(s)** field is
+  split per line, so a report listing several Wayspots at once (each as
+  its own `Name (lat, lng)` or `Name, lat,lng` line) becomes one entry
+  per line, not just the first.
+- Every other message in the thread is scanned the same way, so Wayspots
+  a reporter adds in a follow-up reply are picked up too.
+
+Each entry becomes its own CSV row, sharing that ticket's
+`Conversation ID` / `Issue Type` / raw-text columns. Deliberately **not**
+turned into a *new* location entry: a corrected coordinate mentioned in
+prose (e.g. "(is actually here: &lt;lat,lng&gt;)") — that's a correction to
+a Wayspot already named elsewhere in the same message, not a new one, so
+treating every number pair in prose as a distinct report would invent
+duplicate rows. A Street View / Maps link found near a location isn't
+dropped, though — it's kept as that entry's `Comment` (see below). If a
+reply mixes a genuinely new Wayspot into the same sentence as a
+correction, it may need a manual check.
+
 ## CSV columns
 
 `Conversation ID`, `Ticket Status`, `Wayspot Name (best guess)`,
-`Latitude`, `Longitude`, `Issue Type`, `Location Details (raw)`,
-`Report Details (raw)`, `Source Email ID`, `Source Filename`.
+`Latitude`, `Longitude`, `Comment`, `Issue Type`,
+`Location Details (raw)`, `Report Details (raw)`, `Source Email ID`,
+`Source Filename`.
+
+`Comment` holds a Street View / Maps link found near that specific
+location in a reply (real example: *"'t Zudn, &lt;lat,lng&gt; (is here:
+&lt;corrected lat,lng&gt;, shows on street view: &lt;url&gt;)"*) — kept as
+context for that entry rather than dropped or turned into a bogus extra
+row. Shown as a hover-for-full-text 💬 in the panel's table since the
+link itself is usually too long to display inline.
 
 The two "(raw)" columns are there so you can sanity-check or hand-correct
 a bad name/coordinate guess in a spreadsheet — there's no in-page editing
-UI by design.
+UI by design. Since a ticket can now span several rows, use
+`Conversation ID` to group them back together if you need to.
 
 ## Data storage & privacy
 
@@ -128,6 +163,11 @@ doesn't touch the imported emails — re-scan any time to rebuild it.
   regex silently dropped — including the message with the actual report
   fields), but treat low-confidence rows as needing a manual check
   before you rely on them.
+- Multi-location extraction only recognizes the two per-line list
+  formats seen so far (`Name (lat, lng)` and `Name, lat,lng`). A reply
+  that mixes a genuinely new Wayspot into the same sentence as a
+  correction, rather than giving it its own line, may need a manual
+  check — see "Multiple Wayspots per ticket" above.
 - No map-plotting yet. The importer exposes
   `window.WayfarerAbuseEmailImporter.publishPoiToMap()` and
   `getAbuseReportRecords()` specifically so a future script (or a later
@@ -180,7 +220,7 @@ needed since it's plain `@require`-able JS.
 ## Versions covered by this README
 
 - `wayfarer-abuse-email-importer.user.js` — v4.4.0
-- `wayfarer-abuse-report-extractor.user.js` — v1.3.0
+- `wayfarer-abuse-report-extractor.user.js` — v1.5.0
 
 Full version-by-version detail lives in the changelog comment block at
 the top of each `.user.js` file.
