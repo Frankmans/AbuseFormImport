@@ -218,13 +218,22 @@ info popup there. Since the panel is a full-screen backdrop, clicking a
 row also closes it, so the map you just navigated to is actually visible.
 
 Base itself has no marker-plotting API — this ports Report Wayspots' own
-confirmed-working map-lookup code and builds an independent
-`google.maps.OverlayView` layer, with its own colour/CSS classes so the
-two don't read as the same thing. `window.WayfarerAbuseEmailImporter
+confirmed-working map-lookup code, then plots results as native
+`google.maps.Marker` objects (a custom SVG red-X icon) rather than
+anything from Base or Report Wayspots, so it doesn't require Report
+Wayspots installed and doesn't read as the same layer as its own
+reported-wayspot history markers. `window.WayfarerAbuseEmailImporter
 .publishPoiToMap()` is unrelated to this — that only hands a POI to
 Base's own side-panel selection, not a map marker (an earlier version of
 this README described it as map-plotting; that was wrong, and it's kept
 around as a small convenience API for something else, not for this).
+
+Markers are positioned by the Maps SDK itself and only rebuilt when the
+underlying data actually changes (a scan, a clear, or first turning the
+toggle on) — not on every pan or zoom, which is what made this slow in
+an earlier version. If it ever feels sluggish again, it's worth checking
+whether something's re-triggering a full rebuild on a map event rather
+than reusing the already-fetched record list.
 
 ## Why no `@require` for Base
 
@@ -270,7 +279,7 @@ needed since it's plain `@require`-able JS.
 ## Versions covered by this README
 
 - `wayfarer-abuse-email-importer.user.js` — v4.4.0
-- `wayfarer-abuse-report-extractor.user.js` — v1.11.0
+- `wayfarer-abuse-report-extractor.user.js` — v1.12.0
 
 Full version-by-version detail lives in the changelog comment block at
 the top of each `.user.js` file.

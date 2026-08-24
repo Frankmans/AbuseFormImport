@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Abuse Report Extractor
 // @namespace    https://wayfarer.nianticlabs.com/new
-// @version      1.11.0
+// @version      1.12.0
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map, and exports as CSV.
 // @author       you
 // @match        https://wayfarer.nianticlabs.com/new/mapview*
@@ -51,6 +51,27 @@
  *   - No editing UI for the extracted name/coordinates -- the raw text
  *     columns in the CSV are there so corrections happen in a spreadsheet,
  *     not in-page. Say the word if you'd rather have inline editing.
+ *
+ * v1.12.0 CHANGE FROM v1.11.0: fixed "Show on Map" getting slow with more
+ * than a couple dozen markers. Two separate causes, both fixed:
+ *   1. waeRefreshPulses() called getAllExtractedRecords() (a full
+ *      IndexedDB read) itself, and ran on every 'idle' AND 'zoom_changed'
+ *      map event -- i.e. a full DB read + marker rebuild on every single
+ *      pan/zoom. It now reads from waeAllRecords (already kept in sync by
+ *      refreshPanel() after every scan/clear) instead, and the 'idle'
+ *      listener is gone entirely -- see point 2, it's no longer needed
+ *      for anything.
+ *   2. Markers were a custom google.maps.OverlayView (own div, manual
+ *      draw()/projection math). An OverlayView's draw() runs on every
+ *      projection update for every instance -- including continuously
+ *      during a drag, not just once per pan -- so with dozens of markers
+ *      that's dozens of synchronous DOM writes per drag frame. Switched
+ *      to native google.maps.Marker (own SVG icon, same red-X look) --
+ *      positioned by the Maps SDK itself, no per-frame JS callback
+ *      involved, and no pan/zoom listener needed at all to stay correctly
+ *      placed. zoom_changed now only toggles .setMap() on already-built
+ *      markers for the <8-zoom clutter gate -- cheap, no data fetch, no
+ *      marker recreation.
  *
  * v1.11.0 CHANGE FROM v1.10.0: the ⚠️ nearby-duplicate flag is now
  * clickable instead of just a hover tooltip -- opens a small popover
@@ -431,19 +452,23 @@
   }
 
   // ---------------------------------------------------------------------
-  // Map plotting -- a self-contained marker overlay for extracted
-  // locations, the same OverlayView approach Report Wayspots uses for its
-  // own reported-wayspot history (own CSS classes/color so the two don't
-  // read as the same layer -- this shows *extracted* reports, not
-  // Report Wayspots' own submission history, and doesn't require that
-  // script to be installed at all). Unlike Report Wayspots' pulses, these
-  // are clickable -- with dozens of nearby entries otherwise looking
-  // identical, a click naming which ticket a pulse belongs to earns its
-  // keep here.
+  // Map plotting -- extracted locations as native google.maps.Marker
+  // objects, NOT a custom OverlayView (see v1.12.0 changelog note: an
+  // OverlayView with many instances forces a JS-driven DOM reposition on
+  // every single drag frame, for every marker, which is what made this
+  // laggy once there were more than a couple dozen -- native Markers are
+  // positioned by the Maps SDK itself, no per-frame JS callback involved,
+  // and don't need any pan/zoom listener at all to stay correctly placed.
+  // Own icon/color so this doesn't read as the same layer as Report
+  // Wayspots' own reported-wayspot history markers -- this shows
+  // *extracted* reports, not Report Wayspots' own submission history, and
+  // doesn't require that script to be installed at all. Clickable --
+  // with dozens of nearby entries otherwise looking identical, a click
+  // naming which ticket a marker belongs to earns its keep here.
   // ---------------------------------------------------------------------
 
   const WAE_MAP_VISIBLE_KEY = 'wae_map_pulses_visible';
-  const WAE_PULSES = { map: null, overlaysById: new Map(), refreshTimer: null, infoWindow: null };
+  const WAE_PULSES = { map: null, markersById: new Map(), infoWindow: null };
   let waeAllRecords = [];
   let waeNearbyMap = new Map();
   let waeSearchQuery = '';
@@ -461,50 +486,21 @@
     ].filter(Boolean).join('\n').toLowerCase();
     return haystack.includes(q);
   }
-  let WaePulseOverlay = null;
-
-  function waeEnsurePulseOverlayClass() {
-    if (WaePulseOverlay) return true;
-    if (typeof google === 'undefined' || !google.maps?.OverlayView) return false;
-
-    WaePulseOverlay = class extends google.maps.OverlayView {
-      constructor(latLng, record) {
-        super();
-        this.latLng = latLng;
-        this.record = record;
-        this.div = null;
-      }
-      onAdd() {
-        const div = document.createElement('div');
-        div.className = 'wae-report-marker';
-        div.title = this.record.wayspotName || '(unnamed report)';
-        div.addEventListener('click', (ev) => {
-          ev.stopPropagation();
-          waeShowPulseInfoWindow(this.record, this.latLng);
-        });
-        this.div = div;
-        this.getPanes().overlayLayer.appendChild(div);
-      }
-      draw() {
-        if (!this.div) return;
-        const proj = this.getProjection();
-        if (!proj) return;
-        const p = proj.fromLatLngToDivPixel(this.latLng);
-        if (!p) return;
-        this.div.style.left = p.x + 'px';
-        this.div.style.top = p.y + 'px';
-        this.div.style.transform = 'translate(-50%, -50%)';
-      }
-      onRemove() {
-        this.div?.remove();
-        this.div = null;
-      }
-      setLatLng(latLng) {
-        this.latLng = latLng;
-        this.draw();
-      }
+  // Built lazily (needs `google` to already be loaded) and cached --
+  // same icon object reused for every marker instead of rebuilt per-call.
+  let WAE_MARKER_ICON = null;
+  function waeGetMarkerIcon() {
+    if (WAE_MARKER_ICON) return WAE_MARKER_ICON;
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20">'
+      + '<line x1="3" y1="3" x2="17" y2="17" stroke="#dc2626" stroke-width="4" stroke-linecap="round"/>'
+      + '<line x1="17" y1="3" x2="3" y2="17" stroke="#dc2626" stroke-width="4" stroke-linecap="round"/>'
+      + '</svg>';
+    WAE_MARKER_ICON = {
+      url: 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(svg),
+      scaledSize: new google.maps.Size(20, 20),
+      anchor: new google.maps.Point(10, 10),
     };
-    return true;
+    return WAE_MARKER_ICON;
   }
 
   function waeShowPulseInfoWindow(record, latLng) {
@@ -521,67 +517,77 @@
     WAE_PULSES.infoWindow.open(WAE_PULSES.map);
   }
 
-  function waeSchedulePulseRefresh(delay = 100) {
-    clearTimeout(WAE_PULSES.refreshTimer);
-    WAE_PULSES.refreshTimer = setTimeout(() => {
-      try { waeRefreshPulses(); } catch (e) { /* ignore */ }
-    }, delay);
-  }
-
   function waeClearPulses() {
-    for (const ov of WAE_PULSES.overlaysById.values()) {
-      try { ov.setMap(null); } catch (e) { /* ignore */ }
+    for (const marker of WAE_PULSES.markersById.values()) {
+      try { marker.setMap(null); } catch (e) { /* ignore */ }
     }
-    WAE_PULSES.overlaysById.clear();
+    WAE_PULSES.markersById.clear();
     if (WAE_PULSES.infoWindow) WAE_PULSES.infoWindow.close();
   }
 
   // Hide below this zoom level so a fully zoomed-out view of the
-  // Netherlands doesn't try to draw/reposition every pulse at once.
+  // Netherlands doesn't try to show every marker at once. Purely a
+  // clutter/legibility gate now, not a performance one -- native markers
+  // are cheap enough that this isn't load-bearing the way it was for the
+  // old OverlayView version.
   function waeShouldShowPulses(map) {
     if (!map || typeof map.getZoom !== 'function') return true;
     const z = map.getZoom();
     return (typeof z === 'number') && z >= 8;
   }
 
-  async function waeRefreshPulses() {
+  // Cheap: just toggles .setMap() on markers that already exist, no data
+  // fetch or marker (re)creation. Safe to call on every zoom_changed.
+  function waeApplyZoomGate() {
+    const map = WAE_PULSES.map;
+    if (!map) return;
+    const show = waeShouldShowPulses(map);
+    for (const marker of WAE_PULSES.markersById.values()) {
+      marker.setMap(show ? map : null);
+    }
+  }
+
+  // Rebuilds the marker set from whatever's currently in waeAllRecords --
+  // NOT from IndexedDB. This used to call getAllExtractedRecords() itself
+  // and ran on every pan ('idle') and zoom step, which meant a full DB
+  // read plus a rebuild-vs-diff pass on every single map interaction --
+  // that was the actual cause of the slowdown, independent of the
+  // OverlayView-vs-Marker question. waeAllRecords is already kept in sync
+  // by refreshPanel() after every scan/clear, so this only needs to run
+  // when that data changes or the map is first attached -- never on
+  // pan/zoom, which is why there's no 'idle' listener anymore at all.
+  function waeRefreshPulses() {
     const map = WAE_PULSES.map;
     if (!map || waeIsMapStale(map)) return;
-    if (!waeEnsurePulseOverlayClass()) return;
+    if (typeof google === 'undefined' || !google.maps?.Marker) return;
 
-    if (!waeShouldShowPulses(map)) {
-      waeClearPulses();
-      return;
-    }
-
-    let records;
-    try {
-      records = await getAllExtractedRecords();
-    } catch (e) {
-      return;
-    }
-
-    const wanted = records.filter((r) => Number.isFinite(r.latitude) && Number.isFinite(r.longitude));
+    const wanted = waeAllRecords.filter((r) => Number.isFinite(r.latitude) && Number.isFinite(r.longitude));
     const wantedIds = new Set(wanted.map((r) => r.id));
 
-    for (const [id, ov] of WAE_PULSES.overlaysById.entries()) {
+    for (const [id, marker] of WAE_PULSES.markersById.entries()) {
       if (!wantedIds.has(id)) {
-        try { ov.setMap(null); } catch (e) { /* ignore */ }
-        WAE_PULSES.overlaysById.delete(id);
+        try { marker.setMap(null); } catch (e) { /* ignore */ }
+        WAE_PULSES.markersById.delete(id);
       }
     }
 
+    const show = waeShouldShowPulses(map);
     for (const record of wanted) {
-      const ll = new google.maps.LatLng(record.latitude, record.longitude);
-      const existing = WAE_PULSES.overlaysById.get(record.id);
-      if (!existing) {
-        const ov = new WaePulseOverlay(ll, record);
-        ov.setMap(map);
-        WAE_PULSES.overlaysById.set(record.id, ov);
-      } else {
-        existing.record = record;
-        existing.setLatLng(ll);
+      const position = { lat: record.latitude, lng: record.longitude };
+      let marker = WAE_PULSES.markersById.get(record.id);
+      if (!marker) {
+        marker = new google.maps.Marker({ icon: waeGetMarkerIcon() });
+        // Read from the marker itself, not a closed-over `record`, so a
+        // later re-scan that updates this same marker's data (name,
+        // comment, etc.) is reflected even though the click listener
+        // below was only attached once at creation time.
+        marker.addListener('click', () => waeShowPulseInfoWindow(marker.waeRecord, marker.getPosition()));
+        WAE_PULSES.markersById.set(record.id, marker);
       }
+      marker.waeRecord = record;
+      marker.setPosition(position);
+      marker.setTitle(record.wayspotName || '(unnamed report)');
+      marker.setMap(show ? map : null);
     }
   }
 
@@ -591,8 +597,10 @@
     if (!map) return false;
     if (WAE_PULSES.map !== map) waeClearPulses();
     WAE_PULSES.map = map;
-    map.addListener?.('zoom_changed', () => waeSchedulePulseRefresh(50));
-    map.addListener?.('idle', () => waeSchedulePulseRefresh(50));
+    // Only listener needed: native markers reposition themselves on
+    // pan/zoom with no app code involved at all. zoom_changed here is
+    // just the clutter gate (waeApplyZoomGate), not a data refresh.
+    map.addListener?.('zoom_changed', () => waeApplyZoomGate());
     return true;
   }
 
@@ -793,18 +801,6 @@
     #wae-table tr.wae-row-nearby td{ background:#fffbeb; }
     #wae-table tr.wae-row-clickable{ cursor:pointer; }
     #wae-table tr.wae-row-clickable:hover td{ background:#fff7ed; }
-
-    .wae-report-marker{
-      position:absolute; width:20px; height:20px; cursor:pointer;
-    }
-    .wae-report-marker::before,
-    .wae-report-marker::after{
-      content:""; position:absolute; left:50%; top:50%;
-      width:24px; height:4px; border-radius:2px;
-      background:#dc2626; box-shadow:0 0 2px rgba(0,0,0,0.6);
-    }
-    .wae-report-marker::before{ transform:translate(-50%, -50%) rotate(45deg); }
-    .wae-report-marker::after{ transform:translate(-50%, -50%) rotate(-45deg); }
 
     #wae-nearby-popover{
       position:fixed; z-index:2100; background:#fff; border:1px solid #e5e7eb;
