@@ -83,7 +83,9 @@ time the page loads and kept in memory only, for the session.
    reports several (or has more added in a later reply) shows several
    rows sharing the same `Conversation ID`. Rows missing a name or
    coordinates are flagged so you can check the raw `Location Details` /
-   `Report Details` columns by hand — then **Export CSV**.
+   `Report Details` columns by hand — then **Export CSV**, or click
+   **Show on Map** to see them plotted directly on the map instead (see
+   below).
 
 ## What counts as an "abuse report" email
 
@@ -124,9 +126,9 @@ correction, it may need a manual check.
 ## CSV columns
 
 `Conversation ID`, `Ticket Status`, `Wayspot Name (best guess)`,
-`Latitude`, `Longitude`, `Comment`, `Issue Type`,
-`Location Details (raw)`, `Report Details (raw)`, `Source Email ID`,
-`Source Filename`.
+`Latitude`, `Longitude`, `Comment`, `Nearby Tickets (<20m, other
+tickets)`, `Issue Type`, `Location Details (raw)`, `Report Details
+(raw)`, `Source Email ID`, `Source Filename`.
 
 `Comment` holds a Street View / Maps link found near that specific
 location in a reply (real example: *"'t Zudn, &lt;lat,lng&gt; (is here:
@@ -135,10 +137,27 @@ context for that entry rather than dropped or turned into a bogus extra
 row. Shown as a hover-for-full-text 💬 in the panel's table since the
 link itself is usually too long to display inline.
 
+`Nearby Tickets` lists any other ticket(s) with a location within 20m of
+this row's — see "Flagging nearby duplicate reports" below.
+
 The two "(raw)" columns are there so you can sanity-check or hand-correct
 a bad name/coordinate guess in a spreadsheet — there's no in-page editing
 UI by design. Since a ticket can now span several rows, use
 `Conversation ID` to group them back together if you need to.
+
+## Flagging nearby duplicate reports
+
+Rows get a ⚠️ (and a subtle highlight) when their coordinates fall within
+20m of a location extracted from a **different** ticket — the same spot
+reported more than once, independently. Click the ⚠️ for a popover
+listing which ticket(s) and how far away — each entry is clickable too,
+jumping the map straight to that specific match so you can compare the
+two directly. The same detail is in the CSV's `Nearby Tickets` column.
+
+Locations within *one* ticket's own thread are never flagged against
+each other — that's the expected multi-location shape this tool already
+handles (see "Multiple Wayspots per ticket" above), not a duplicate worth
+noticing. Flagging only fires across two distinct `Conversation ID`s.
 
 ## Data storage & privacy
 
@@ -168,13 +187,44 @@ doesn't touch the imported emails — re-scan any time to rebuild it.
   that mixes a genuinely new Wayspot into the same sentence as a
   correction, rather than giving it its own line, may need a manual
   check — see "Multiple Wayspots per ticket" above.
-- No map-plotting yet. The importer exposes
-  `window.WayfarerAbuseEmailImporter.publishPoiToMap()` and
-  `getAbuseReportRecords()` specifically so a future script (or a later
-  version of the extractor) can push pins onto Base's map through its
-  real POI bridge — nothing currently calls it.
 - No inline editing of extracted rows — corrections happen in the
   exported CSV.
+
+## Searching
+
+The extractor panel has a search box above the table. It filters against
+name, conversation ID, comment, issue type, both raw text fields, and the
+source filename/email ID — not just what's shown in the columns, since a
+query is more likely to hit the raw `Location Details`/`Report Details`
+text than the best-guess name. It only changes what's *displayed* —
+**Export CSV**, **Show on Map**, and the summary counts above the table
+all still reflect everything, not just the currently-filtered rows.
+
+## Plotting on the map
+
+Click **Show on Map** in the extractor panel to plot every extracted
+location as a red cross marker directly on the Wayfarer map — the same idea
+as Report Wayspots' own reported-wayspot history markers, but for what
+this script extracted from imported emails, and without needing Report
+Wayspots installed. Click a marker for its name, coordinates, comment, and
+ticket ID. The toggle's state is remembered (`localStorage`) and
+re-attaches automatically next time the mapview loads if you left it on;
+markers stay in sync automatically after every scan or clear while it's on.
+
+Every table row with coordinates is clickable too, independent of whether
+the map markers themselves are toggled on — click a row to jump the map
+straight to that location (centering and zooming in) and show the same
+info popup there. Since the panel is a full-screen backdrop, clicking a
+row also closes it, so the map you just navigated to is actually visible.
+
+Base itself has no marker-plotting API — this ports Report Wayspots' own
+confirmed-working map-lookup code and builds an independent
+`google.maps.OverlayView` layer, with its own colour/CSS classes so the
+two don't read as the same thing. `window.WayfarerAbuseEmailImporter
+.publishPoiToMap()` is unrelated to this — that only hands a POI to
+Base's own side-panel selection, not a map marker (an earlier version of
+this README described it as map-plotting; that was wrong, and it's kept
+around as a small convenience API for something else, not for this).
 
 ## Why no `@require` for Base
 
@@ -220,7 +270,7 @@ needed since it's plain `@require`-able JS.
 ## Versions covered by this README
 
 - `wayfarer-abuse-email-importer.user.js` — v4.4.0
-- `wayfarer-abuse-report-extractor.user.js` — v1.5.0
+- `wayfarer-abuse-report-extractor.user.js` — v1.11.0
 
 Full version-by-version detail lives in the changelog comment block at
 the top of each `.user.js` file.

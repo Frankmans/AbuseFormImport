@@ -120,8 +120,20 @@
  *     getAbuseReportRecords() to get the stored {record, email} pairs (each
  *     email already an OPREmail.Email, ready for
  *     OPREmail.helpshift.parseAbuseReportEmail(email)), then hand the title
- *     + coordinates it extracts to publishPoiToMap() to put a pin on the
- *     map through Base's real bridge.
+ *     + coordinates it extracts to publishPoiToMap() to write onto Base's
+ *     real bridge.
+ *     *** CORRECTION, confirmed against Report Wayspots v3.3.0's real
+ *     source ***: publishPoiToMap() does NOT put a pin on the map -- Base
+ *     only shows/selects a bridge-sourced POI in its own side panel (see
+ *     that function's own code comment). The extractor script's actual
+ *     map-plotting (added in its own v1.6.0, "Show on Map") doesn't use
+ *     this bridge at all -- it ports Report Wayspots' real map-lookup code
+ *     and builds its own self-contained pulse-overlay layer instead, the
+ *     only approach actually confirmed to draw a marker. This function and
+ *     getAbuseReportRecords() are left in place as a small convenience API
+ *     regardless -- still useful for a future consumer that only wants
+ *     "the abuse-report emails already parsed" or "hand one POI to Base's
+ *     side panel" -- just not for map-plotting.
  *
  * GMAIL OAUTH DESIGN NOTES:
  * Uses Google Identity Services' token client (a popup-based implicit OAuth

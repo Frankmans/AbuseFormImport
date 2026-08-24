@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Wayfarer Abuse Report Extractor
 // @namespace    https://wayfarer.nianticlabs.com/new
-// @version      1.5.0
-// @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, and exports as CSV.
+// @version      1.11.0
+// @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map, and exports as CSV.
 // @author       you
 // @match        https://wayfarer.nianticlabs.com/new/mapview*
 // @require      https://raw.githubusercontent.com/Frankmans/AbuseFormImport/refs/heads/main/opr-email-lib.js
@@ -51,6 +51,72 @@
  *   - No editing UI for the extracted name/coordinates -- the raw text
  *     columns in the CSV are there so corrections happen in a spreadsheet,
  *     not in-page. Say the word if you'd rather have inline editing.
+ *
+ * v1.11.0 CHANGE FROM v1.10.0: the ⚠️ nearby-duplicate flag is now
+ * clickable instead of just a hover tooltip -- opens a small popover
+ * listing each nearby ticket by name/distance, and clicking one jumps the
+ * map straight to THAT specific match (same waeGoToLocation() a table row
+ * click uses), so you can actually go compare the two rather than just
+ * being told they're close. A plain title="..." can't hold clickable
+ * content, so this is a real floating element (position:fixed, appended
+ * to document.body, since the table's own scroll container would clip
+ * anything positioned inside it) -- closes on an outside click, Escape,
+ * picking an item, or the panel itself closing.
+ *
+ * v1.10.0 CHANGE FROM v1.9.0: rows are now flagged (\u26A0\uFE0F, plus a subtle
+ * row highlight) when their coordinates fall within 20m (Haversine,
+ * WAE_NEARBY_THRESHOLD_METERS) of a location extracted from a DIFFERENT
+ * ticket -- the same spot reported more than once, independently.
+ * Deliberately NOT flagged against each other: multiple locations within
+ * one ticket's own thread -- that's the expected multi-location shape
+ * this tool already handles, not a duplicate to notice. Computed once
+ * per data refresh (scan/clear), not per search keystroke -- it's O(n^2)
+ * over records-with-coordinates, cheap at this tool's usual scale but no
+ * reason to redo it on every filter change. Also exposed as a new
+ * "Nearby Tickets" CSV column, computed at export time.
+ *
+ * v1.9.0 CHANGE FROM v1.8.0: added a search box above the table. Filters
+ * in-memory against the already-fetched record list (no IndexedDB
+ * round-trip per keystroke) across name, conversation ID, comment, issue
+ * type, both raw text fields, and the source filename/email id -- not
+ * just the visible columns, since a query is more likely to hit the raw
+ * locationDetails/reportDetails text than the best-guess name. Filtering
+ * only changes what's displayed; Export CSV, Show on Map, and the
+ * summary counts still reflect everything, not just the visible rows.
+ *
+ * v1.8.0 CHANGE FROM v1.7.0: every table row with coordinates is now
+ * clickable -- jumps the map to that location (centers, zooms in to 17 if
+ * more zoomed out than that) and shows the InfoWindow there, regardless
+ * of whether "Show on Map" pins are toggled on. Since the panel is a
+ * full-screen backdrop, clicking a row also closes it -- otherwise the
+ * map you just navigated would be sitting invisible behind the modal.
+ * Rows with no parseable coordinates aren't clickable (nothing to jump
+ * to). Reuses the same map-attachment code "Show on Map" already ported
+ * from Report Wayspots -- no new map-detection logic needed.
+ *
+ * v1.7.0 CHANGE FROM v1.6.0: markers are now a static red X (two rotated
+ * bars, class .wae-report-marker) instead of the animated expanding-ring
+ * pulse v1.6.0 shipped with -- at your request. No animation/keyframes
+ * left in the CSS. Same OverlayView plumbing, click-for-InfoWindow
+ * behavior, and localStorage-persisted toggle as before -- only the
+ * marker's own look changed.
+ *
+ * v1.6.0 CHANGE FROM v1.5.0: added a "Show on Map" toggle that plots
+ * every extracted location as a red cross marker directly on the Wayfarer
+ * map -- the same thing Report Wayspots does for its own reported-
+ * wayspot history, but for what THIS script extracted from imported
+ * emails, and without needing Report Wayspots installed at all. Base
+ * itself has no marker-plotting API (its own map-lookup is module-scoped,
+ * same as Report Wayspots' copy), so this ports Report Wayspots'
+ * confirmed-working getWfMap()/extractMapFromCtxEntry() map-detection
+ * code and builds a self-contained google.maps.OverlayView marker layer
+ * (own CSS classes/color, kept distinct from Report Wayspots' so the two
+ * don't read as the same layer). Unlike Report Wayspots' pulses, these
+ * are clickable -- shows name/coordinates/comment/ticket in an
+ * InfoWindow, since dozens of nearby entries would otherwise be
+ * indistinguishable. The toggle's on/off state persists in localStorage
+ * and re-attaches automatically on page load if it was left on; pins stay
+ * in sync automatically after every scan or clear while it's on.
  *
  * v1.5.0 CHANGE FROM v1.4.0: Street View / Maps links found near a
  * location in a reply (real example: "'t Zudn, <lat,lng> (is here:
@@ -184,6 +250,389 @@
   }
 
   // ---------------------------------------------------------------------
+  // Map attachment -- ported from Report Wayspots v3.15.0's own
+  // getWfMap()/extractMapFromCtxEntry(), confirmed against that real
+  // script. Base has no public API for "give me the live map instance"
+  // (its own getMap() is module-scoped, same as Report Wayspots' copy),
+  // so every companion script that needs the map reaches into Angular's
+  // __ngContext__ on the map component the same way. Kept here rather
+  // than shared, for the same reason nothing @requires Base anymore --
+  // see the v1.2.0 changelog note above.
+  // ---------------------------------------------------------------------
+
+  function waeLooksLikeGoogleMap(obj) {
+    return !!(obj &&
+              typeof obj.getCenter === 'function' &&
+              typeof obj.addListener === 'function' &&
+              typeof obj.getDiv === 'function');
+  }
+
+  function waeExtractMapFromCtxEntry(entry) {
+    if (!entry) return null;
+    if (waeLooksLikeGoogleMap(entry)) return entry; // mapview
+    const m = entry?.componentRef?.map;             // submit
+    return waeLooksLikeGoogleMap(m) ? m : null;
+  }
+
+  function waeGetWfMap() {
+    return new Promise((resolve) => {
+      let attempts = 80;
+      function tryFindMap() {
+        const candidates = document.querySelectorAll('app-submit-wayspot-map nia-map, app-wf-base-map');
+        for (const el of candidates) {
+          const ctx = el && el.__ngContext__;
+          if (!ctx) continue;
+          for (const entry of ctx) {
+            try {
+              const map = waeExtractMapFromCtxEntry(entry);
+              if (map) return resolve(map);
+            } catch (e) { /* ignore */ }
+          }
+        }
+        if (attempts-- <= 0) return resolve(null);
+        setTimeout(tryFindMap, 250);
+      }
+      tryFindMap();
+    });
+  }
+
+  function waeIsMapStale(map) {
+    try {
+      const div = map && map.getDiv && map.getDiv();
+      return !div || !div.isConnected;
+    } catch (e) {
+      return true;
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Cross-ticket proximity flagging -- "was this same spot reported more
+  // than once, in a different ticket". Multiple locations within ONE
+  // ticket's own thread are expected (that's the whole multi-location
+  // feature) and never flagged against each other here; this is
+  // specifically about two different conversationIds landing on
+  // (near-)identical coordinates, which is the pattern worth a human
+  // actually noticing -- repeat/recurring spam locations, or the same
+  // Wayspot reported independently by someone else.
+  // ---------------------------------------------------------------------
+
+  const WAE_NEARBY_THRESHOLD_METERS = 20;
+
+  function waeHaversineMeters(lat1, lon1, lat2, lon2) {
+    const R = 6371000;
+    const toRad = (d) => (d * Math.PI) / 180;
+    const dLat = toRad(lat2 - lat1);
+    const dLon = toRad(lon2 - lon1);
+    const a = Math.sin(dLat / 2) ** 2 +
+              Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+    return 2 * R * Math.asin(Math.sqrt(a));
+  }
+
+  // Returns a Map from record.id -> array of { record, distanceMeters },
+  // one entry per OTHER record (from a different ticket) found within
+  // WAE_NEARBY_THRESHOLD_METERS. O(n^2) over records-with-coordinates,
+  // which is fine at the scale this tool deals in (tens to low hundreds
+  // of rows, not thousands).
+  function waeFindNearbyDuplicates(records) {
+    const withCoords = records.filter((r) => Number.isFinite(r.latitude) && Number.isFinite(r.longitude));
+    const result = new Map();
+    const addMatch = (id, entry) => {
+      if (!result.has(id)) result.set(id, []);
+      result.get(id).push(entry);
+    };
+    for (let i = 0; i < withCoords.length; i++) {
+      for (let j = i + 1; j < withCoords.length; j++) {
+        const a = withCoords[i];
+        const b = withCoords[j];
+        const aTicket = a.conversationId || a.sourceEmailId;
+        const bTicket = b.conversationId || b.sourceEmailId;
+        if (aTicket === bTicket) continue;
+        const distanceMeters = waeHaversineMeters(a.latitude, a.longitude, b.latitude, b.longitude);
+        if (distanceMeters <= WAE_NEARBY_THRESHOLD_METERS) {
+          addMatch(a.id, { record: b, distanceMeters });
+          addMatch(b.id, { record: a, distanceMeters });
+        }
+      }
+    }
+    return result;
+  }
+
+  function waeSortedNearbyMatches(nearby) {
+    return (nearby || []).slice().sort((x, y) => x.distanceMeters - y.distanceMeters);
+  }
+
+  function waeFormatNearbyForCsv(nearby) {
+    if (!nearby || !nearby.length) return null;
+    return waeSortedNearbyMatches(nearby)
+      .map((n) => `${n.record.conversationId || n.record.sourceEmailId} (${Math.round(n.distanceMeters)}m)`)
+      .join('; ');
+  }
+
+  // ---------------------------------------------------------------------
+  // Nearby-flag popover -- clicking a ⚠️ lists the specific ticket(s) it's
+  // near, each as its own clickable item that jumps straight to THAT
+  // match's location (via waeGoToLocation, same as clicking a table row
+  // directly) rather than just naming it in a hover tooltip with nowhere
+  // to go.
+  // ---------------------------------------------------------------------
+
+  let waeNearbyPopoverEl = null;
+
+  function waeCloseNearbyPopover() {
+    if (!waeNearbyPopoverEl) return;
+    waeNearbyPopoverEl.remove();
+    waeNearbyPopoverEl = null;
+    document.removeEventListener('click', waeNearbyPopoverOutsideClick, true);
+    document.removeEventListener('keydown', waeNearbyPopoverEscHandler);
+  }
+
+  function waeNearbyPopoverEscHandler(ev) {
+    if (ev.key === 'Escape') waeCloseNearbyPopover();
+  }
+
+  function waeNearbyPopoverOutsideClick(ev) {
+    if (waeNearbyPopoverEl && !waeNearbyPopoverEl.contains(ev.target)) waeCloseNearbyPopover();
+  }
+
+  function waeOpenNearbyPopover(anchorEl, nearby) {
+    waeCloseNearbyPopover();
+
+    const items = waeSortedNearbyMatches(nearby).map((n) => {
+      const label = `${n.record.wayspotName || '(unnamed)'} \u2014 ${Math.round(n.distanceMeters)}m \u2014 ticket ${n.record.conversationId || n.record.sourceEmailId}`;
+      return `<button type="button" class="wae-nearby-item" data-id="${escapeHtml(n.record.id)}">${escapeHtml(label)}</button>`;
+    }).join('');
+
+    const pop = document.createElement('div');
+    pop.id = 'wae-nearby-popover';
+    pop.innerHTML = `<div class="wae-nearby-popover-title">Within ${WAE_NEARBY_THRESHOLD_METERS}m, other ticket(s) -- click to go there:</div>${items}`;
+    document.body.appendChild(pop);
+
+    const anchorRect = anchorEl.getBoundingClientRect();
+    const left = Math.max(8, Math.min(anchorRect.left, window.innerWidth - pop.offsetWidth - 8));
+    const top = Math.min(anchorRect.bottom + 4, window.innerHeight - pop.offsetHeight - 8);
+    pop.style.left = left + 'px';
+    pop.style.top = top + 'px';
+
+    pop.addEventListener('click', (ev) => {
+      const btn = ev.target.closest('.wae-nearby-item');
+      if (!btn) return;
+      const target = waeAllRecords.find((r) => r.id === btn.dataset.id);
+      waeCloseNearbyPopover();
+      if (target) waeGoToLocation(target);
+    });
+
+    waeNearbyPopoverEl = pop;
+    // Deferred so the click that opened the popover doesn't immediately
+    // bubble into the outside-click listener and close it again.
+    setTimeout(() => {
+      document.addEventListener('click', waeNearbyPopoverOutsideClick, true);
+      document.addEventListener('keydown', waeNearbyPopoverEscHandler);
+    }, 0);
+  }
+
+  // ---------------------------------------------------------------------
+  // Map plotting -- a self-contained marker overlay for extracted
+  // locations, the same OverlayView approach Report Wayspots uses for its
+  // own reported-wayspot history (own CSS classes/color so the two don't
+  // read as the same layer -- this shows *extracted* reports, not
+  // Report Wayspots' own submission history, and doesn't require that
+  // script to be installed at all). Unlike Report Wayspots' pulses, these
+  // are clickable -- with dozens of nearby entries otherwise looking
+  // identical, a click naming which ticket a pulse belongs to earns its
+  // keep here.
+  // ---------------------------------------------------------------------
+
+  const WAE_MAP_VISIBLE_KEY = 'wae_map_pulses_visible';
+  const WAE_PULSES = { map: null, overlaysById: new Map(), refreshTimer: null, infoWindow: null };
+  let waeAllRecords = [];
+  let waeNearbyMap = new Map();
+  let waeSearchQuery = '';
+
+  // Search matches across everything a person might actually search by --
+  // not just the visible name/conversation columns, but the raw
+  // locationDetails/reportDetails text too, since a query like a street
+  // name or an issue keyword is more likely to hit those than the
+  // best-guess Wayspot name.
+  function waeMatchesQuery(r, q) {
+    if (!q) return true;
+    const haystack = [
+      r.wayspotName, r.conversationId, r.comment, r.issueType,
+      r.locationDetails, r.reportDetails, r.sourceFilename, r.sourceEmailId,
+    ].filter(Boolean).join('\n').toLowerCase();
+    return haystack.includes(q);
+  }
+  let WaePulseOverlay = null;
+
+  function waeEnsurePulseOverlayClass() {
+    if (WaePulseOverlay) return true;
+    if (typeof google === 'undefined' || !google.maps?.OverlayView) return false;
+
+    WaePulseOverlay = class extends google.maps.OverlayView {
+      constructor(latLng, record) {
+        super();
+        this.latLng = latLng;
+        this.record = record;
+        this.div = null;
+      }
+      onAdd() {
+        const div = document.createElement('div');
+        div.className = 'wae-report-marker';
+        div.title = this.record.wayspotName || '(unnamed report)';
+        div.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          waeShowPulseInfoWindow(this.record, this.latLng);
+        });
+        this.div = div;
+        this.getPanes().overlayLayer.appendChild(div);
+      }
+      draw() {
+        if (!this.div) return;
+        const proj = this.getProjection();
+        if (!proj) return;
+        const p = proj.fromLatLngToDivPixel(this.latLng);
+        if (!p) return;
+        this.div.style.left = p.x + 'px';
+        this.div.style.top = p.y + 'px';
+        this.div.style.transform = 'translate(-50%, -50%)';
+      }
+      onRemove() {
+        this.div?.remove();
+        this.div = null;
+      }
+      setLatLng(latLng) {
+        this.latLng = latLng;
+        this.draw();
+      }
+    };
+    return true;
+  }
+
+  function waeShowPulseInfoWindow(record, latLng) {
+    if (typeof google === 'undefined' || !google.maps?.InfoWindow || !WAE_PULSES.map) return;
+    if (!WAE_PULSES.infoWindow) WAE_PULSES.infoWindow = new google.maps.InfoWindow();
+    const name = escapeHtml(record.wayspotName || '(unnamed report)');
+    const parts = [`<div style="font-size:12px;max-width:260px;"><strong>${name}</strong>`];
+    parts.push(`<div>${latLng.lat().toFixed(6)}, ${latLng.lng().toFixed(6)}</div>`);
+    if (record.comment) parts.push(`<div style="margin-top:4px;color:#6b7280;word-break:break-all;">${escapeHtml(record.comment)}</div>`);
+    if (record.conversationId) parts.push(`<div style="margin-top:4px;color:#9ca3af;">Ticket ${escapeHtml(record.conversationId)}</div>`);
+    parts.push('</div>');
+    WAE_PULSES.infoWindow.setContent(parts.join(''));
+    WAE_PULSES.infoWindow.setPosition(latLng);
+    WAE_PULSES.infoWindow.open(WAE_PULSES.map);
+  }
+
+  function waeSchedulePulseRefresh(delay = 100) {
+    clearTimeout(WAE_PULSES.refreshTimer);
+    WAE_PULSES.refreshTimer = setTimeout(() => {
+      try { waeRefreshPulses(); } catch (e) { /* ignore */ }
+    }, delay);
+  }
+
+  function waeClearPulses() {
+    for (const ov of WAE_PULSES.overlaysById.values()) {
+      try { ov.setMap(null); } catch (e) { /* ignore */ }
+    }
+    WAE_PULSES.overlaysById.clear();
+    if (WAE_PULSES.infoWindow) WAE_PULSES.infoWindow.close();
+  }
+
+  // Hide below this zoom level so a fully zoomed-out view of the
+  // Netherlands doesn't try to draw/reposition every pulse at once.
+  function waeShouldShowPulses(map) {
+    if (!map || typeof map.getZoom !== 'function') return true;
+    const z = map.getZoom();
+    return (typeof z === 'number') && z >= 8;
+  }
+
+  async function waeRefreshPulses() {
+    const map = WAE_PULSES.map;
+    if (!map || waeIsMapStale(map)) return;
+    if (!waeEnsurePulseOverlayClass()) return;
+
+    if (!waeShouldShowPulses(map)) {
+      waeClearPulses();
+      return;
+    }
+
+    let records;
+    try {
+      records = await getAllExtractedRecords();
+    } catch (e) {
+      return;
+    }
+
+    const wanted = records.filter((r) => Number.isFinite(r.latitude) && Number.isFinite(r.longitude));
+    const wantedIds = new Set(wanted.map((r) => r.id));
+
+    for (const [id, ov] of WAE_PULSES.overlaysById.entries()) {
+      if (!wantedIds.has(id)) {
+        try { ov.setMap(null); } catch (e) { /* ignore */ }
+        WAE_PULSES.overlaysById.delete(id);
+      }
+    }
+
+    for (const record of wanted) {
+      const ll = new google.maps.LatLng(record.latitude, record.longitude);
+      const existing = WAE_PULSES.overlaysById.get(record.id);
+      if (!existing) {
+        const ov = new WaePulseOverlay(ll, record);
+        ov.setMap(map);
+        WAE_PULSES.overlaysById.set(record.id, ov);
+      } else {
+        existing.record = record;
+        existing.setLatLng(ll);
+      }
+    }
+  }
+
+  async function waeAttachToMapIfNeeded() {
+    if (WAE_PULSES.map && !waeIsMapStale(WAE_PULSES.map)) return true;
+    const map = await waeGetWfMap();
+    if (!map) return false;
+    if (WAE_PULSES.map !== map) waeClearPulses();
+    WAE_PULSES.map = map;
+    map.addListener?.('zoom_changed', () => waeSchedulePulseRefresh(50));
+    map.addListener?.('idle', () => waeSchedulePulseRefresh(50));
+    return true;
+  }
+
+  // Panel-row click -> jump the map to that location. The panel is a
+  // full-screen backdrop, so the map isn't visible until it closes -- this
+  // closes it as part of navigating, the same way clicking a location is
+  // expected to actually show it rather than just move something behind
+  // the modal. Shows the InfoWindow on arrival too, as immediate visual
+  // confirmation regardless of whether "Show on Map" pins are toggled on.
+  async function waeGoToLocation(record) {
+    if (!Number.isFinite(record.latitude) || !Number.isFinite(record.longitude)) return;
+    const attached = await waeAttachToMapIfNeeded();
+    if (!attached) {
+      const logEl = document.getElementById('wae-log');
+      if (logEl) log(logEl, '✗ Could not find the Wayfarer map on this page -- try again from the mapview.', 'err');
+      return;
+    }
+    const map = WAE_PULSES.map;
+    const latLng = new google.maps.LatLng(record.latitude, record.longitude);
+    map.setCenter(latLng);
+    const z = map.getZoom();
+    if (typeof z === 'number' && z < 17) map.setZoom(17);
+    closePanel();
+    google.maps.event.addListenerOnce(map, 'idle', () => waeShowPulseInfoWindow(record, latLng));
+  }
+
+  function isMapPulsesEnabled() {
+    return localStorage.getItem(WAE_MAP_VISIBLE_KEY) === 'true';
+  }
+
+  // Re-syncs the map layer with whatever's currently in storage, but only
+  // if the toggle is actually on -- called after scan/clear so the map
+  // doesn't silently drift out of date while "Show on Map" is active.
+  async function waeResyncMapIfVisible() {
+    if (!isMapPulsesEnabled()) return;
+    const attached = await waeAttachToMapIfNeeded();
+    if (attached) waeRefreshPulses();
+  }
+
+  // ---------------------------------------------------------------------
   // Scan: raw imported emails -> extracted rows
   // ---------------------------------------------------------------------
 
@@ -258,6 +707,7 @@
     ['latitude', 'Latitude'],
     ['longitude', 'Longitude'],
     ['comment', 'Comment'],
+    ['nearbyTickets', 'Nearby Tickets (<20m, other tickets)'],
     ['issueType', 'Issue Type'],
     ['locationDetails', 'Location Details (raw)'],
     ['reportDetails', 'Report Details (raw)'],
@@ -316,6 +766,10 @@
     #wae-panel .wae-sub{ font-size:11px; color:#6b7280; margin-bottom:8px; }
     .wae-btn-row{ display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin:6px 0; }
     .wae-btn-row .wfmapmods-modal-btn{ margin:0; }
+    .wae-text-input{
+      width:100%; box-sizing:border-box; border:1px solid #d1d5db; border-radius:4px;
+      padding:5px 8px; font-size:12px; margin:6px 0; font-family:inherit;
+    }
     .wae-btn-danger{ color:#dc2626; border-color:#dc2626; }
     #wae-panel button:disabled{ opacity:0.5; cursor:default; }
     #wae-progress{ font-size:11px; color:#2563eb; margin:4px 0; min-height:14px; }
@@ -335,7 +789,37 @@
     }
     #wae-table td.wae-missing{ color:#9ca3af; font-style:italic; }
     #wae-table td.wae-comment{ text-align:center; cursor:help; max-width:24px; }
-    #wae-table tr:hover td{ background:#f9fafb; }
+    #wae-table td.wae-nearby-flag{ text-align:center; cursor:help; max-width:24px; }
+    #wae-table tr.wae-row-nearby td{ background:#fffbeb; }
+    #wae-table tr.wae-row-clickable{ cursor:pointer; }
+    #wae-table tr.wae-row-clickable:hover td{ background:#fff7ed; }
+
+    .wae-report-marker{
+      position:absolute; width:20px; height:20px; cursor:pointer;
+    }
+    .wae-report-marker::before,
+    .wae-report-marker::after{
+      content:""; position:absolute; left:50%; top:50%;
+      width:24px; height:4px; border-radius:2px;
+      background:#dc2626; box-shadow:0 0 2px rgba(0,0,0,0.6);
+    }
+    .wae-report-marker::before{ transform:translate(-50%, -50%) rotate(45deg); }
+    .wae-report-marker::after{ transform:translate(-50%, -50%) rotate(-45deg); }
+
+    #wae-nearby-popover{
+      position:fixed; z-index:2100; background:#fff; border:1px solid #e5e7eb;
+      border-radius:6px; box-shadow:0 8px 24px rgba(0,0,0,0.18);
+      padding:6px; max-width:320px; font-family:Roboto, Arial, sans-serif;
+    }
+    .wae-nearby-popover-title{
+      font-size:11px; color:#6b7280; padding:2px 6px 6px; white-space:normal;
+    }
+    .wae-nearby-item{
+      display:block; width:100%; text-align:left; background:none; border:none;
+      border-radius:4px; padding:6px; font-size:12px; color:#111827; cursor:pointer;
+      white-space:normal;
+    }
+    .wae-nearby-item:hover{ background:#fffbeb; }
   `;
 
   function log(container, msg, cls) {
@@ -346,9 +830,11 @@
     while (container.children.length > 50) container.removeChild(container.lastChild);
   }
 
-  function renderTable(records) {
+  function renderTable(records, hasQuery, nearbyMap) {
     if (!records.length) {
-      return '<div class="wae-sub">No abuse reports extracted yet -- click "Scan Imported Emails".</div>';
+      return hasQuery
+        ? '<div class="wae-sub">No rows match that search.</div>'
+        : '<div class="wae-sub">No abuse reports extracted yet -- click "Scan Imported Emails".</div>';
     }
     const rows = records
       .slice()
@@ -357,17 +843,28 @@
         const name = r.wayspotName
           ? `<td title="${escapeHtml(r.wayspotName)}">${escapeHtml(r.wayspotName)}</td>`
           : '<td class="wae-missing">(none found)</td>';
-        const lat = r.latitude !== null ? r.latitude.toFixed(6) : '<span class="wae-missing">-</span>';
-        const lng = r.longitude !== null ? r.longitude.toFixed(6) : '<span class="wae-missing">-</span>';
+        const hasCoords = r.latitude !== null && r.longitude !== null;
+        const lat = hasCoords ? r.latitude.toFixed(6) : '<span class="wae-missing">-</span>';
+        const lng = hasCoords ? r.longitude.toFixed(6) : '<span class="wae-missing">-</span>';
         const comment = r.comment
           ? `<td class="wae-comment" title="${escapeHtml(r.comment)}">\uD83D\uDCAC</td>`
           : '<td></td>';
-        return `<tr>
+        const nearby = nearbyMap && nearbyMap.get(r.id);
+        const nearbyCell = nearby && nearby.length
+          ? `<td class="wae-nearby-flag" data-nearby-id="${escapeHtml(r.id)}" title="Click to see nearby ticket(s)">\u26A0\uFE0F</td>`
+          : '<td></td>';
+        const classes = [];
+        if (hasCoords) classes.push('wae-row-clickable');
+        if (nearby && nearby.length) classes.push('wae-row-nearby');
+        const rowAttrs = (classes.length ? ` class="${classes.join(' ')}"` : '') +
+          (hasCoords ? ` data-id="${escapeHtml(r.id)}" title="Click to locate on the map"` : '');
+        return `<tr${rowAttrs}>
           <td>${escapeHtml(r.conversationId || r.sourceEmailId)}</td>
           ${name}
           <td>${lat}</td>
           <td>${lng}</td>
           ${comment}
+          ${nearbyCell}
           <td>${escapeHtml(r.ticketStatus.replace('ABUSE_REPORT_', ''))}</td>
         </tr>`;
       })
@@ -375,7 +872,7 @@
     return `
       <div id="wae-table-wrap">
         <table id="wae-table">
-          <thead><tr><th>Conversation</th><th>Wayspot Name</th><th>Lat</th><th>Lng</th><th></th><th>Status</th></tr></thead>
+          <thead><tr><th>Conversation</th><th>Wayspot Name</th><th>Lat</th><th>Lng</th><th></th><th></th><th>Status</th></tr></thead>
           <tbody>${rows}</tbody>
         </table>
       </div>`;
@@ -385,27 +882,45 @@
     return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   }
 
-  async function refreshPanel() {
+  function waeRenderFilteredTable() {
     const countEl = document.getElementById('wae-count');
     const tableEl = document.getElementById('wae-table-container');
-    let extracted = [];
+    const q = waeSearchQuery.trim().toLowerCase();
+    const filtered = q ? waeAllRecords.filter((r) => waeMatchesQuery(r, q)) : waeAllRecords;
+
+    if (tableEl) tableEl.innerHTML = renderTable(filtered, !!q, waeNearbyMap);
+
+    const withCoords = waeAllRecords.filter((r) => r.latitude !== null && r.longitude !== null).length;
+    const withName = waeAllRecords.filter((r) => r.wayspotName).length;
+    const ticketCount = new Set(waeAllRecords.map((r) => r.conversationId || r.sourceEmailId)).size;
+    const nearbyCount = waeNearbyMap.size;
+    if (countEl) {
+      let base = `${waeAllRecords.length} location(s) extracted from ${ticketCount} ticket(s) -- ${withCoords} with coordinates, ${withName} with a name guess.`;
+      if (nearbyCount) base += ` \u26A0\uFE0F ${nearbyCount} within ${WAE_NEARBY_THRESHOLD_METERS}m of a report from another ticket.`;
+      countEl.textContent = q ? `${filtered.length} match${filtered.length === 1 ? '' : 'es'} -- ${base}` : base;
+    }
+
+    const exportBtn = document.getElementById('wae-export-btn');
+    if (exportBtn) exportBtn.disabled = waeAllRecords.length === 0;
+    const clearBtn = document.getElementById('wae-clear-btn');
+    if (clearBtn) clearBtn.disabled = waeAllRecords.length === 0;
+    const mapToggleBtn = document.getElementById('wae-map-toggle-btn');
+    if (mapToggleBtn) {
+      mapToggleBtn.disabled = withCoords === 0;
+      mapToggleBtn.textContent = isMapPulsesEnabled() ? 'Hide from Map' : 'Show on Map';
+    }
+  }
+
+  async function refreshPanel() {
+    const countEl = document.getElementById('wae-count');
     try {
-      extracted = await getAllExtractedRecords();
+      waeAllRecords = await getAllExtractedRecords();
     } catch (e) {
       if (countEl) countEl.textContent = 'Could not read extracted-report storage.';
       return;
     }
-    const withCoords = extracted.filter((r) => r.latitude !== null && r.longitude !== null).length;
-    const withName = extracted.filter((r) => r.wayspotName).length;
-    const ticketCount = new Set(extracted.map((r) => r.conversationId || r.sourceEmailId)).size;
-    if (countEl) {
-      countEl.textContent = `${extracted.length} location(s) extracted from ${ticketCount} ticket(s) -- ${withCoords} with coordinates, ${withName} with a name guess.`;
-    }
-    if (tableEl) tableEl.innerHTML = renderTable(extracted);
-    const exportBtn = document.getElementById('wae-export-btn');
-    if (exportBtn) exportBtn.disabled = extracted.length === 0;
-    const clearBtn = document.getElementById('wae-clear-btn');
-    if (clearBtn) clearBtn.disabled = extracted.length === 0;
+    waeNearbyMap = waeFindNearbyDuplicates(waeAllRecords);
+    waeRenderFilteredTable();
   }
 
   function buildPanel() {
@@ -429,10 +944,13 @@
 
         <div class="wae-btn-row">
           <button id="wae-scan-btn" class="wfmapmods-modal-btn wfmapmods-modal-btn-primary">Scan Imported Emails</button>
+          <button id="wae-map-toggle-btn" class="wfmapmods-modal-btn" disabled>Show on Map</button>
           <button id="wae-export-btn" class="wfmapmods-modal-btn" disabled>Export CSV</button>
           <button id="wae-clear-btn" class="wfmapmods-modal-btn wae-btn-danger" disabled>Clear Extracted Data</button>
         </div>
         <div id="wae-progress"></div>
+
+        <input type="text" id="wae-search-input" class="wae-text-input" placeholder="Search name, ticket, location/report text...">
 
         <div id="wae-table-container"></div>
         <div id="wae-log"></div>
@@ -452,11 +970,55 @@
 
     panel.querySelector('#wae-close-btn').addEventListener('click', closePanel);
 
+    const tableContainerEl = panel.querySelector('#wae-table-container');
+    tableContainerEl.addEventListener('click', (ev) => {
+      const flagCell = ev.target.closest('.wae-nearby-flag[data-nearby-id]');
+      if (flagCell) {
+        ev.stopPropagation();
+        const nearby = waeNearbyMap.get(flagCell.dataset.nearbyId);
+        if (nearby && nearby.length) waeOpenNearbyPopover(flagCell, nearby);
+        return;
+      }
+      const tr = ev.target.closest('tr[data-id]');
+      if (!tr) return;
+      const record = waeAllRecords.find((r) => r.id === tr.dataset.id);
+      if (record) waeGoToLocation(record);
+    });
+
+    const searchInput = panel.querySelector('#wae-search-input');
+    searchInput.addEventListener('input', () => {
+      waeSearchQuery = searchInput.value;
+      waeRenderFilteredTable();
+    });
+
     const progressEl = panel.querySelector('#wae-progress');
     const logEl = panel.querySelector('#wae-log');
     const scanBtn = panel.querySelector('#wae-scan-btn');
+    const mapToggleBtn = panel.querySelector('#wae-map-toggle-btn');
     const exportBtn = panel.querySelector('#wae-export-btn');
     const clearBtn = panel.querySelector('#wae-clear-btn');
+
+    mapToggleBtn.addEventListener('click', async () => {
+      const turningOn = !isMapPulsesEnabled();
+      if (turningOn) {
+        mapToggleBtn.disabled = true;
+        mapToggleBtn.textContent = 'Attaching to map...';
+        const attached = await waeAttachToMapIfNeeded();
+        mapToggleBtn.disabled = false;
+        if (!attached) {
+          log(logEl, '✗ Could not find the Wayfarer map on this page -- try again from the mapview.', 'err');
+          mapToggleBtn.textContent = 'Show on Map';
+          return;
+        }
+        localStorage.setItem(WAE_MAP_VISIBLE_KEY, 'true');
+        await waeRefreshPulses();
+        mapToggleBtn.textContent = 'Hide from Map';
+      } else {
+        localStorage.setItem(WAE_MAP_VISIBLE_KEY, 'false');
+        waeClearPulses();
+        mapToggleBtn.textContent = 'Show on Map';
+      }
+    });
 
     scanBtn.addEventListener('click', async () => {
       scanBtn.disabled = true;
@@ -486,6 +1048,7 @@
       } finally {
         scanBtn.disabled = false;
         refreshPanel();
+        waeResyncMapIfVisible();
       }
     });
 
@@ -493,7 +1056,12 @@
       try {
         const extracted = await getAllExtractedRecords();
         if (!extracted.length) return;
-        downloadCsv(extracted);
+        const nearby = waeFindNearbyDuplicates(extracted);
+        const withNearby = extracted.map((r) => ({
+          ...r,
+          nearbyTickets: waeFormatNearbyForCsv(nearby.get(r.id)),
+        }));
+        downloadCsv(withNearby);
         log(logEl, `✓ Exported ${extracted.length} row(s) to CSV.`, 'ok');
       } catch (e) {
         log(logEl, `✗ Export failed: ${e.message || e}`, 'err');
@@ -509,6 +1077,7 @@
         log(logEl, `✗ Clear failed: ${e.message || e}`, 'err');
       } finally {
         refreshPanel();
+        waeResyncMapIfVisible();
       }
     });
   }
@@ -529,6 +1098,7 @@
     const panel = document.getElementById('wae-panel');
     if (panel) panel.style.display = 'none';
     document.removeEventListener('keydown', waeEscHandler);
+    waeCloseNearbyPopover();
   }
 
   function togglePanel() {
@@ -608,4 +1178,5 @@
 
   buildPanel();
   startSidePanelWatcher();
+  waeResyncMapIfVisible();
 })();
