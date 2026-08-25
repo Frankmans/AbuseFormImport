@@ -67,9 +67,17 @@
     // as a freeform support conversation rather than through a templated
     // per-submission notification email. See the "helpshift.ts" section
     // below for why this needs its own thread-parsing logic.
+    //
+    // RECEIVED/PENDING/ACTIONED/DENIED are matched against Niantic
+    // Support's own confirmed canned reply text (see RESOLUTION_TEMPLATES
+    // below) -- UPDATED is the catch-all for anything else (a custom
+    // human reply, the reporter's own follow-up being the newest message,
+    // etc.), not a fourth canned outcome.
     ABUSE_REPORT_RECEIVED: "ABUSE_REPORT_RECEIVED",
+    ABUSE_REPORT_PENDING: "ABUSE_REPORT_PENDING",
+    ABUSE_REPORT_ACTIONED: "ABUSE_REPORT_ACTIONED",
+    ABUSE_REPORT_DENIED: "ABUSE_REPORT_DENIED",
     ABUSE_REPORT_UPDATED: "ABUSE_REPORT_UPDATED",
-    ABUSE_REPORT_DECIDED: "ABUSE_REPORT_DECIDED",
   };
 
   const Style = {
@@ -2194,15 +2202,34 @@ const TEMPLATES = [
           && /thank you for contacting/.test(newestText)
           && /back to you shortly/.test(newestText);
 
-        // *** BEST-EFFORT / UNCONFIRMED *** -- no real resolved/closed
-        // example was available when this was written. These keywords are
-        // guessed from generic support-ticket vocabulary only; treat an
-        // ABUSE_REPORT_DECIDED result with more caution than the other two.
-        const looksDecided = newestIsSupport && /(resolved|closing this (ticket|conversation)|has been closed|no further action)/.test(newestText);
+        // Niantic Support closes an abuse-report ticket with one of three
+        // canned replies -- confirmed real text for all three:
+        //   ACTIONED: "We have reviewed the report and have taken action
+        //     on the Wayspots in accordance with our policies."
+        //   PENDING: "Thank you for your patience as your report is being
+        //     looked into. We will follow up once we have reviewed the
+        //     reported Wayspots."
+        //   DENIED: "We took another look at the Wayspot in question and
+        //     decided that it does not meet our criteria for removal at
+        //     this time."
+        // Matched against whitespace-normalized text (a canned phrase can
+        // be word-wrapped across lines in the raw email) so wrapping
+        // doesn't break the match. This replaces an earlier *** BEST-
+        // EFFORT / UNCONFIRMED *** version that guessed generic support-
+        // ticket vocabulary ("resolved", "closing this ticket", etc.)
+        // because no real resolved/closed example was available when it
+        // was written -- keep that history in mind if a *fourth* canned
+        // reply ever turns up that doesn't match any of these three.
+        const newestNormalized = newestText.replace(/\s+/g, " ").trim();
+        const looksActioned = newestIsSupport && /we have reviewed the report and have taken action on the wayspots? in accordance with our policies/.test(newestNormalized);
+        const looksPending = newestIsSupport && /thank you for your patience as your report is being looked into\.? we will follow up once we have reviewed the reported wayspots?/.test(newestNormalized);
+        const looksDenied = newestIsSupport && /we took another look at the wayspot in question and decided that it does not meet our criteria for removal at this time/.test(newestNormalized);
 
         let type;
         if (isAutoAck) type = Type.ABUSE_REPORT_RECEIVED;
-        else if (looksDecided) type = Type.ABUSE_REPORT_DECIDED;
+        else if (looksActioned) type = Type.ABUSE_REPORT_ACTIONED;
+        else if (looksPending) type = Type.ABUSE_REPORT_PENDING;
+        else if (looksDenied) type = Type.ABUSE_REPORT_DENIED;
         else type = Type.ABUSE_REPORT_UPDATED;
 
         return { type, style: Style.SUPPORT, language: "en" };

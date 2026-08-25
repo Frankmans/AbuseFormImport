@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Abuse Report Extractor
 // @namespace    https://wayfarer.nianticlabs.com/new
-// @version      1.14.0
+// @version      1.15.0
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map, and exports as CSV.
 // @author       you
 // @match        https://wayfarer.nianticlabs.com/new/mapview*
@@ -51,6 +51,14 @@
  *   - No editing UI for the extracted name/coordinates -- the raw text
  *     columns in the CSV are there so corrections happen in a spreadsheet,
  *     not in-page. Say the word if you'd rather have inline editing.
+ *
+ * v1.15.0 CHANGE FROM v1.14.0: the Status column is now a friendly,
+ * color-coded badge (Received/Pending Review/Actioned/Denied/Updated)
+ * instead of a raw ABUSE_REPORT_* enum suffix -- reflects opr-email-
+ * lib.js's confirmed-accurate three-way resolution classification (see
+ * that file's own changelog note): Actioned and Denied both mean nothing
+ * further to do here, Pending Review means revisit later. Also included
+ * in search (querying "pending" now matches) and the CSV export.
  *
  * v1.14.0 CHANGE FROM v1.13.0: fixed markers not showing (or vanishing)
  * once you'd zoomed into a specific Wayspot -- Wayfarer's zoomed-in
@@ -554,6 +562,7 @@
     const haystack = [
       r.wayspotName, r.conversationId, r.comment, r.issueType,
       r.locationDetails, r.reportDetails, r.sourceFilename, r.sourceEmailId,
+      waeStatusLabel(r.ticketStatus),
     ].filter(Boolean).join('\n').toLowerCase();
     return haystack.includes(q);
   }
@@ -907,6 +916,10 @@
     #wae-table td.wae-missing{ color:#9ca3af; font-style:italic; }
     #wae-table td.wae-comment{ text-align:center; cursor:help; max-width:24px; }
     #wae-table td.wae-nearby-flag{ text-align:center; cursor:help; max-width:24px; }
+    .wae-status-badge{
+      display:inline-block; border:1px solid; border-radius:9999px;
+      padding:1px 8px; font-size:10.5px; font-weight:600; white-space:nowrap;
+    }
     #wae-table tr.wae-row-nearby td{ background:#fffbeb; }
     #wae-table tr.wae-row-clickable{ cursor:pointer; }
     #wae-table tr.wae-row-clickable:hover td{ background:#fff7ed; }
@@ -933,6 +946,34 @@
     line.textContent = msg;
     container.prepend(line);
     while (container.children.length > 50) container.removeChild(container.lastChild);
+  }
+
+  // Friendly label + color per ticket status -- matches Niantic Support's
+  // three confirmed canned closing replies (see opr-email-lib.js's
+  // HELPSHIFT_TEMPLATES disambiguate()): ACTIONED means the report was
+  // reviewed and acted on (nothing more to do here), PENDING means it's
+  // still being looked into (revisit later), DENIED means it was
+  // reviewed but didn't meet the removal criteria (also nothing more to
+  // do, but distinct from ACTIONED). RECEIVED is just the initial
+  // auto-ack; UPDATED is the catch-all for anything that isn't one of
+  // those three canned replies (a custom reply, the reporter's own
+  // follow-up being the newest message, etc.).
+  const WAE_STATUS_BADGES = {
+    ABUSE_REPORT_RECEIVED: { label: 'Received', color: '#2563eb' },
+    ABUSE_REPORT_PENDING: { label: 'Pending Review', color: '#b45309' },
+    ABUSE_REPORT_ACTIONED: { label: 'Actioned', color: '#16a34a' },
+    ABUSE_REPORT_DENIED: { label: 'Denied', color: '#6b7280' },
+    ABUSE_REPORT_UPDATED: { label: 'Updated', color: '#6b7280' },
+  };
+
+  function waeStatusLabel(ticketStatus) {
+    const info = WAE_STATUS_BADGES[ticketStatus];
+    return info ? info.label : String(ticketStatus).replace('ABUSE_REPORT_', '');
+  }
+
+  function waeStatusBadge(ticketStatus) {
+    const info = WAE_STATUS_BADGES[ticketStatus] || { label: waeStatusLabel(ticketStatus), color: '#6b7280' };
+    return `<span class="wae-status-badge" style="color:${info.color};border-color:${info.color};">${escapeHtml(info.label)}</span>`;
   }
 
   function renderTable(records, hasQuery, nearbyMap) {
@@ -970,7 +1011,7 @@
           <td>${lng}</td>
           ${comment}
           ${nearbyCell}
-          <td>${escapeHtml(r.ticketStatus.replace('ABUSE_REPORT_', ''))}</td>
+          <td>${waeStatusBadge(r.ticketStatus)}</td>
         </tr>`;
       })
       .join('');
@@ -1191,6 +1232,7 @@
         const withNearby = extracted.map((r) => ({
           ...r,
           nearbyTickets: waeFormatNearbyForCsv(nearby.get(r.id)),
+          ticketStatus: waeStatusLabel(r.ticketStatus),
         }));
         downloadCsv(withNearby);
         log(logEl, `✓ Exported ${extracted.length} row(s) to CSV.`, 'ok');

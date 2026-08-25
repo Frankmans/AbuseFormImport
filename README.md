@@ -145,6 +145,25 @@ a bad name/coordinate guess in a spreadsheet — there's no in-page editing
 UI by design. Since a ticket can now span several rows, use
 `Conversation ID` to group them back together if you need to.
 
+## Ticket status
+
+`Ticket Status` is Niantic Support's own reply, classified against three
+confirmed canned closing messages:
+
+| Status | Matches | Meaning |
+|---|---|---|
+| **Actioned** | *"We have reviewed the report and have taken action on the Wayspots in accordance with our policies."* | Reviewed and acted on — nothing further to do. |
+| **Pending Review** | *"Thank you for your patience as your report is being looked into. We will follow up once we have reviewed the reported Wayspots."* | Still under review — revisit later. |
+| **Denied** | *"We took another look at the Wayspot in question and decided that it does not meet our criteria for removal at this time."* | Reviewed, no action taken — also nothing further to do, distinct from Actioned. |
+
+Two other values can show up: **Received** (just the initial auto-ack,
+no human reply yet) and **Updated** (a reply that isn't one of the three
+canned ones above — a custom human reply, or the reporter's own
+follow-up being the newest message in the thread). Status reflects the
+*most recent* matching reply, so a ticket that went Pending Review and
+was later Actioned shows Actioned. Shown as a color-coded badge in the
+panel and included in search (e.g. searching "pending" matches).
+
 ## Flagging nearby duplicate reports
 
 Rows get a ⚠️ (and a subtle highlight) when their coordinates fall within
@@ -295,7 +314,7 @@ needed since it's plain `@require`-able JS.
 ## Versions covered by this README
 
 - `wayfarer-abuse-email-importer.user.js` — v4.4.0
-- `wayfarer-abuse-report-extractor.user.js` — v1.14.0
+- `wayfarer-abuse-report-extractor.user.js` — v1.15.0
 
 Full version-by-version detail lives in the changelog comment block at
 the top of each `.user.js` file.
