@@ -2196,7 +2196,17 @@ const TEMPLATES = [
         // at the same timestamp.
         const newest = messages[0];
         const newestText = stripHelpshiftMarkup(newest.raw).toLowerCase();
-        const newestIsSupport = newest.author.toLowerCase().includes("niantic support");
+        // NOT author.includes("niantic support") -- that only matches the
+        // automated acknowledgement. A real human agent's reply (including
+        // the actual decision messages this exists to classify) is
+        // authored under their own name ("Jaxson", "Graham", ...), never
+        // the literal "Niantic Support" string. The reliable signal
+        // (confirmed against real tickets while tracking down the
+        // blank-author header-parsing bug elsewhere in this file) is that
+        // the REPORTER's own messages have a blank author -- Helpshift
+        // doesn't render a name for the ticket owner -- while every
+        // Niantic-side reply, bot or named human, has a non-blank one.
+        const newestIsSupport = newest.author.trim() !== "";
 
         const isAutoAck = newestIsSupport
           && /thank you for contacting/.test(newestText)

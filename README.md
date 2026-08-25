@@ -159,10 +159,13 @@ confirmed canned closing messages:
 Two other values can show up: **Received** (just the initial auto-ack,
 no human reply yet) and **Updated** (a reply that isn't one of the three
 canned ones above — a custom human reply, or the reporter's own
-follow-up being the newest message in the thread). Status reflects the
-*most recent* matching reply, so a ticket that went Pending Review and
-was later Actioned shows Actioned. Shown as a color-coded badge in the
-panel and included in search (e.g. searching "pending" matches).
+follow-up being the newest message in the thread). Only the single
+newest message in the thread is ever checked — not previous replies — so
+if the reporter sends a follow-up (e.g. a "thanks!") *after* the real
+decision, status reads Updated again even though it was actually decided
+earlier; that's expected given how this is meant to work, not a bug.
+Shown as a color-coded badge in the panel and included in search (e.g.
+searching "pending" matches).
 
 ## Flagging nearby duplicate reports
 
@@ -314,7 +317,7 @@ needed since it's plain `@require`-able JS.
 ## Versions covered by this README
 
 - `wayfarer-abuse-email-importer.user.js` — v4.4.0
-- `wayfarer-abuse-report-extractor.user.js` — v1.15.0
+- `wayfarer-abuse-report-extractor.user.js` — v1.15.1
 
 Full version-by-version detail lives in the changelog comment block at
 the top of each `.user.js` file.

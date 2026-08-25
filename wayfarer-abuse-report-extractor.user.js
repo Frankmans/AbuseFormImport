@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Abuse Report Extractor
 // @namespace    https://wayfarer.nianticlabs.com/new
-// @version      1.15.0
+// @version      1.15.1
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map, and exports as CSV.
 // @author       you
 // @match        https://wayfarer.nianticlabs.com/new/mapview*
@@ -51,6 +51,27 @@
  *   - No editing UI for the extracted name/coordinates -- the raw text
  *     columns in the CSV are there so corrections happen in a spreadsheet,
  *     not in-page. Say the word if you'd rather have inline editing.
+ *
+ * v1.15.1 CHANGE FROM v1.15.0 (opr-email-lib.js fix, no code change in
+ * this file, only the classification results it depends on): every
+ * ticket was coming back Updated regardless of its actual reply text.
+ * Cause: the "is the newest message from support" check tested for the
+ * literal string "niantic support" in the author field, but that only
+ * ever appears on the automated auto-ack -- a real human agent's reply
+ * (including the actual decision messages this exists to classify) is
+ * authored under their own name ("Jaxson", "Graham", ...), so it never
+ * matched and every real closing reply fell through to the Updated
+ * catch-all. Fixed to check for a non-blank author instead (the reliable
+ * signal, per the blank-author fix elsewhere in that file: the REPORTER's
+ * own messages have a blank author, every Niantic-side reply doesn't).
+ * Confirmed against both real sample tickets on hand -- both now
+ * correctly classify as Actioned instead of Updated -- plus all three
+ * canned replies via synthetic transcripts. Deliberately still only
+ * checks the single newest message, not previous replies in the thread,
+ * per how this is meant to work: if the reporter sends a follow-up
+ * *after* the real decision (e.g. a "thanks!"), status reads Updated
+ * again since the newest message genuinely isn't one of the three
+ * canned replies at that point -- a known limitation, not a bug.
  *
  * v1.15.0 CHANGE FROM v1.14.0: the Status column is now a friendly,
  * color-coded badge (Received/Pending Review/Actioned/Denied/Updated)
