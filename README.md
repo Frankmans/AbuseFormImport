@@ -235,6 +235,22 @@ an earlier version. If it ever feels sluggish again, it's worth checking
 whether something's re-triggering a full rebuild on a map event rather
 than reusing the already-fetched record list.
 
+Separately, the ⚠️ nearby-duplicate detection used to recompute on every
+panel *open* too (not just when data changed), and did it as a full
+pairwise scan — with a few thousand accumulated rows that was slow enough
+to visibly hang the panel while opening. It's now grid-bucketed (only
+compares records in the same ~111m neighborhood, not every pair) and
+skipped entirely when nothing's changed since last time.
+
+Zooming into a specific Wayspot switches Wayfarer into a separate
+submit/edit view with its own map component — a genuinely different
+`google.maps.Map` object than the general mapview's. Markers only ever
+render on the one map they were created against, so this used to make
+every marker silently vanish when you zoomed in, with nothing bringing
+them back until you manually re-toggled. A lightweight watch (checks
+every 2s, only while pins are toggled on) now notices that swap and
+re-attaches automatically.
+
 ## Why no `@require` for Base
 
 Earlier versions of both scripts `@require`d Base directly. That turned
@@ -279,7 +295,7 @@ needed since it's plain `@require`-able JS.
 ## Versions covered by this README
 
 - `wayfarer-abuse-email-importer.user.js` — v4.4.0
-- `wayfarer-abuse-report-extractor.user.js` — v1.12.0
+- `wayfarer-abuse-report-extractor.user.js` — v1.14.0
 
 Full version-by-version detail lives in the changelog comment block at
 the top of each `.user.js` file.
