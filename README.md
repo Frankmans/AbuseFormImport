@@ -123,6 +123,21 @@ dropped, though — it's kept as that entry's `Comment` (see below). If a
 reply mixes a genuinely new Wayspot into the same sentence as a
 correction, it may need a manual check.
 
+## Long-running tickets spanning several emails
+
+An actively back-and-forth ticket generates a new email notification on
+every reply, and each individual export only contains a recent window of
+quoted history — not necessarily the complete conversation. If you've
+imported more than one email for the same ticket, the extractor merges
+all of them (deduping identical messages, re-sorting into one true
+newest-first order by actual timestamp) into a single complete thread
+*before* extracting — so a Wayspot mentioned only in an older email that's
+since scrolled out of a newer one's quoted history still gets picked up,
+and the original form fields still resolve even if the newest export's
+own quoted history no longer reaches back that far. Import every email
+you have for an active ticket, not just the latest one, for the most
+complete picture — auto-sync already does this automatically.
+
 ## CSV columns
 
 `Conversation ID`, `Ticket Status`, `Wayspot Name (best guess)`,
@@ -136,6 +151,10 @@ location in a reply (real example: *"'t Zudn, &lt;lat,lng&gt; (is here:
 context for that entry rather than dropped or turned into a bogus extra
 row. Shown as a hover-for-full-text 💬 in the panel's table since the
 link itself is usually too long to display inline.
+
+`Source Email ID` / `Source Filename` list every email that contributed
+to that row (semicolon-joined) — for a long-running ticket merged from
+several emails, that can be more than one.
 
 `Nearby Tickets` lists any other ticket(s) with a location within 20m of
 this row's — see "Flagging nearby duplicate reports" below.
@@ -317,7 +336,7 @@ needed since it's plain `@require`-able JS.
 ## Versions covered by this README
 
 - `wayfarer-abuse-email-importer.user.js` — v4.4.0
-- `wayfarer-abuse-report-extractor.user.js` — v1.15.1
+- `wayfarer-abuse-report-extractor.user.js` — v1.16.0
 
 Full version-by-version detail lives in the changelog comment block at
 the top of each `.user.js` file.

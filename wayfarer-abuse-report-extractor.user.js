@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Abuse Report Extractor
 // @namespace    https://wayfarer.nianticlabs.com/new
-// @version      1.15.1
+// @version      1.16.0
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map, and exports as CSV.
 // @author       you
 // @match        https://wayfarer.nianticlabs.com/new/mapview*
@@ -51,6 +51,40 @@
  *   - No editing UI for the extracted name/coordinates -- the raw text
  *     columns in the CSV are there so corrections happen in a spreadsheet,
  *     not in-page. Say the word if you'd rather have inline editing.
+ *
+ * v1.16.0 CHANGE FROM v1.15.1: fixed long-running tickets losing data --
+ * a ticket active enough to generate several separate email notifications
+ * over time was only ever scanned from whichever single stored email
+ * happened to be processed, even though each individual export only
+ * contains THAT email's own quoted-history window, not the complete
+ * conversation. Confirmed against two real exports of the same ticket a
+ * week apart: the later one's quoted history didn't even reach back to
+ * the original form submission anymore (its structured fields came back
+ * completely empty), and each export's 10-message window covered
+ * entirely different, non-overlapping stretches of an actively
+ * back-and-forth conversation -- scanning either alone found 11 or 12
+ * locations; scanning both together and merging finds the true 23.
+ *
+ * This was also silently DESTRUCTIVE, not just incomplete: every row's id
+ * was based on conversationId alone ("conv:<id>:<index>"), so two
+ * separate emails for the same ticket produced colliding ids, and
+ * whichever one got written to storage second would silently overwrite
+ * the other's rows at the same index rather than adding to them.
+ *
+ * Fixed by restructuring scanImportedEmails() into two passes: first
+ * parse every stored email into its own thread and group by
+ * conversationId, then merge each group's messages (opr-email-lib.js's
+ * new mergeThreads() -- dedupes identical messages and re-sorts the
+ * union newest-first by actual timestamp) before running extraction
+ * (parseAbuseReportThread) and status classification
+ * (classifyAbuseReportStatus) on that complete merged picture. One row
+ * group per ticket now, never per individual email, so the id-collision
+ * possibility is gone entirely rather than just less likely.
+ * sourceEmailId/sourceFilename now list every contributing email
+ * (semicolon-joined) instead of just one, since a row's data can
+ * genuinely come from several. Verified through the actual scan button
+ * click handler (not just the parsing functions in isolation) against
+ * both real emails on hand, using a real IndexedDB implementation.
  *
  * v1.15.1 CHANGE FROM v1.15.0 (opr-email-lib.js fix, no code change in
  * this file, only the classification results it depends on): every
@@ -785,7 +819,17 @@
 
   async function scanImportedEmails(onProgress) {
     const allEmails = await WSTStorage.getAllEmails();
-    const extracted = [];
+
+    // Pass 1: classify + parse every stored email into its own thread,
+    // and group by conversationId. A long-running ticket can span
+    // several separate email notifications -- Helpshift/the mailer only
+    // includes a recent window of quoted history in each one, not
+    // necessarily the complete conversation -- so a ticket's true
+    // complete picture can require several stored emails, not just
+    // whichever one happens to be newest. Emails with no conversationId
+    // (couldn't be parsed as a ticket at all) each get their own
+    // single-email group, keyed by record.id, same as before.
+    const groups = new Map(); // key -> { threads: [], records: [] }
     let scanned = 0;
 
     for (const record of allEmails) {
@@ -805,27 +849,55 @@
         continue;
       }
 
-      let parsed;
+      let thread;
       try {
-        parsed = OPREmail.helpshift.parseAbuseReportEmail(email);
+        thread = OPREmail.helpshift.parseThread(email.getBody('text/plain') || '');
       } catch (e) { continue; }
 
-      const idBase = parsed.conversationId ? `conv:${parsed.conversationId}` : `email:${record.id}`;
-      // parsed.locations is every Wayspot found anywhere in the thread --
-      // the original report can list several at once, and later replies
-      // ("I see I missed some: ...") can add more. One row per location,
-      // all sharing conversationId/ticketStatus/issueType/raw fields so
-      // they're still recognizable as one ticket in the CSV. A ticket
-      // with no parseable location at all still gets exactly one row (so
-      // it's not silently dropped from the scan), with everything
-      // location-related left null.
+      const key = thread.conversationId ? `conv:${thread.conversationId}` : `email:${record.id}`;
+      if (!groups.has(key)) groups.set(key, { threads: [], records: [] });
+      const group = groups.get(key);
+      group.threads.push(thread);
+      group.records.push(record);
+    }
+
+    // Pass 2: merge each group's messages into one complete thread (a
+    // no-op for single-email groups -- mergeThreads on one thread just
+    // returns it), then extract locations/fields/status from that
+    // complete picture instead of any single email's own partial view.
+    const extracted = [];
+    for (const [idBase, group] of groups.entries()) {
+      const merged = OPREmail.helpshift.mergeThreads(group.threads);
+
+      let parsed;
+      try {
+        parsed = OPREmail.helpshift.parseAbuseReportThread(merged);
+      } catch (e) { continue; }
+
+      const ticketStatus = OPREmail.helpshift.classifyAbuseReportStatus(merged.messages) || 'ABUSE_REPORT_UPDATED';
+
+      // Multiple source emails can contribute to one merged ticket now --
+      // list all of them (oldest first, matching the merged message
+      // order's intent) rather than picking just one, so every email that
+      // fed into this row's data is still traceable.
+      const sourceEmailId = group.records.map((r) => r.id).join('; ');
+      const sourceFilename = group.records.map((r) => r.filename).filter(Boolean).join('; ') || null;
+
+      // parsed.locations is every Wayspot found anywhere in the merged
+      // thread -- the original report can list several at once, and
+      // later replies ("I see I missed some: ...") can add more. One row
+      // per location, all sharing conversationId/ticketStatus/issueType/
+      // raw fields so they're still recognizable as one ticket in the
+      // CSV. A ticket with no parseable location at all still gets
+      // exactly one row (so it's not silently dropped from the scan),
+      // with everything location-related left null.
       const locations = parsed.locations && parsed.locations.length ? parsed.locations : [null];
 
       locations.forEach((loc, i) => {
         extracted.push({
           id: locations.length > 1 ? `${idBase}:${i}` : idBase,
           conversationId: parsed.conversationId || null,
-          ticketStatus: classification.type,
+          ticketStatus,
           wayspotName: loc ? loc.name : null,
           latitude: loc ? Number(loc.latitude) : null,
           longitude: loc ? Number(loc.longitude) : null,
@@ -833,8 +905,8 @@
           issueType: parsed.issueType || null,
           locationDetails: parsed.locationDetails || null,
           reportDetails: parsed.reportDetails || null,
-          sourceEmailId: record.id,
-          sourceFilename: record.filename || null,
+          sourceEmailId,
+          sourceFilename,
           scannedAt: Date.now(),
         });
       });

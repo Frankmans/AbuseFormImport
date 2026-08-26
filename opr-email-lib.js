@@ -503,11 +503,19 @@
 
   // High-level convenience: given a classified ABUSE_REPORT_* email, pull
   // out the transcript, the reporter's original form fields, and every
-  // Wayspot reported anywhere in the thread in one call.
+  // Wayspot reported anywhere in the thread in one call. Thin wrapper --
+  // see parseAbuseReportThread below for the actual extraction logic,
+  // which operates on an already-parsed {conversationId, messages} rather
+  // than a single raw email, specifically so a caller with messages
+  // merged from SEVERAL emails (a long-running ticket that outgrew what
+  // any one email export contains -- see mergeAbuseReportThreads) can run
+  // the same logic on the complete picture.
   const parseAbuseReportEmail = (email) => {
     const plaintext = email.getBody("text/plain") || "";
-    const { conversationId, messages } = parseHelpshiftThread(plaintext);
+    return parseAbuseReportThread(parseHelpshiftThread(plaintext));
+  };
 
+  const parseAbuseReportThread = ({ conversationId, messages }) => {
     // The reporter's form submission isn't necessarily message[1] -- longer
     // threads (support asking follow-up questions, the reporter replying
     // again) can push it further down, so find it by content instead of
@@ -2180,68 +2188,121 @@ const TEMPLATES = [
   // guarantees that regardless of where in the upstream-ported array a
   // future addition might slot in.
   // -------------------------------------------------------------------------
+  // Niantic Support closes an abuse-report ticket with one of three
+  // canned replies -- confirmed real text for all three:
+  //   ACTIONED: "We have reviewed the report and have taken action
+  //     on the Wayspots in accordance with our policies."
+  //   PENDING: "Thank you for your patience as your report is being
+  //     looked into. We will follow up once we have reviewed the
+  //     reported Wayspots."
+  //   DENIED: "We took another look at the Wayspot in question and
+  //     decided that it does not meet our criteria for removal at
+  //     this time."
+  // Matched against whitespace-normalized text (a canned phrase can
+  // be word-wrapped across lines in the raw email) so wrapping
+  // doesn't break the match. This replaces an earlier *** BEST-
+  // EFFORT / UNCONFIRMED *** version that guessed generic support-
+  // ticket vocabulary ("resolved", "closing this ticket", etc.)
+  // because no real resolved/closed example was available when it
+  // was written -- keep that history in mind if a *fourth* canned
+  // reply ever turns up that doesn't match any of these three.
+  //
+  // Takes a `messages` array directly (newest-first -- see
+  // parseHelpshiftThread) rather than an Email, so it works the same way
+  // whether `messages` came from a single email's own thread or several
+  // emails merged together (see mergeAbuseReportThreads) -- a
+  // long-running ticket's true newest message might live in a LATER
+  // email export than whichever one happens to be classified, so status
+  // needs to be computed from the merged view too, not just one email.
+  const classifyAbuseReportStatus = (messages) => {
+    if (!messages.length) return null;
+
+    // Confirmed real example: the transcript lists the newest message
+    // FIRST (standard quoted-reply convention -- newest on top, older
+    // context quoted below), not chronologically. In the one confirmed
+    // sample this is "Niantic Support"'s immediate auto-acknowledgement,
+    // with the reporter's own original form submission quoted below it
+    // at the same timestamp.
+    const newest = messages[0];
+    const newestText = stripHelpshiftMarkup(newest.raw).toLowerCase();
+    // NOT author.includes("niantic support") -- that only matches the
+    // automated acknowledgement. A real human agent's reply (including
+    // the actual decision messages this exists to classify) is
+    // authored under their own name ("Jaxson", "Graham", ...), never
+    // the literal "Niantic Support" string. The reliable signal
+    // (confirmed against real tickets while tracking down the
+    // blank-author header-parsing bug elsewhere in this file) is that
+    // the REPORTER's own messages have a blank author -- Helpshift
+    // doesn't render a name for the ticket owner -- while every
+    // Niantic-side reply, bot or named human, has a non-blank one.
+    const newestIsSupport = newest.author.trim() !== "";
+
+    const isAutoAck = newestIsSupport
+      && /thank you for contacting/.test(newestText)
+      && /back to you shortly/.test(newestText);
+
+    const newestNormalized = newestText.replace(/\s+/g, " ").trim();
+    const looksActioned = newestIsSupport && /we have reviewed the report and have taken action on the wayspots? in accordance with our policies/.test(newestNormalized);
+    const looksPending = newestIsSupport && /thank you for your patience as your report is being looked into\.? we will follow up once we have reviewed the reported wayspots?/.test(newestNormalized);
+    const looksDenied = newestIsSupport && /we took another look at the wayspot in question and decided that it does not meet our criteria for removal at this time/.test(newestNormalized);
+
+    if (isAutoAck) return Type.ABUSE_REPORT_RECEIVED;
+    if (looksActioned) return Type.ABUSE_REPORT_ACTIONED;
+    if (looksPending) return Type.ABUSE_REPORT_PENDING;
+    if (looksDenied) return Type.ABUSE_REPORT_DENIED;
+    return Type.ABUSE_REPORT_UPDATED;
+  };
+
+  // Merges the message lists from several parsed threads that share the
+  // same conversationId -- needed because a long-running ticket generates
+  // a new email notification on every reply, and each individual email
+  // export only contains THAT email's own quoted-history window, not
+  // necessarily every message that's ever been part of the conversation
+  // (confirmed against two real exports of the same ticket, a week apart:
+  // the earlier one's original form-submission message, with its
+  // structured fields, wasn't present at all in the later one's quoted
+  // history -- scanning either alone misses real data the other has).
+  // Dedupes by (author, date, time, raw) -- the exact same message
+  // appears byte-for-byte identical across every export that happens to
+  // include it, via standard email quoting -- and re-sorts the union
+  // newest-first by actual parsed timestamp, since simple concatenation
+  // can't be trusted to preserve a correct global order across messages
+  // that originally came from different emails' own (locally newest-
+  // first) orderings.
+  const mergeThreads = (threads) => {
+    const conversationId = threads.map((t) => t.conversationId).find(Boolean) || null;
+    const seen = new Set();
+    const merged = [];
+    for (const { messages } of threads) {
+      for (const msg of messages) {
+        const key = `${msg.author}|${msg.date}|${msg.time}|${msg.raw}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        merged.push(msg);
+      }
+    }
+    merged.sort((a, b) => {
+      const ta = Date.parse(`${a.date} ${a.time}`);
+      const tb = Date.parse(`${b.date} ${b.time}`);
+      // Newest first, matching a single thread's own convention. An
+      // unparseable timestamp sorts last rather than crashing the sort
+      // or silently reshuffling everything around it.
+      if (Number.isNaN(ta) && Number.isNaN(tb)) return 0;
+      if (Number.isNaN(ta)) return 1;
+      if (Number.isNaN(tb)) return -1;
+      return tb - ta;
+    });
+    return { conversationId, messages: merged };
+  };
+
   const HELPSHIFT_TEMPLATES = [
     {
       subject: /^(?:Re: )?\[\d+\]\s*Reporting Abuse in (?:Wayfarer|Niantic Wayspot)/i,
       disambiguate: (email) => {
         const plaintext = email.getBody("text/plain") || "";
         const { messages } = parseHelpshiftThread(plaintext);
-        if (!messages.length) return null;
-
-        // Confirmed real example: the transcript lists the newest message
-        // FIRST (standard quoted-reply convention -- newest on top, older
-        // context quoted below), not chronologically. In the one confirmed
-        // sample this is "Niantic Support"'s immediate auto-acknowledgement,
-        // with the reporter's own original form submission quoted below it
-        // at the same timestamp.
-        const newest = messages[0];
-        const newestText = stripHelpshiftMarkup(newest.raw).toLowerCase();
-        // NOT author.includes("niantic support") -- that only matches the
-        // automated acknowledgement. A real human agent's reply (including
-        // the actual decision messages this exists to classify) is
-        // authored under their own name ("Jaxson", "Graham", ...), never
-        // the literal "Niantic Support" string. The reliable signal
-        // (confirmed against real tickets while tracking down the
-        // blank-author header-parsing bug elsewhere in this file) is that
-        // the REPORTER's own messages have a blank author -- Helpshift
-        // doesn't render a name for the ticket owner -- while every
-        // Niantic-side reply, bot or named human, has a non-blank one.
-        const newestIsSupport = newest.author.trim() !== "";
-
-        const isAutoAck = newestIsSupport
-          && /thank you for contacting/.test(newestText)
-          && /back to you shortly/.test(newestText);
-
-        // Niantic Support closes an abuse-report ticket with one of three
-        // canned replies -- confirmed real text for all three:
-        //   ACTIONED: "We have reviewed the report and have taken action
-        //     on the Wayspots in accordance with our policies."
-        //   PENDING: "Thank you for your patience as your report is being
-        //     looked into. We will follow up once we have reviewed the
-        //     reported Wayspots."
-        //   DENIED: "We took another look at the Wayspot in question and
-        //     decided that it does not meet our criteria for removal at
-        //     this time."
-        // Matched against whitespace-normalized text (a canned phrase can
-        // be word-wrapped across lines in the raw email) so wrapping
-        // doesn't break the match. This replaces an earlier *** BEST-
-        // EFFORT / UNCONFIRMED *** version that guessed generic support-
-        // ticket vocabulary ("resolved", "closing this ticket", etc.)
-        // because no real resolved/closed example was available when it
-        // was written -- keep that history in mind if a *fourth* canned
-        // reply ever turns up that doesn't match any of these three.
-        const newestNormalized = newestText.replace(/\s+/g, " ").trim();
-        const looksActioned = newestIsSupport && /we have reviewed the report and have taken action on the wayspots? in accordance with our policies/.test(newestNormalized);
-        const looksPending = newestIsSupport && /thank you for your patience as your report is being looked into\.? we will follow up once we have reviewed the reported wayspots?/.test(newestNormalized);
-        const looksDenied = newestIsSupport && /we took another look at the wayspot in question and decided that it does not meet our criteria for removal at this time/.test(newestNormalized);
-
-        let type;
-        if (isAutoAck) type = Type.ABUSE_REPORT_RECEIVED;
-        else if (looksActioned) type = Type.ABUSE_REPORT_ACTIONED;
-        else if (looksPending) type = Type.ABUSE_REPORT_PENDING;
-        else if (looksDenied) type = Type.ABUSE_REPORT_DENIED;
-        else type = Type.ABUSE_REPORT_UPDATED;
-
+        const type = classifyAbuseReportStatus(messages);
+        if (type === null) return null;
         return { type, style: Style.SUPPORT, language: "en" };
       },
     },
@@ -2267,6 +2328,9 @@ const TEMPLATES = [
       extractFormFields: extractHelpshiftFormFields,
       extractCoordinates: extractHelpshiftCoordinates,
       parseAbuseReportEmail,
+      parseAbuseReportThread,
+      classifyAbuseReportStatus,
+      mergeThreads,
     },
     errors: {
       InvalidEmailFormatError,
