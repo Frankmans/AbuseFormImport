@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Abuse Email Importer
 // @namespace    https://wayfarer.scopely.com/new
-// @version      4.5.0
+// @version      4.5.1
 // @description  Imports Niantic Support "Reporting Abuse in Wayfarer" tickets from Gmail via OAuth, or from .eml files -- using a port of bilde2910/OPR-Tools' email parser -- and stores them for the Abuse Report Extractor script (and other consumers) to search.
 // @author       you
 // @match        https://wayfarer.scopely.com/new/mapview*
@@ -38,6 +38,12 @@
  * otherwise likely block a page-context request to googleapis.com. This
  * shouldn't change anything about the .eml/backup features below; @require'd
  * scripts and this script still share one execution context either way.
+ *
+ * v4.5.1 CHANGE FROM v4.5.0: the auto-sync checkbox looked out of place
+ * (bare browser-default appearance) after v4.5.0's .wei-checkbox swap-in
+ * for the removed .wfmapmods-modal-checkbox -- that rule only set size,
+ * nothing else. Added accent-color to actually match the rest of the
+ * panel's blue instead of leaving it unstyled.
  *
  * v4.5.0 CHANGE FROM v4.4.0: adapted for Wayfarer's move to
  * wayfarer.scopely.com and Tntnnbltn's new consolidated
@@ -221,7 +227,7 @@
     .wei-btn-danger{ color:#dc2626; border-color:#dc2626; }
     #wei-panel button:disabled{ opacity:0.5; cursor:default; }
     .wei-autosync-row{ display:flex; align-items:center; gap:6px; font-size:12px; color:#374151; margin:6px 0; cursor:default; }
-    .wei-checkbox{ width:16px; height:16px; margin:0; }
+    .wei-checkbox{ width:16px; height:16px; margin:0; accent-color:#2563eb; cursor:pointer; }
     #wei-progress{ font-size:11px; color:#2563eb; margin:4px 0; min-height:14px; }
     #wei-log{
       margin-top:8px; max-height:180px; overflow-y:auto; font-size:11px; line-height:1.5;
