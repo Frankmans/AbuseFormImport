@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Wayfarer Abuse Report Extractor
-// @namespace    https://wayfarer.nianticlabs.com/new
-// @version      1.16.0
+// @namespace    https://wayfarer.scopely.com/new
+// @version      1.17.0
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map, and exports as CSV.
 // @author       you
-// @match        https://wayfarer.nianticlabs.com/new/mapview*
+// @match        https://wayfarer.scopely.com/new/mapview*
 // @require      https://raw.githubusercontent.com/Frankmans/AbuseFormImport/refs/heads/main/opr-email-lib.js
 // @require      https://raw.githubusercontent.com/Frankmans/AbuseFormImport/refs/heads/main/wst-storage.js
 // @run-at       document-idle
@@ -51,6 +51,21 @@
  *   - No editing UI for the extracted name/coordinates -- the raw text
  *     columns in the CSV are there so corrections happen in a spreadsheet,
  *     not in-page. Say the word if you'd rather have inline editing.
+ *
+ * v1.17.0 CHANGE FROM v1.16.0: adapted for Wayfarer's move to
+ * wayfarer.scopely.com and Tntnnbltn's new consolidated
+ * wayfarer-map-mods.user.js suite (v4.0.0, replacing the old separate
+ * wayfarer-map-mods-base.user.js + Report Wayspots scripts this was
+ * previously confirmed against). @namespace/@match updated to the new
+ * domain. Verified the new suite's actual source line by line against
+ * everything this script depends on -- #wfmapmods-side-panel,
+ * .wfmapmods-settings-links, every .wfmapmods-modal-* class this uses,
+ * and the map-lookup code's componentRef.map pattern + "app-submit-
+ * wayspot-map nia-map, app-wf-base-map" selectors are all unchanged
+ * (the last two are byte-for-byte what the new suite's own internal map
+ * resolution uses too). No code changes needed in this file -- unlike
+ * the importer script, this one never depended on the POI/submit bridge
+ * (removed in the new suite) or the modal checkbox class (also removed).
  *
  * v1.16.0 CHANGE FROM v1.15.1: fixed long-running tickets losing data --
  * a ticket active enough to generate several separate email notifications

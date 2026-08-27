@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Wayfarer Abuse Email Importer
-// @namespace    https://wayfarer.nianticlabs.com/new
-// @version      4.4.0
+// @namespace    https://wayfarer.scopely.com/new
+// @version      4.5.0
 // @description  Imports Niantic Support "Reporting Abuse in Wayfarer" tickets from Gmail via OAuth, or from .eml files -- using a port of bilde2910/OPR-Tools' email parser -- and stores them for the Abuse Report Extractor script (and other consumers) to search.
 // @author       you
-// @match        https://wayfarer.nianticlabs.com/new/mapview*
+// @match        https://wayfarer.scopely.com/new/mapview*
 // @grant        GM_xmlhttpRequest
 // @connect      gmail.googleapis.com
 // @connect      accounts.google.com
@@ -38,6 +38,42 @@
  * otherwise likely block a page-context request to googleapis.com. This
  * shouldn't change anything about the .eml/backup features below; @require'd
  * scripts and this script still share one execution context either way.
+ *
+ * v4.5.0 CHANGE FROM v4.4.0: adapted for Wayfarer's move to
+ * wayfarer.scopely.com and Tntnnbltn's new consolidated
+ * wayfarer-map-mods.user.js suite (v4.0.0, replacing the old separate
+ * wayfarer-map-mods-base.user.js + Report Wayspots scripts this was
+ * previously confirmed against). @namespace/@match updated to the new
+ * domain. Verified the new suite's actual source line by line against
+ * everything this script depends on:
+ *   - #wfmapmods-side-panel, .wfmapmods-settings-links, and all the
+ *     .wfmapmods-modal-* classes this uses for its own panel are
+ *     unchanged.
+ *   - The map-lookup code below (confirmed against Report Wayspots
+ *     v3.15.0) is still accurate -- looksLikeGoogleMap()/
+ *     extractMapFromCtxEntry()'s componentRef.map pattern and the
+ *     "app-submit-wayspot-map nia-map, app-wf-base-map" selectors are
+ *     byte-for-byte what the new suite's own internal map resolution
+ *     uses too.
+ *   - #wfmapmods-poi-bridge/#wfmapmods-submit-bridge, however, are GONE
+ *     -- replaced internally with a private "component bridge"
+ *     abstraction with no stable public DOM contract. isMapModsBaseActive()
+ *     now checks for #wfmapmods-side-panel instead (see that function),
+ *     and publishPoiToMap() is now a documented no-op with a one-time
+ *     console warning rather than silently writing to a throwaway
+ *     element nothing reads -- see that function's own comment. This
+ *     doesn't affect real map-plotting either way; that was always the
+ *     extractor script's own "Show on Map" (native markers), never this
+ *     bridge.
+ *   - .wfmapmods-modal-checkbox is also gone (only context-specific
+ *     .wfmapmods-layers-checkbox/.wfmapmods-filters-checkbox remain,
+ *     neither fitting an unrelated auto-sync toggle) -- swapped for a
+ *     small self-contained .wei-checkbox rule instead.
+ * NOT changed: SUPPORTED_SENDERS still filters on support@nianticlabs.com
+ * -- that's Niantic Support's own email address, a separate concern from
+ * which website domain Wayfarer itself is hosted at, and nothing
+ * indicated it changed too. Worth confirming if abuse-report tickets
+ * start arriving from a different address.
  *
  * v4.4.0 CHANGE FROM v4.3.0: SUPPORTED_SENDERS narrowed to just
  * support@nianticlabs.com. Gmail sync now only screens for Niantic
@@ -185,6 +221,7 @@
     .wei-btn-danger{ color:#dc2626; border-color:#dc2626; }
     #wei-panel button:disabled{ opacity:0.5; cursor:default; }
     .wei-autosync-row{ display:flex; align-items:center; gap:6px; font-size:12px; color:#374151; margin:6px 0; cursor:default; }
+    .wei-checkbox{ width:16px; height:16px; margin:0; }
     #wei-progress{ font-size:11px; color:#2563eb; margin:4px 0; min-height:14px; }
     #wei-log{
       margin-top:8px; max-height:180px; overflow-y:auto; font-size:11px; line-height:1.5;
@@ -414,7 +451,7 @@
             <button id="wei-full-resync" class="wfmapmods-modal-btn">Force full re-sync</button>
           </div>
           <label class="wei-autosync-row">
-            <input type="checkbox" id="wei-autosync-toggle" class="wfmapmods-modal-checkbox"> Auto-sync every
+            <input type="checkbox" id="wei-autosync-toggle" class="wei-checkbox"> Auto-sync every
             <select id="wei-autosync-interval" class="wfmapmods-modal-select">
               <option value="5">5 min</option>
               <option value="15">15 min</option>
@@ -778,56 +815,41 @@
   // own to push, so it exposes a small public API for the future
   // extraction plugin to use instead of re-deriving/reimplementing this.
   // ---------------------------------------------------------------------
-  const POI_BRIDGE_ID = 'wfmapmods-poi-bridge';
-
   function isMapModsBaseActive() {
-    // Base creates both bridge elements itself, from createBridges() in
-    // its own init(); their mere presence is a reasonable proxy for
-    // "Base is loaded and running here", without needing to guess at any
-    // internal state of its own.
-    return !!(document.getElementById(POI_BRIDGE_ID) || document.getElementById('wfmapmods-submit-bridge'));
+    // v4.0.0 of the consolidated wayfarer-map-mods.user.js suite removed
+    // the #wfmapmods-poi-bridge/#wfmapmods-submit-bridge DOM elements this
+    // used to check for entirely (confirmed against its real source --
+    // zero matches for either id; replaced internally with a private
+    // "component bridge" abstraction that isn't exposed via any stable
+    // public DOM contract). #wfmapmods-side-panel is still created the
+    // same way, so that's the reliable "is Base loaded and running here"
+    // signal now -- the same element this script's own settings-link
+    // watcher already depends on.
+    return !!document.getElementById('wfmapmods-side-panel');
   }
 
-  function ensurePoiBridgeElement() {
-    let el = document.getElementById(POI_BRIDGE_ID);
-    if (!el) {
-      // Base normally creates this first (document-start vs. our
-      // document-idle), so this is only a fallback for the unlikely case
-      // this script's publishPoiToMap() gets called before Base has run
-      // its own createBridges() -- same id/shape Base itself uses, so
-      // Base's own MutationObserver picks it up transparently either way.
-      el = document.createElement('div');
-      el.id = POI_BRIDGE_ID;
-      el.style.display = 'none';
-      el.setAttribute('data-wfmapmods-bridge', '1');
-      document.body.appendChild(el);
-    }
-    return el;
-  }
+  let poiBridgeWarned = false;
 
   // Writes a POI onto Map Mods - Base's POI bridge -- the exact payload
-  // shape its handleBridgePoiPayload() reads (confirmed against v3.15.0).
-  // Base shows/selects it in its own side panel; it does not itself drop a
-  // map marker for bridge-sourced POIs beyond that side-panel selection.
+  // shape its old handleBridgePoiPayload() read (confirmed against
+  // v3.15.0). That bridge no longer exists as of v4.0.0 of the
+  // consolidated suite (see isMapModsBaseActive() above) -- this is now a
+  // documented no-op rather than silently writing to a throwaway element
+  // nothing reads, which would give false confidence that something
+  // happened. Kept in place (not removed, not throwing) since it's part
+  // of window.WayfarerAbuseEmailImporter's public API and some external
+  // caller may still invoke it; warns once, not on every call. Base
+  // shows/selects a bridge-sourced POI in its own side panel when the
+  // bridge existed -- it never dropped a map marker for one regardless.
+  // The extractor script's own "Show on Map" (native google.maps.Marker,
+  // not this bridge) is the actual working map-plotting mechanism.
   function publishPoiToMap({ guid, title, description, lat, lng, imageUrl, status, source } = {}) {
     if (typeof lat !== 'number' || typeof lng !== 'number' || !Number.isFinite(lat) || !Number.isFinite(lng)) {
       throw new Error('publishPoiToMap: lat/lng must be finite numbers');
     }
-    const bridge = ensurePoiBridgeElement();
-    const payload = {
-      guid: guid || null,
-      title: title || '(untitled)',
-      description: description || '',
-      lat,
-      lng,
-      imageUrl: imageUrl || '',
-      status: status || '',
-      source: source || 'Wayfarer Abuse Email Importer',
-    };
-    try {
-      bridge.setAttribute('data-payload', JSON.stringify(payload));
-    } catch (e) {
-      console.warn('[Wayfarer Abuse Email Importer] Failed to publish POI to Map Mods - Base bridge:', e, payload);
+    if (!poiBridgeWarned) {
+      poiBridgeWarned = true;
+      console.warn('[Wayfarer Abuse Email Importer] publishPoiToMap() is a no-op: Map Mods - Base v4.0.0 removed the POI bridge this used to write to. Use the Abuse Report Extractor\'s own "Show on Map" instead.');
     }
   }
 

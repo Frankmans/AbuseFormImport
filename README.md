@@ -3,10 +3,12 @@
 Two companion Tampermonkey userscripts that pull Niantic Support's
 "Reporting Abuse in Wayfarer" Helpshift ticket emails out of Gmail (or
 `.eml` files), and extract a best-guess Wayspot name + coordinates from
-each one into an exportable CSV. Both hook into [Tntnnbltn's Wayfarer Map
-Mods - Base][base] side panel rather than having their own floating UI.
+each one into an exportable CSV. Both hook into [Tntnnbltn's
+wayfarer-map-mods suite][base] side panel rather than having their own
+floating UI. Wayfarer itself moved to `wayfarer.scopely.com`; both
+scripts and this README are updated for that.
 
-[base]: https://gitlab.com/Tntnnbltn/wayfarer-addons
+[base]: https://gitlab.com/Tntnnbltn/wayfarer-map-mods
 
 ## What's in here
 
@@ -26,18 +28,21 @@ improves without re-importing anything.
 ## Requirements
 
 - A userscript manager (Tampermonkey or compatible).
-- **[Wayfarer Map Mods - Base][base] installed separately, on its own.**
-  Both scripts add a link into its side panel settings section
-  (`Import Abuse Report Emails` / `Abuse Report Extractor`) — without Base
-  running, there's nowhere for those links or panels to appear. Don't
-  `@require` Base into anything else; see the "Why no `@require` for
-  Base" note below.
+- **[Tntnnbltn's wayfarer-map-mods suite][base] (v4.0.0+) installed
+  separately, on its own.** Both scripts add a link into its side panel
+  settings section (`Import Abuse Report Emails` / `Abuse Report
+  Extractor`) — without it running, there's nowhere for those links or
+  panels to appear. Don't `@require` it into anything else; see the "Why
+  no `@require` for the suite" note below. Earlier versions of both
+  scripts targeted the old separate `wayfarer-map-mods-base.user.js` —
+  if you're still on that, update it to the consolidated v4.0.0+ suite
+  first.
 - A Google Cloud OAuth Client ID, **only** if you want Gmail sync. The
   `.eml` drop path works with no setup at all.
 
 ## Install
 
-1. Install Map Mods - Base first, if you haven't already.
+1. Install the wayfarer-map-mods suite first, if you haven't already.
 2. Install the importer:
    `https://raw.githubusercontent.com/Frankmans/AbuseFormImport/refs/heads/main/wayfarer-abuse-email-importer.user.js`
 3. Install the extractor:
@@ -61,8 +66,12 @@ Only needed if you want automatic sync instead of (or alongside) dropping
 4. **APIs & Services -> Credentials -> Create Credentials -> OAuth client
    ID**. Application type: **Web application**.
 5. Under **Authorized JavaScript origins**, add
-   `https://wayfarer.nianticlabs.com`. No redirect URI is needed — this
+   `https://wayfarer.scopely.com`. No redirect URI is needed — this
    uses Google Identity Services' popup token flow, not a redirect flow.
+   If you set this up before Wayfarer moved off `wayfarer.nianticlabs.com`,
+   add the new origin to the existing OAuth client rather than making a
+   new one — Google validates against the page's actual origin at request
+   time, so the old entry alone will now fail silently.
 6. Copy the resulting Client ID (ends in `.apps.googleusercontent.com`)
    into the **Connect Gmail** field in the importer's panel. It's saved
    in `localStorage` so you only paste it once; it's not a secret.
@@ -72,7 +81,7 @@ time the page loads and kept in memory only, for the session.
 
 ## Using it
 
-1. On `https://wayfarer.nianticlabs.com/new/mapview`, open Base's side
+1. On `https://wayfarer.scopely.com/new/mapview`, open the suite's side
    panel and click **Import Abuse Report Emails**.
 2. Either **Sync new emails** (after connecting Gmail) or drop `.eml`
    files into the dropzone. Turn on auto-sync if you want it to check
@@ -93,7 +102,11 @@ Gmail sync only searches `support@nianticlabs.com` — Niantic Support's
 Helpshift "Reporting Abuse in Wayfarer" ticket threads. It used to also
 pull in general Wayfarer/Spatial/Ingress nomination-status notifications
 from several other senders; that was narrowed in v4.4.0 to keep this
-tool scoped to abuse reports specifically.
+tool scoped to abuse reports specifically. Left unchanged when Wayfarer
+itself moved to `wayfarer.scopely.com` — that's a separate concern (who
+sends support email vs. which domain the web app runs on), and nothing
+so far indicates the sender address changed too. Worth checking if
+tickets stop arriving.
 
 Dropped `.eml` files are accepted from any sender — screening happens at
 extraction time instead, via `opr-email-lib.js`'s `classify()`, which
@@ -208,7 +221,7 @@ except for the Gmail API calls you make yourself:
 - `wst_email_store` — raw imported emails (importer).
 - `wf-abuse-report-extract-db` — extracted name/coordinate rows
   (extractor's own database, kept separate from both the importer's
-  store and Base's own `wayfarer-tools-db`).
+  store and whatever the map-mods suite itself uses for its own data).
 
 Both panels have **Export backup JSON** / **Import backup JSON** /
 **Clear** buttons for their respective stores. Clearing extracted data
@@ -258,16 +271,17 @@ straight to that location (centering and zooming in) and show the same
 info popup there. Since the panel is a full-screen backdrop, clicking a
 row also closes it, so the map you just navigated to is actually visible.
 
-Base itself has no marker-plotting API — this ports Report Wayspots' own
-confirmed-working map-lookup code, then plots results as native
+The suite itself has no marker-plotting API — this ports its confirmed-
+working map-lookup code, then plots results as native
 `google.maps.Marker` objects (a custom SVG red-X icon) rather than
-anything from Base or Report Wayspots, so it doesn't require Report
-Wayspots installed and doesn't read as the same layer as its own
+anything from the suite, so it doesn't read as the same layer as its own
 reported-wayspot history markers. `window.WayfarerAbuseEmailImporter
-.publishPoiToMap()` is unrelated to this — that only hands a POI to
-Base's own side-panel selection, not a map marker (an earlier version of
-this README described it as map-plotting; that was wrong, and it's kept
-around as a small convenience API for something else, not for this).
+.publishPoiToMap()` is unrelated to this — it used to hand a POI to a
+`#wfmapmods-poi-bridge` element for the suite's own side-panel selection
+(never a map marker, even before this), but that bridge was removed
+entirely in the suite's v4.0.0; the function is now a documented no-op
+kept only for API compatibility. Real map-plotting has only ever been
+this script's own "Show on Map".
 
 Markers are positioned by the Maps SDK itself and only rebuilt when the
 underlying data actually changes (a scan, a clear, or first turning the
@@ -292,22 +306,24 @@ them back until you manually re-toggled. A lightweight watch (checks
 every 2s, only while pins are toggled on) now notices that swap and
 re-attaches automatically.
 
-## Why no `@require` for Base
+## Why no `@require` for the suite
 
-Earlier versions of both scripts `@require`d Base directly. That turned
-out to be wrong: `@require` re-fetches and re-executes the *entire*
-required file separately inside **each** userscript that lists it, not a
-single shared instance. With two scripts both requiring it, that meant
-two independent copies of Base running on the same page, each building
-its own `#wfmapmods-side-panel` — and since Base has no guard against a
-second, separately-required copy, whichever one you could see wasn't
-necessarily the one a script had actually inserted its link into.
+Earlier versions of both scripts `@require`d Tntnnbltn's Base script
+directly. That turned out to be wrong: `@require` re-fetches and
+re-executes the *entire* required file separately inside **each**
+userscript that lists it, not a single shared instance. With two scripts
+both requiring it, that meant two independent copies running on the same
+page, each building its own `#wfmapmods-side-panel` — and since it had no
+guard against a second, separately-required copy, whichever one you
+could see wasn't necessarily the one a script had actually inserted its
+link into.
 
-Base's real companion script, Report Wayspots, never `@require`s it
-either — it's installed once, standalone, and every other script just
-assumes exactly one copy is already running and talks to it purely
-through the DOM (`.wfmapmods-settings-links`, `#wfmapmods-side-panel`,
-the bridge elements). Both scripts here now do the same.
+Base's real companion script, Report Wayspots (now merged into the same
+consolidated `wayfarer-map-mods.user.js` suite as of v4.0.0), never
+`@require`d it either — it's installed once, standalone, and every other
+script just assumes exactly one copy is already running and talks to it
+purely through the DOM (`.wfmapmods-settings-links`, `#wfmapmods-side-panel`).
+Both scripts here do the same.
 
 ## Architecture at a glance
 
@@ -335,8 +351,10 @@ needed since it's plain `@require`-able JS.
 
 ## Versions covered by this README
 
-- `wayfarer-abuse-email-importer.user.js` — v4.4.0
-- `wayfarer-abuse-report-extractor.user.js` — v1.16.0
+- `wayfarer-abuse-email-importer.user.js` — v4.5.0
+- `wayfarer-abuse-report-extractor.user.js` — v1.17.0
+- Verified against `wayfarer-map-mods.user.js` v4.0.0 (the consolidated
+  suite both scripts depend on — see Requirements above).
 
 Full version-by-version detail lives in the changelog comment block at
 the top of each `.user.js` file.
