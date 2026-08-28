@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Abuse Report Extractor
 // @namespace    https://wayfarer.scopely.com/new
-// @version      1.17.0
+// @version      1.18.0
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map, and exports as CSV.
 // @author       you
 // @match        https://wayfarer.scopely.com/new/mapview*
@@ -51,6 +51,21 @@
  *   - No editing UI for the extracted name/coordinates -- the raw text
  *     columns in the CSV are there so corrections happen in a spreadsheet,
  *     not in-page. Say the word if you'd rather have inline editing.
+ *
+ * v1.18.0 CHANGE FROM v1.17.0: two changes, same as the importer script's
+ * own v4.6.0 (see that file for the fuller explanation of both).
+ *   1. Added padding to the dialog -- .wfmapmods-modal-dialog itself
+ *      provides none, confirmed against the real suite CSS, so content
+ *      sat flush against the edges. Also overflow-y:auto so tall content
+ *      scrolls instead of being clipped.
+ *   2. Now registers as a real entry in the suite's Plugin Manager
+ *      settings screen via window.WFMM.plugins.registerExternal(),
+ *      falling back to the old self-start if that API never appears
+ *      within 5s. stop() tears down the settings link, panel, side-panel
+ *      watcher, map markers, and stale-map watch; start() rebuilds
+ *      everything and resyncs the map if "Show on Map" was left on.
+ *      Verified the full register+start+stop+restart cycle and the
+ *      fallback path through a simulated DOM.
  *
  * v1.17.0 CHANGE FROM v1.16.0: adapted for Wayfarer's move to
  * wayfarer.scopely.com and Tntnnbltn's new consolidated
@@ -996,6 +1011,7 @@
   const STYLE = `
     #wae-panel .wae-dialog{
       width:560px; max-width:calc(100vw - 24px);
+      padding:18px 22px; overflow-y:auto;
     }
     #wae-panel .wae-sub{ font-size:11px; color:#6b7280; margin-bottom:8px; }
     .wae-btn-row{ display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin:6px 0; }
@@ -1457,7 +1473,66 @@
     }
   }
 
-  buildPanel();
-  startSidePanelWatcher();
-  waeResyncMapIfVisible();
+  function startPlugin() {
+    buildPanel();
+    startSidePanelWatcher();
+    waeResyncMapIfVisible();
+  }
+
+  function stopPlugin() {
+    stopSidePanelWatcher();
+    document.getElementById('wae-settings-link')?.remove();
+    waeCloseNearbyPopover();
+    closePanel();
+    document.getElementById('wae-panel')?.remove();
+    waeStopStaleWatch();
+    waeClearPulses();
+  }
+
+  // ---------------------------------------------------------------------
+  // Map Mods plugin manager registration -- see the importer script's own
+  // copy of this comment for the full explanation. Same pattern here:
+  // register as a real entry in the suite's Plugin Manager settings
+  // screen (window.WFMM.plugins.registerExternal(), confirmed against its
+  // v4.0.0 source), falling back to the old self-starting behavior if the
+  // plugin manager never becomes available within 5s.
+  // ---------------------------------------------------------------------
+
+  const PLUGIN_ID = 'wayfarer-abuse-report-extractor';
+  const PLUGIN_DEFINITION = {
+    id: PLUGIN_ID,
+    name: (typeof GM_info !== 'undefined' && GM_info.script?.name) || 'Wayfarer Abuse Report Extractor',
+    description: 'Scans imported abuse-report emails for reported Wayspot names/coordinates, flags nearby duplicates, and plots them on the map.',
+    source: 'external',
+    requirement: 'optional',
+    author: (typeof GM_info !== 'undefined' && GM_info.script?.author) || 'unknown',
+    version: (typeof GM_info !== 'undefined' && GM_info.script?.version) || '0.0.0',
+    namespace: (typeof GM_info !== 'undefined' && GM_info.script?.namespace) || undefined,
+    apiVersion: 1,
+    create() {
+      return { start: startPlugin, stop: stopPlugin };
+    },
+  };
+
+  function registerOrSelfStart(attemptsLeft) {
+    const plugins = window.WFMM && window.WFMM.plugins;
+    if (plugins && typeof plugins.registerExternal === 'function') {
+      try {
+        plugins.registerExternal(PLUGIN_DEFINITION);
+        return; // registered -- WFMM owns calling start()/stop() from here
+      } catch (e) {
+        console.warn('[Wayfarer Abuse Report Extractor] Plugin Manager registration failed, self-starting instead:', e);
+        startPlugin();
+        return;
+      }
+    }
+    if (attemptsLeft > 0) {
+      setTimeout(() => registerOrSelfStart(attemptsLeft - 1), 250);
+      return;
+    }
+    console.warn('[Wayfarer Abuse Report Extractor] Map Mods plugin manager not detected after 5s -- self-starting instead.');
+    startPlugin();
+  }
+
+  registerOrSelfStart(20); // 20 * 250ms = 5s
 })();

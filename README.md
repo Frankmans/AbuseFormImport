@@ -96,6 +96,13 @@ time the page loads and kept in memory only, for the session.
    **Show on Map** to see them plotted directly on the map instead (see
    below).
 
+Both scripts also show up as their own entries — with a name,
+description, and enable/disable toggle — in the wayfarer-map-mods
+suite's own **Plugin Manager** settings screen, alongside its bundled
+features. Disabling one there tears it down cleanly (removes its panel
+and side-panel link, stops its background watchers) rather than just
+hiding it; re-enabling rebuilds everything fresh.
+
 ## What counts as an "abuse report" email
 
 Gmail sync only searches `support@nianticlabs.com` — Niantic Support's
@@ -351,8 +358,8 @@ needed since it's plain `@require`-able JS.
 
 ## Versions covered by this README
 
-- `wayfarer-abuse-email-importer.user.js` — v4.5.0
-- `wayfarer-abuse-report-extractor.user.js` — v1.17.0
+- `wayfarer-abuse-email-importer.user.js` — v4.6.0
+- `wayfarer-abuse-report-extractor.user.js` — v1.18.0
 - Verified against `wayfarer-map-mods.user.js` v4.0.0 (the consolidated
   suite both scripts depend on — see Requirements above).
 

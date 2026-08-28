@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Abuse Email Importer
 // @namespace    https://wayfarer.scopely.com/new
-// @version      4.5.1
+// @version      4.6.0
 // @description  Imports Niantic Support "Reporting Abuse in Wayfarer" tickets from Gmail via OAuth, or from .eml files -- using a port of bilde2910/OPR-Tools' email parser -- and stores them for the Abuse Report Extractor script (and other consumers) to search.
 // @author       you
 // @match        https://wayfarer.scopely.com/new/mapview*
@@ -38,6 +38,32 @@
  * otherwise likely block a page-context request to googleapis.com. This
  * shouldn't change anything about the .eml/backup features below; @require'd
  * scripts and this script still share one execution context either way.
+ *
+ * v4.6.0 CHANGE FROM v4.5.1: two changes.
+ *   1. The dialog had no padding at all -- confirmed .wfmapmods-modal-
+ *      dialog itself provides none in the real v4.0.0 suite CSS (its own
+ *      modals add it via a separate inner body wrapper class this script
+ *      never adopted), so content sat flush against the edges. Added
+ *      padding directly on .wei-dialog, plus overflow-y:auto so tall
+ *      content scrolls within the dialog instead of being clipped by the
+ *      base rule's overflow:hidden.
+ *   2. Now registers as a real entry in the suite's own Plugin Manager
+ *      settings screen (#wfmm-plugin-manager-modal) via its external-
+ *      plugin API, window.WFMM.plugins.registerExternal() -- confirmed
+ *      against the real v4.0.0 source (id/name/description/author/
+ *      version/apiVersion required; source:"external", requirement:
+ *      "optional" default to enabled; create() returns {start,stop} and
+ *      WFMM itself calls them based on the user's toggle in that screen,
+ *      not this script). See startPlugin()/stopPlugin()/
+ *      registerOrSelfStart() below. stop() actually tears things down --
+ *      removes the settings link and panel, stops the side-panel
+ *      watcher, clears any running auto-sync timer -- rather than just
+ *      hiding something, so re-enabling from that screen starts clean.
+ *      Falls back to the old unconditional self-start (no Plugin Manager
+ *      entry) if window.WFMM.plugins never appears within 5s, so this
+ *      still works standalone against an older Base version. Verified
+ *      both the registration+start+stop+restart cycle and the fallback
+ *      path through a simulated DOM, not just read against the source.
  *
  * v4.5.1 CHANGE FROM v4.5.0: the auto-sync checkbox looked out of place
  * (bare browser-default appearance) after v4.5.0's .wei-checkbox swap-in
@@ -211,6 +237,7 @@
   const STYLE = `
     #wei-panel .wei-dialog{
       width:480px; max-width:calc(100vw - 24px);
+      padding:18px 22px; overflow-y:auto;
     }
     #wei-panel .wei-sub{ font-size:11px; color:#6b7280; margin-bottom:8px; }
     #wei-dropzone{
@@ -972,7 +999,75 @@
     }
   }
 
-  registerWithMapModsBase();
-  buildPanel();
-  startSidePanelWatcher();
+  function startPlugin() {
+    registerWithMapModsBase();
+    buildPanel();
+    startSidePanelWatcher();
+  }
+
+  function stopPlugin() {
+    stopSidePanelWatcher();
+    document.getElementById('wei-settings-link')?.remove();
+    closePanel();
+    document.getElementById('wei-panel')?.remove();
+    if (autoSyncTimer) { clearInterval(autoSyncTimer); autoSyncTimer = null; }
+  }
+
+  // ---------------------------------------------------------------------
+  // Map Mods plugin manager registration -- v4.0.0 of the consolidated
+  // suite added a real external-plugin API (confirmed against its source:
+  // window.WFMM.plugins.registerExternal()), which makes this show up as
+  // a normal entry in the suite's own Plugin Manager settings screen
+  // (#wfmm-plugin-manager-modal) with a name/description/enable-toggle,
+  // same as any of its own bundled features. WFMM calls create().start()
+  // for us once registered (as part of its own startup sequence, or
+  // immediately if the suite already finished starting) -- we must NOT
+  // also call startPlugin() ourselves after a successful registration, or
+  // it would start twice. stop() runs if the user disables it from that
+  // screen.
+  //
+  // Falls back to the old self-starting behavior (no Plugin Manager
+  // entry, just the settings-link-in-side-panel approach from earlier
+  // versions) if window.WFMM.plugins never becomes available within 5s --
+  // covers an older Base version, or this script's own document-idle
+  // timing landing before the suite has run at all.
+  // ---------------------------------------------------------------------
+
+  const PLUGIN_ID = 'wayfarer-abuse-email-importer';
+  const PLUGIN_DEFINITION = {
+    id: PLUGIN_ID,
+    name: (typeof GM_info !== 'undefined' && GM_info.script?.name) || 'Wayfarer Abuse Email Importer',
+    description: 'Imports Niantic Support "Reporting Abuse in Wayfarer" tickets from Gmail or .eml files, for the Abuse Report Extractor to scan.',
+    source: 'external',
+    requirement: 'optional',
+    author: (typeof GM_info !== 'undefined' && GM_info.script?.author) || 'unknown',
+    version: (typeof GM_info !== 'undefined' && GM_info.script?.version) || '0.0.0',
+    namespace: (typeof GM_info !== 'undefined' && GM_info.script?.namespace) || undefined,
+    apiVersion: 1,
+    create() {
+      return { start: startPlugin, stop: stopPlugin };
+    },
+  };
+
+  function registerOrSelfStart(attemptsLeft) {
+    const plugins = window.WFMM && window.WFMM.plugins;
+    if (plugins && typeof plugins.registerExternal === 'function') {
+      try {
+        plugins.registerExternal(PLUGIN_DEFINITION);
+        return; // registered -- WFMM owns calling start()/stop() from here
+      } catch (e) {
+        console.warn('[Wayfarer Abuse Email Importer] Plugin Manager registration failed, self-starting instead:', e);
+        startPlugin();
+        return;
+      }
+    }
+    if (attemptsLeft > 0) {
+      setTimeout(() => registerOrSelfStart(attemptsLeft - 1), 250);
+      return;
+    }
+    console.warn('[Wayfarer Abuse Email Importer] Map Mods plugin manager not detected after 5s -- self-starting instead.');
+    startPlugin();
+  }
+
+  registerOrSelfStart(20); // 20 * 250ms = 5s
 })();
