@@ -260,17 +260,36 @@ query is more likely to hit the raw `Location Details`/`Report Details`
 text than the best-guess name. It only changes what's *displayed* —
 **Export CSV**, **Show on Map**, and the summary counts above the table
 all still reflect everything, not just the currently-filtered rows.
+Typing is debounced (200ms) rather than filtering on every keystroke.
+
+## Large histories (thousands of rows)
+
+The table only ever renders 200 rows at a time (**Prev**/**Next**
+controls appear once you have more than that), regardless of how many
+total rows exist or how many match a search — confirmed via benchmark
+that rendering the full table as real DOM elements, not the underlying
+computations, is what actually gets slow once a real history reaches
+into the thousands. Nearby-duplicate detection and map clustering both
+stayed fast (well under 100ms) even at 15,000+ rows in testing, so if
+things still feel sluggish at that scale, it's worth checking whether
+something's re-rendering the full table rather than paging through it.
 
 ## Plotting on the map
 
 Click **Show on Map** in the extractor panel to plot every extracted
-location as a red cross marker directly on the Wayfarer map — the same idea
-as Report Wayspots' own reported-wayspot history markers, but for what
-this script extracted from imported emails, and without needing Report
-Wayspots installed. Click a marker for its name, coordinates, comment, and
-ticket ID. The toggle's state is remembered (`localStorage`) and
-re-attaches automatically next time the mapview loads if you left it on;
-markers stay in sync automatically after every scan or clear while it's on.
+location directly on the Wayfarer map — the same idea as Report
+Wayspots' own reported-wayspot history markers, but for what this script
+extracted from imported emails, and without needing Report Wayspots
+installed. Nearby locations cluster into a single numbered badge when
+zoomed out, splitting apart into individual red-X markers as you zoom in
+close enough to tell them apart — clustering is based on actual on-screen
+distance at the current zoom, not a fixed real-world radius, so it
+adapts correctly whether you're looking at the whole country or one
+neighborhood. Click an individual marker for its name, coordinates,
+comment, and ticket ID; click a cluster to zoom in on it. The toggle's
+state is remembered (`localStorage`) and re-attaches automatically next
+time the mapview loads if you left it on; markers stay in sync
+automatically after every scan or clear while it's on.
 
 Every table row with coordinates is clickable too, independent of whether
 the map markers themselves are toggled on — click a row to jump the map
@@ -280,8 +299,8 @@ row also closes it, so the map you just navigated to is actually visible.
 
 The suite itself has no marker-plotting API — this ports its confirmed-
 working map-lookup code, then plots results as native
-`google.maps.Marker` objects (a custom SVG red-X icon) rather than
-anything from the suite, so it doesn't read as the same layer as its own
+`google.maps.Marker` objects (custom SVG icons) rather than anything
+from the suite, so it doesn't read as the same layer as its own
 reported-wayspot history markers. `window.WayfarerAbuseEmailImporter
 .publishPoiToMap()` is unrelated to this — it used to hand a POI to a
 `#wfmapmods-poi-bridge` element for the suite's own side-panel selection
@@ -290,12 +309,23 @@ entirely in the suite's v4.0.0; the function is now a documented no-op
 kept only for API compatibility. Real map-plotting has only ever been
 this script's own "Show on Map".
 
-Markers are positioned by the Maps SDK itself and only rebuilt when the
-underlying data actually changes (a scan, a clear, or first turning the
-toggle on) — not on every pan or zoom, which is what made this slow in
-an earlier version. If it ever feels sluggish again, it's worth checking
-whether something's re-triggering a full rebuild on a map event rather
-than reusing the already-fetched record list.
+Markers reposition themselves via the Maps SDK on pan with no app code
+involved, but a full re-render (recomputing clusters) does run on every
+zoom step — that's necessary now since clustering itself is zoom-
+dependent, and it's cheap (grid-bucketed, not pairwise) so it stays fast.
+Data-driven rebuilds (a scan, a clear, first turning the toggle on) work
+the same as before.
+
+Rendering hundreds of individual markers used to be the real remaining
+slowdown once a dataset grew large, even after the fixes above — each
+one has genuine linear overhead regardless of how cheap any single
+marker is. Nearby locations now cluster into a single numbered badge
+based on actual on-screen pixel distance at the current zoom (not a
+fixed real-world radius), splitting apart as you zoom in — same
+grid-bucketing idea as the nearby-duplicate detection below, just in
+screen-pixel space. A synthetic 450-location test (30 tickets × 15
+locations, matching real multi-location extraction scale) rendered just
+21 markers zoomed out vs. 447 zoomed in close enough to distinguish them.
 
 Separately, the ⚠️ nearby-duplicate detection used to recompute on every
 panel *open* too (not just when data changed), and did it as a full
@@ -359,7 +389,7 @@ needed since it's plain `@require`-able JS.
 ## Versions covered by this README
 
 - `wayfarer-abuse-email-importer.user.js` — v4.6.0
-- `wayfarer-abuse-report-extractor.user.js` — v1.18.0
+- `wayfarer-abuse-report-extractor.user.js` — v1.20.1
 - Verified against `wayfarer-map-mods.user.js` v4.0.0 (the consolidated
   suite both scripts depend on — see Requirements above).
 

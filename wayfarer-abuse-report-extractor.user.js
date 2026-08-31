@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Abuse Report Extractor
 // @namespace    https://wayfarer.scopely.com/new
-// @version      1.18.0
+// @version      1.20.1
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map, and exports as CSV.
 // @author       you
 // @match        https://wayfarer.scopely.com/new/mapview*
@@ -51,6 +51,86 @@
  *   - No editing UI for the extracted name/coordinates -- the raw text
  *     columns in the CSV are there so corrections happen in a spreadsheet,
  *     not in-page. Say the word if you'd rather have inline editing.
+ *
+ * v1.20.1 CHANGE FROM v1.20.0: replaced two remaining O(n) .find() calls
+ * (the nearby-popover item click and the table row click) with O(1)
+ * lookups against a new waeRecordsById Map, kept in sync alongside
+ * waeAllRecords in refreshPanel(). Checked whether waeRefreshPulses()'s
+ * per-zoom_changed coordinate filter was also worth caching -- benchmarked
+ * at 0.8ms/pass over 15,000 records, ~16ms across 20 rapid zoom events --
+ * genuinely negligible, left as-is rather than adding cache complexity
+ * with no real benefit.
+ *
+ * v1.20.0 CHANGE FROM v1.19.0: fixed the panel itself (not the map) going
+ * very slow once a real accumulated history got into the many thousands
+ * of rows (real report: 15,000+). Benchmarked every piece of the
+ * pipeline at that scale before touching anything -- nearby-duplicate
+ * detection (75ms), clustering (35ms), and building the row HTML as a
+ * plain string (78ms) all stayed fast; the actual cost was the browser
+ * parsing/laying out that many real DOM rows at once (a ~3MB HTML
+ * string via one innerHTML assignment), plus the search box recomputing
+ * a fresh per-record searchable-text string AND re-rendering the entire
+ * table on every single keystroke (measured ~180ms per keystroke
+ * uncached at 15,000 rows).
+ *
+ * Fixes, in the order they matter:
+ *   1. The table is now paginated -- WAE_PAGE_SIZE (200) rows rendered
+ *      at a time regardless of how many total rows exist, with Prev/Next
+ *      controls and a "Page X of Y (rows A-B of N)" label. This is the
+ *      one that actually matters -- verified DOM row count stays at 200
+ *      even with 15,000 records loaded, instead of all 15,000.
+ *   2. Search input is now debounced (200ms) instead of filtering and
+ *      re-rendering on every keystroke, and resets to page 1 on a new
+ *      query so filtering never leaves you stranded on an out-of-range
+ *      page.
+ *   3. Each record's searchable text is now cached on first use
+ *      (`r._waeHaystack`) instead of rebuilt from scratch on every
+ *      filter pass -- naturally invalidates itself since a real data
+ *      reload always produces fresh record objects from IndexedDB.
+ *   4. The filtered+sorted view and the summary stats (location/ticket/
+ *      coordinate counts) are now cached too, invalidated only when the
+ *      underlying data or the search query actually changes (compared by
+ *      array reference, cheap) -- confirmed via direct instrumentation
+ *      that a plain Prev/Next page turn now hits this cache and does
+ *      zero refiltering/resorting of the full dataset, rather than
+ *      redoing that work to show 200 already-known rows.
+ * Scan/Clear both reset to page 1, since the data (and likely the total
+ * row count) just changed.
+ *
+ * v1.19.0 CHANGE FROM v1.18.0: fixed "Show on Map" getting slow again
+ * once a real dataset grew into the hundreds -- the v1.12.0 native-Marker
+ * fix and v1.13.0/v1.14.0 no-DB-read-on-pan fixes removed the WRONG
+ * things (custom OverlayView repositioning, redundant IndexedDB reads);
+ * they didn't address the actual remaining ceiling, which is that
+ * rendering hundreds of individual Marker objects simultaneously has
+ * real linear overhead (positioning, event listeners) no matter how
+ * cheap any one of them is on its own -- confirmed this by checking
+ * whether the suite's own map rendering does anything fundamentally
+ * different for its own POI pins at scale; it doesn't (also plain
+ * google.maps.Marker in the couple of spots that use one), which pointed
+ * at the real fix being to render fewer markers at once, not a faster
+ * marker technology.
+ *
+ * Added screen-pixel clustering: nearby records are grouped into a
+ * single numbered-badge marker based on actual on-screen pixel distance
+ * at the CURRENT zoom (not a fixed lat/lng radius, since the same real-
+ * world distance covers wildly different pixel distances depending on
+ * zoom) -- same grid-bucketing technique as the v1.13.0 nearby-duplicate
+ * fix, just in pixel space. Clicking a cluster zooms in on it instead of
+ * opening the info popup; a single-record "cluster" behaves exactly like
+ * before. Recomputed on zoom_changed (a discrete, infrequent event, not
+ * pan/drag) and after data changes -- diffed by a key derived from each
+ * cluster's sorted member ids, so re-rendering at the same zoom with the
+ * same data doesn't recreate markers needlessly.
+ *
+ * Verified with a synthetic 450-location dataset (30 tickets x 15
+ * locations each, matching the real scale multi-location extraction
+ * produces) through the actual button-click code path, not just the
+ * clustering function in isolation: 21 markers rendered at a zoomed-out
+ * level vs. 447 once zoomed in close enough to tell them apart -- and
+ * confirmed the underlying clustering function alone handles 5,000
+ * scattered records in ~125ms and a dense 750-record/50-cluster scenario
+ * in single-digit milliseconds.
  *
  * v1.18.0 CHANGE FROM v1.17.0: two changes, same as the importer script's
  * own v4.6.0 (see that file for the fuller explanation of both).
@@ -601,7 +681,7 @@
     pop.addEventListener('click', (ev) => {
       const btn = ev.target.closest('.wae-nearby-item');
       if (!btn) return;
-      const target = waeAllRecords.find((r) => r.id === btn.dataset.id);
+      const target = waeRecordsById.get(btn.dataset.id);
       waeCloseNearbyPopover();
       if (target) waeGoToLocation(target);
     });
@@ -634,8 +714,11 @@
   const WAE_MAP_VISIBLE_KEY = 'wae_map_pulses_visible';
   const WAE_PULSES = { map: null, markersById: new Map(), infoWindow: null };
   let waeAllRecords = [];
+  let waeRecordsById = new Map();
   let waeNearbyMap = new Map();
   let waeSearchQuery = '';
+  let waeCurrentPage = 1;
+  const WAE_PAGE_SIZE = 200;
 
   // Search matches across everything a person might actually search by --
   // not just the visible name/conversation columns, but the raw
@@ -644,12 +727,14 @@
   // best-guess Wayspot name.
   function waeMatchesQuery(r, q) {
     if (!q) return true;
-    const haystack = [
-      r.wayspotName, r.conversationId, r.comment, r.issueType,
-      r.locationDetails, r.reportDetails, r.sourceFilename, r.sourceEmailId,
-      waeStatusLabel(r.ticketStatus),
-    ].filter(Boolean).join('\n').toLowerCase();
-    return haystack.includes(q);
+    if (!r._waeHaystack) {
+      r._waeHaystack = [
+        r.wayspotName, r.conversationId, r.comment, r.issueType,
+        r.locationDetails, r.reportDetails, r.sourceFilename, r.sourceEmailId,
+        waeStatusLabel(r.ticketStatus),
+      ].filter(Boolean).join('\n').toLowerCase();
+    }
+    return r._waeHaystack.includes(q);
   }
   // Built lazily (needs `google` to already be loaded) and cached --
   // same icon object reused for every marker instead of rebuilt per-call.
@@ -666,6 +751,93 @@
       anchor: new google.maps.Point(10, 10),
     };
     return WAE_MARKER_ICON;
+  }
+
+  // Same red as the single-report marker, just bigger, filled, and with
+  // room for a count label -- reads as "many of the same thing" rather
+  // than a different kind of marker.
+  let WAE_CLUSTER_ICON = null;
+  function waeGetClusterIcon() {
+    if (WAE_CLUSTER_ICON) return WAE_CLUSTER_ICON;
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32">'
+      + '<circle cx="16" cy="16" r="14" fill="#dc2626" stroke="#ffffff" stroke-width="2.5"/>'
+      + '</svg>';
+    WAE_CLUSTER_ICON = {
+      url: 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(svg),
+      scaledSize: new google.maps.Size(32, 32),
+      anchor: new google.maps.Point(16, 16),
+      labelOrigin: new google.maps.Point(16, 16),
+    };
+    return WAE_CLUSTER_ICON;
+  }
+
+  const WAE_CLUSTER_PIXEL_RADIUS = 45;
+
+  // Groups records into clusters based on screen-pixel distance at the
+  // CURRENT zoom -- not a fixed lat/lng radius, since the same physical
+  // distance covers wildly different pixel distances depending on how
+  // zoomed in the map is. Same grid-bucketing technique as
+  // waeFindNearbyDuplicates (O(n) amortized, not O(n^2)), just in pixel
+  // space: project each record to world coordinates, scale by 2^zoom to
+  // get actual screen pixels, bucket into cells sized to the cluster
+  // radius, then greedily merge each point with unassigned neighbors in
+  // its own and adjacent cells that fall within the radius. Not a
+  // perfectly optimal clustering, but visually solid and cheap enough to
+  // rerun on every zoom_changed.
+  function waeComputeClusters(map, records) {
+    const projection = map.getProjection();
+    const zoom = map.getZoom();
+    if (!projection || typeof zoom !== 'number') {
+      return records.map((r) => ({ recordIds: [r.id], records: [r], lat: r.latitude, lng: r.longitude }));
+    }
+
+    const scale = Math.pow(2, zoom);
+    const points = records.map((r) => {
+      const world = projection.fromLatLngToPoint(new google.maps.LatLng(r.latitude, r.longitude));
+      return { record: r, x: world.x * scale, y: world.y * scale };
+    });
+
+    const cellSize = WAE_CLUSTER_PIXEL_RADIUS;
+    const buckets = new Map();
+    for (const p of points) {
+      const key = `${Math.floor(p.x / cellSize)}:${Math.floor(p.y / cellSize)}`;
+      if (!buckets.has(key)) buckets.set(key, []);
+      buckets.get(key).push(p);
+    }
+
+    const assigned = new Set();
+    const clusters = [];
+    for (const p of points) {
+      if (assigned.has(p.record.id)) continue;
+      const cellX = Math.floor(p.x / cellSize);
+      const cellY = Math.floor(p.y / cellSize);
+      const group = [p];
+      assigned.add(p.record.id);
+      for (let dx = -1; dx <= 1; dx++) {
+        for (let dy = -1; dy <= 1; dy++) {
+          const neighbors = buckets.get(`${cellX + dx}:${cellY + dy}`);
+          if (!neighbors) continue;
+          for (const q of neighbors) {
+            if (assigned.has(q.record.id)) continue;
+            if (Math.hypot(p.x - q.x, p.y - q.y) <= WAE_CLUSTER_PIXEL_RADIUS) {
+              group.push(q);
+              assigned.add(q.record.id);
+            }
+          }
+        }
+      }
+      clusters.push({
+        recordIds: group.map((g) => g.record.id).sort(),
+        records: group.map((g) => g.record),
+        lat: group.reduce((s, g) => s + g.record.latitude, 0) / group.length,
+        lng: group.reduce((s, g) => s + g.record.longitude, 0) / group.length,
+      });
+    }
+    return clusters;
+  }
+
+  function waeClusterKey(cluster) {
+    return cluster.recordIds.join(',');
   }
 
   function waeShowPulseInfoWindow(record, latLng) {
@@ -691,68 +863,75 @@
   }
 
   // Hide below this zoom level so a fully zoomed-out view of the
-  // Netherlands doesn't try to show every marker at once. Purely a
-  // clutter/legibility gate now, not a performance one -- native markers
-  // are cheap enough that this isn't load-bearing the way it was for the
-  // old OverlayView version.
+  // Netherlands doesn't try to show every marker/cluster at once.
   function waeShouldShowPulses(map) {
     if (!map || typeof map.getZoom !== 'function') return true;
     const z = map.getZoom();
     return (typeof z === 'number') && z >= 8;
   }
 
-  // Cheap: just toggles .setMap() on markers that already exist, no data
-  // fetch or marker (re)creation. Safe to call on every zoom_changed.
-  function waeApplyZoomGate() {
-    const map = WAE_PULSES.map;
-    if (!map) return;
-    const show = waeShouldShowPulses(map);
-    for (const marker of WAE_PULSES.markersById.values()) {
-      marker.setMap(show ? map : null);
-    }
-  }
-
   // Rebuilds the marker set from whatever's currently in waeAllRecords --
-  // NOT from IndexedDB. This used to call getAllExtractedRecords() itself
-  // and ran on every pan ('idle') and zoom step, which meant a full DB
-  // read plus a rebuild-vs-diff pass on every single map interaction --
-  // that was the actual cause of the slowdown, independent of the
-  // OverlayView-vs-Marker question. waeAllRecords is already kept in sync
-  // by refreshPanel() after every scan/clear, so this only needs to run
-  // when that data changes or the map is first attached -- never on
-  // pan/zoom, which is why there's no 'idle' listener anymore at all.
+  // NOT from IndexedDB (see v1.13.0 changelog note: that used to be the
+  // actual cause of a different slowdown, fixed by reading from this
+  // already-fetched cache instead). Clusters nearby records together at
+  // the current zoom (see v1.19.0 changelog note) rather than rendering
+  // one marker per record unconditionally -- that was the remaining
+  // performance ceiling once a real dataset grew into the hundreds, since
+  // each individually-rendered Marker has real linear overhead
+  // (positioning, event listeners) regardless of how cheap any one of
+  // them is. Diffs cluster markers by a key derived from their sorted
+  // member record ids, so re-running at the SAME zoom with the SAME data
+  // (e.g. after a scan that didn't change anything) doesn't recreate
+  // markers needlessly -- only a genuine zoom change or data change does.
   function waeRefreshPulses() {
     const map = WAE_PULSES.map;
     if (!map || waeIsMapStale(map)) return;
     if (typeof google === 'undefined' || !google.maps?.Marker) return;
 
-    const wanted = waeAllRecords.filter((r) => Number.isFinite(r.latitude) && Number.isFinite(r.longitude));
-    const wantedIds = new Set(wanted.map((r) => r.id));
+    if (!waeShouldShowPulses(map)) {
+      waeClearPulses();
+      return;
+    }
 
-    for (const [id, marker] of WAE_PULSES.markersById.entries()) {
-      if (!wantedIds.has(id)) {
+    const wanted = waeAllRecords.filter((r) => Number.isFinite(r.latitude) && Number.isFinite(r.longitude));
+    const clusters = waeComputeClusters(map, wanted);
+    const wantedKeys = new Set(clusters.map(waeClusterKey));
+
+    for (const [key, marker] of WAE_PULSES.markersById.entries()) {
+      if (!wantedKeys.has(key)) {
         try { marker.setMap(null); } catch (e) { /* ignore */ }
-        WAE_PULSES.markersById.delete(id);
+        WAE_PULSES.markersById.delete(key);
       }
     }
 
-    const show = waeShouldShowPulses(map);
-    for (const record of wanted) {
-      const position = { lat: record.latitude, lng: record.longitude };
-      let marker = WAE_PULSES.markersById.get(record.id);
+    for (const cluster of clusters) {
+      const key = waeClusterKey(cluster);
+      const isCluster = cluster.records.length > 1;
+      const position = { lat: cluster.lat, lng: cluster.lng };
+      let marker = WAE_PULSES.markersById.get(key);
       if (!marker) {
-        marker = new google.maps.Marker({ icon: waeGetMarkerIcon() });
-        // Read from the marker itself, not a closed-over `record`, so a
-        // later re-scan that updates this same marker's data (name,
-        // comment, etc.) is reflected even though the click listener
-        // below was only attached once at creation time.
-        marker.addListener('click', () => waeShowPulseInfoWindow(marker.waeRecord, marker.getPosition()));
-        WAE_PULSES.markersById.set(record.id, marker);
+        marker = new google.maps.Marker({});
+        // Read from the marker itself, not a closed-over `cluster`, so a
+        // later re-render that rebuilds this same cluster's data is
+        // reflected even though the click listener below was only
+        // attached once at creation time.
+        marker.addListener('click', () => {
+          const c = marker.waeCluster;
+          if (c.records.length > 1) {
+            WAE_PULSES.map.setCenter(marker.getPosition());
+            WAE_PULSES.map.setZoom(Math.min((WAE_PULSES.map.getZoom() || 8) + 3, 21));
+          } else {
+            waeShowPulseInfoWindow(c.records[0], marker.getPosition());
+          }
+        });
+        WAE_PULSES.markersById.set(key, marker);
       }
-      marker.waeRecord = record;
+      marker.waeCluster = cluster;
       marker.setPosition(position);
-      marker.setTitle(record.wayspotName || '(unnamed report)');
-      marker.setMap(show ? map : null);
+      marker.setIcon(isCluster ? waeGetClusterIcon() : waeGetMarkerIcon());
+      marker.setLabel(isCluster ? { text: String(cluster.records.length), color: '#ffffff', fontSize: '12px', fontWeight: '700' } : null);
+      marker.setTitle(isCluster ? `${cluster.records.length} reports` : (cluster.records[0].wayspotName || '(unnamed report)'));
+      marker.setMap(map);
     }
   }
 
@@ -762,10 +941,14 @@
     if (!map) return false;
     if (WAE_PULSES.map !== map) waeClearPulses();
     WAE_PULSES.map = map;
-    // Only listener needed: native markers reposition themselves on
-    // pan/zoom with no app code involved at all. zoom_changed here is
-    // just the clutter gate (waeApplyZoomGate), not a data refresh.
-    map.addListener?.('zoom_changed', () => waeApplyZoomGate());
+    // Re-cluster on every zoom change -- clustering itself is zoom-
+    // dependent (screen-pixel distance changes with zoom even though
+    // lat/lng doesn't), so this can't just be a cheap visibility toggle
+    // anymore. Still no 'idle'/pan listener at all -- individual markers
+    // within one cluster layout still reposition themselves on pan with
+    // no app code involved, only a zoom step changes which records
+    // group together.
+    map.addListener?.('zoom_changed', () => waeRefreshPulses());
     return true;
   }
 
@@ -1028,6 +1211,9 @@
     #wae-log div.warn{ color:#b45309; }
     #wae-log div.err{ color:#dc2626; }
     #wae-table-wrap{ margin-top:8px; max-height:260px; overflow:auto; border:1px solid #e5e7eb; border-radius:4px; }
+    #wae-pagination{ display:flex; align-items:center; justify-content:center; gap:10px; margin-top:8px; }
+    #wae-pagination .wfmapmods-modal-btn{ margin:0; padding:4px 10px; font-size:11px; }
+    #wae-pagination .wae-sub{ margin:0; white-space:nowrap; }
     #wae-table{ width:100%; border-collapse:collapse; font-size:11px; }
     #wae-table th{
       position:sticky; top:0; background:#f9fafb; color:#374151; text-align:left;
@@ -1100,15 +1286,20 @@
     return `<span class="wae-status-badge" style="color:${info.color};border-color:${info.color};">${escapeHtml(info.label)}</span>`;
   }
 
-  function renderTable(records, hasQuery, nearbyMap) {
-    if (!records.length) {
+  function renderTable(sorted, hasQuery, nearbyMap) {
+    if (!sorted.length) {
       return hasQuery
         ? '<div class="wae-sub">No rows match that search.</div>'
         : '<div class="wae-sub">No abuse reports extracted yet -- click "Scan Imported Emails".</div>';
     }
-    const rows = records
-      .slice()
-      .sort((a, b) => (b.scannedAt || 0) - (a.scannedAt || 0))
+
+    const totalPages = Math.max(1, Math.ceil(sorted.length / WAE_PAGE_SIZE));
+    if (waeCurrentPage > totalPages) waeCurrentPage = totalPages;
+    if (waeCurrentPage < 1) waeCurrentPage = 1;
+    const startIdx = (waeCurrentPage - 1) * WAE_PAGE_SIZE;
+    const pageRecords = sorted.slice(startIdx, startIdx + WAE_PAGE_SIZE);
+
+    const rows = pageRecords
       .map((r) => {
         const name = r.wayspotName
           ? `<td title="${escapeHtml(r.wayspotName)}">${escapeHtml(r.wayspotName)}</td>`
@@ -1139,35 +1330,83 @@
         </tr>`;
       })
       .join('');
+
+    const pagination = totalPages > 1 ? `
+      <div id="wae-pagination">
+        <button type="button" class="wfmapmods-modal-btn" id="wae-page-prev"${waeCurrentPage <= 1 ? ' disabled' : ''}>\u00AB Prev</button>
+        <span class="wae-sub">Page ${waeCurrentPage} of ${totalPages} (rows ${startIdx + 1}\u2013${Math.min(startIdx + WAE_PAGE_SIZE, sorted.length)} of ${sorted.length})</span>
+        <button type="button" class="wfmapmods-modal-btn" id="wae-page-next"${waeCurrentPage >= totalPages ? ' disabled' : ''}>Next \u00BB</button>
+      </div>` : '';
+
     return `
       <div id="wae-table-wrap">
         <table id="wae-table">
           <thead><tr><th>Conversation</th><th>Wayspot Name</th><th>Lat</th><th>Lng</th><th></th><th></th><th>Status</th></tr></thead>
           <tbody>${rows}</tbody>
         </table>
-      </div>`;
+      </div>
+      ${pagination}`;
   }
 
   function escapeHtml(s) {
     return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   }
 
+  let waeFilteredSortedCache = null;
+  let waeFilteredSortedCacheFor = null;
+
+  // Only re-filters/re-sorts when the underlying data or the search query
+  // actually changed since last time -- refreshPanel() always assigns a
+  // fresh array to waeAllRecords on a real data reload, so comparing by
+  // reference (not content) is enough to detect that cheaply. A pure page
+  // turn (Prev/Next) calls waeRenderFilteredTable() with neither of those
+  // changed, so it hits this cache instead of redoing the same filter and
+  // sort pass across the whole dataset for the sake of showing 200
+  // already-known rows.
+  function waeGetFilteredSorted() {
+    const q = waeSearchQuery.trim().toLowerCase();
+    if (waeFilteredSortedCacheFor && waeFilteredSortedCacheFor.recordsRef === waeAllRecords && waeFilteredSortedCacheFor.query === q) {
+      return waeFilteredSortedCache;
+    }
+    const filtered = q ? waeAllRecords.filter((r) => waeMatchesQuery(r, q)) : waeAllRecords;
+    const sorted = filtered.slice().sort((a, b) => (b.scannedAt || 0) - (a.scannedAt || 0));
+    waeFilteredSortedCache = sorted;
+    waeFilteredSortedCacheFor = { recordsRef: waeAllRecords, query: q };
+    return sorted;
+  }
+
+  let waeStatsCache = null;
+  let waeStatsCacheFor = null;
+
+  // Same idea as waeGetFilteredSorted -- these three counts only depend
+  // on waeAllRecords itself, never the current page or search query, so
+  // recomputing three O(n) passes over the full dataset on every single
+  // render (including a plain page turn) was pure waste.
+  function waeGetStats() {
+    if (waeStatsCacheFor === waeAllRecords) return waeStatsCache;
+    waeStatsCache = {
+      withCoords: waeAllRecords.filter((r) => r.latitude !== null && r.longitude !== null).length,
+      withName: waeAllRecords.filter((r) => r.wayspotName).length,
+      ticketCount: new Set(waeAllRecords.map((r) => r.conversationId || r.sourceEmailId)).size,
+    };
+    waeStatsCacheFor = waeAllRecords;
+    return waeStatsCache;
+  }
+
   function waeRenderFilteredTable() {
     const countEl = document.getElementById('wae-count');
     const tableEl = document.getElementById('wae-table-container');
     const q = waeSearchQuery.trim().toLowerCase();
-    const filtered = q ? waeAllRecords.filter((r) => waeMatchesQuery(r, q)) : waeAllRecords;
+    const sorted = waeGetFilteredSorted();
 
-    if (tableEl) tableEl.innerHTML = renderTable(filtered, !!q, waeNearbyMap);
+    if (tableEl) tableEl.innerHTML = renderTable(sorted, !!q, waeNearbyMap);
 
-    const withCoords = waeAllRecords.filter((r) => r.latitude !== null && r.longitude !== null).length;
-    const withName = waeAllRecords.filter((r) => r.wayspotName).length;
-    const ticketCount = new Set(waeAllRecords.map((r) => r.conversationId || r.sourceEmailId)).size;
+    const { withCoords, withName, ticketCount } = waeGetStats();
     const nearbyCount = waeNearbyMap.size;
     if (countEl) {
       let base = `${waeAllRecords.length} location(s) extracted from ${ticketCount} ticket(s) -- ${withCoords} with coordinates, ${withName} with a name guess.`;
       if (nearbyCount) base += ` \u26A0\uFE0F ${nearbyCount} within ${WAE_NEARBY_THRESHOLD_METERS}m of a report from another ticket.`;
-      countEl.textContent = q ? `${filtered.length} match${filtered.length === 1 ? '' : 'es'} -- ${base}` : base;
+      countEl.textContent = q ? `${sorted.length} match${sorted.length === 1 ? '' : 'es'} -- ${base}` : base;
     }
 
     const exportBtn = document.getElementById('wae-export-btn');
@@ -1199,6 +1438,7 @@
     const countEl = document.getElementById('wae-count');
     try {
       waeAllRecords = await getAllExtractedRecords();
+      waeRecordsById = new Map(waeAllRecords.map((r) => [r.id, r]));
     } catch (e) {
       if (countEl) countEl.textContent = 'Could not read extracted-report storage.';
       return;
@@ -1266,6 +1506,16 @@
 
     const tableContainerEl = panel.querySelector('#wae-table-container');
     tableContainerEl.addEventListener('click', (ev) => {
+      if (ev.target.closest('#wae-page-prev')) {
+        waeCurrentPage--;
+        waeRenderFilteredTable();
+        return;
+      }
+      if (ev.target.closest('#wae-page-next')) {
+        waeCurrentPage++;
+        waeRenderFilteredTable();
+        return;
+      }
       const flagCell = ev.target.closest('.wae-nearby-flag[data-nearby-id]');
       if (flagCell) {
         ev.stopPropagation();
@@ -1275,14 +1525,19 @@
       }
       const tr = ev.target.closest('tr[data-id]');
       if (!tr) return;
-      const record = waeAllRecords.find((r) => r.id === tr.dataset.id);
+      const record = waeRecordsById.get(tr.dataset.id);
       if (record) waeGoToLocation(record);
     });
 
     const searchInput = panel.querySelector('#wae-search-input');
+    let waeSearchDebounceTimer = null;
     searchInput.addEventListener('input', () => {
-      waeSearchQuery = searchInput.value;
-      waeRenderFilteredTable();
+      clearTimeout(waeSearchDebounceTimer);
+      waeSearchDebounceTimer = setTimeout(() => {
+        waeSearchQuery = searchInput.value;
+        waeCurrentPage = 1;
+        waeRenderFilteredTable();
+      }, 200);
     });
 
     const progressEl = panel.querySelector('#wae-progress');
@@ -1343,6 +1598,7 @@
         log(logEl, `✗ Scan failed: ${e.message || e}`, 'err');
       } finally {
         scanBtn.disabled = false;
+        waeCurrentPage = 1;
         refreshPanel();
         waeResyncMapIfVisible();
       }
@@ -1373,6 +1629,7 @@
       } catch (e) {
         log(logEl, `✗ Clear failed: ${e.message || e}`, 'err');
       } finally {
+        waeCurrentPage = 1;
         refreshPanel();
         waeResyncMapIfVisible();
       }
