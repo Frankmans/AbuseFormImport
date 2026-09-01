@@ -226,9 +226,17 @@ Everything lives in IndexedDB, in your own browser, and never leaves it
 except for the Gmail API calls you make yourself:
 
 - `wst_email_store` — raw imported emails (importer).
-- `wf-abuse-report-extract-db` — extracted name/coordinate rows
-  (extractor's own database, kept separate from both the importer's
-  store and whatever the map-mods suite itself uses for its own data).
+- `wf-abuse-report-extract-db` — the extractor's own database, kept
+  separate from both the importer's store and whatever the map-mods
+  suite itself uses for its own data. Two object stores inside it:
+  `extractedReports` (one row per reported Wayspot — name, coordinates,
+  comment) and `ticketDetails` (one row per *ticket* — issue type and
+  the raw report/location text, shared by every location row that ticket
+  produced, rather than each row storing its own copy). You won't
+  usually need to think about this split — every part of the panel
+  (search, the table, CSV export) sees the two joined back together
+  automatically — but it's why a 12-location ticket doesn't store its
+  ~2.4KB of raw text twelve times over.
 
 Both panels have **Export backup JSON** / **Import backup JSON** /
 **Clear** buttons for their respective stores. Clearing extracted data
@@ -273,6 +281,14 @@ into the thousands. Nearby-duplicate detection and map clustering both
 stayed fast (well under 100ms) even at 15,000+ rows in testing, so if
 things still feel sluggish at that scale, it's worth checking whether
 something's re-rendering the full table rather than paging through it.
+
+Storage itself is also lighter than it used to be — issue type and the
+raw report/location text are now stored once per *ticket*, not once per
+*location* (see "Data storage & privacy" above), which measured as
+roughly an 80% reduction in stored bytes at a realistic 15,000-row scale
+with real-sized report text. Search, CSV export, and everything else
+still see the exact same data on every row — this only changed how it's
+stored, not what any part of the panel shows.
 
 ## Plotting on the map
 
@@ -389,7 +405,7 @@ needed since it's plain `@require`-able JS.
 ## Versions covered by this README
 
 - `wayfarer-abuse-email-importer.user.js` — v4.6.0
-- `wayfarer-abuse-report-extractor.user.js` — v1.20.1
+- `wayfarer-abuse-report-extractor.user.js` — v1.21.0
 - Verified against `wayfarer-map-mods.user.js` v4.0.0 (the consolidated
   suite both scripts depend on — see Requirements above).
 
