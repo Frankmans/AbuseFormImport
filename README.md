@@ -405,7 +405,7 @@ needed since it's plain `@require`-able JS.
 ## Versions covered by this README
 
 - `wayfarer-abuse-email-importer.user.js` — v4.6.0
-- `wayfarer-abuse-report-extractor.user.js` — v1.21.0
+- `wayfarer-abuse-report-extractor.user.js` — v1.21.1
 - Verified against `wayfarer-map-mods.user.js` v4.0.0 (the consolidated
   suite both scripts depend on — see Requirements above).
 

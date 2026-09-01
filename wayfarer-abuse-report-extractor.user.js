@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Abuse Report Extractor
 // @namespace    https://wayfarer.scopely.com/new
-// @version      1.21.0
+// @version      1.21.1
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map, and exports as CSV.
 // @author       you
 // @match        https://wayfarer.scopely.com/new/mapview*
@@ -51,6 +51,14 @@
  *   - No editing UI for the extracted name/coordinates -- the raw text
  *     columns in the CSV are there so corrections happen in a spreadsheet,
  *     not in-page. Say the word if you'd rather have inline editing.
+ *
+ * v1.21.1 CHANGE FROM v1.21.0: cluster markers (the numbered-badge
+ * circles for multiple nearby reports) shrunk from 32x32 to 22x22, closer
+ * to the 20x20 single-report marker, with a smaller count label to match.
+ * Purely visual -- WAE_CLUSTER_PIXEL_RADIUS (the screen-pixel distance
+ * that decides whether nearby reports group into one cluster at all)
+ * is untouched, so this doesn't change *when* markers cluster, only how
+ * big the resulting circle is.
  *
  * v1.21.0 CHANGE FROM v1.20.1: issueType/locationDetails/reportDetails
  * are genuinely per-TICKET, not per-location, but every location row was
@@ -827,14 +835,14 @@
   let WAE_CLUSTER_ICON = null;
   function waeGetClusterIcon() {
     if (WAE_CLUSTER_ICON) return WAE_CLUSTER_ICON;
-    const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32">'
-      + '<circle cx="16" cy="16" r="14" fill="#dc2626" stroke="#ffffff" stroke-width="2.5"/>'
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22">'
+      + '<circle cx="11" cy="11" r="9.5" fill="#dc2626" stroke="#ffffff" stroke-width="2"/>'
       + '</svg>';
     WAE_CLUSTER_ICON = {
       url: 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(svg),
-      scaledSize: new google.maps.Size(32, 32),
-      anchor: new google.maps.Point(16, 16),
-      labelOrigin: new google.maps.Point(16, 16),
+      scaledSize: new google.maps.Size(22, 22),
+      anchor: new google.maps.Point(11, 11),
+      labelOrigin: new google.maps.Point(11, 11),
     };
     return WAE_CLUSTER_ICON;
   }
@@ -997,7 +1005,7 @@
       marker.waeCluster = cluster;
       marker.setPosition(position);
       marker.setIcon(isCluster ? waeGetClusterIcon() : waeGetMarkerIcon());
-      marker.setLabel(isCluster ? { text: String(cluster.records.length), color: '#ffffff', fontSize: '12px', fontWeight: '700' } : null);
+      marker.setLabel(isCluster ? { text: String(cluster.records.length), color: '#ffffff', fontSize: '10px', fontWeight: '700' } : null);
       marker.setTitle(isCluster ? `${cluster.records.length} reports` : (cluster.records[0].wayspotName || '(unnamed report)'));
       marker.setMap(map);
     }
