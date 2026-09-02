@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         Wayfarer Abuse Report Extractor
 // @namespace    https://wayfarer.scopely.com/new
-// @version      1.21.1
+// @version      1.21.2
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map, and exports as CSV.
 // @author       you
 // @match        https://wayfarer.scopely.com/new/mapview*
+// @grant        none
 // @require      https://raw.githubusercontent.com/Frankmans/AbuseFormImport/refs/heads/main/opr-email-lib.js
 // @require      https://raw.githubusercontent.com/Frankmans/AbuseFormImport/refs/heads/main/wst-storage.js
 // @run-at       document-idle
@@ -51,6 +52,26 @@
  *   - No editing UI for the extracted name/coordinates -- the raw text
  *     columns in the CSV are there so corrections happen in a spreadsheet,
  *     not in-page. Say the word if you'd rather have inline editing.
+ *
+ * v1.21.2 CHANGE FROM v1.21.1: fixed Plugin Manager registration silently
+ * never happening -- same underlying issue as the importer script's own
+ * v4.6.1 (see that file for the fuller explanation), except here the
+ * cause was ambiguity rather than confirmed sandboxing: this script had
+ * no @grant line at all, and while that's usually inferred as "none"
+ * (unsandboxed), that inference isn't guaranteed identical across
+ * userscript managers/versions. Added an explicit @grant none (removing
+ * the ambiguity outright) and switched to reading through unsafeWindow
+ * instead of window, same as the importer -- under @grant none these are
+ * literally the same object per Tampermonkey's own docs, so this is
+ * effectively a no-op safety net here, not a functional fix on its own,
+ * but keeps both scripts' registration code identical and correct
+ * regardless of which usage mode ends up applying.
+ *
+ * Same caveat as the importer script's v4.6.1: real userscript-manager
+ * sandboxing can't be reproduced in this project's Node/jsdom test
+ * harness, so this is grounded in Tampermonkey's documented behavior and
+ * the specific reported symptom, not end-to-end verified. Worth
+ * confirming directly against the real Plugin Manager screen.
  *
  * v1.21.1 CHANGE FROM v1.21.0: cluster markers (the numbered-badge
  * circles for multiple nearby reports) shrunk from 32x32 to 22x22, closer
@@ -1864,8 +1885,22 @@
     },
   };
 
+  // @grant none (see this script's header) means window already IS
+  // unsafeWindow -- no sandbox, no separate grant needed -- per
+  // Tampermonkey's own docs. This wasn't always explicit here; omitting
+  // @grant entirely is usually inferred as "none" too, but that inference
+  // isn't identical across userscript managers/versions, so it's spelled
+  // out now rather than relied on implicitly. See the importer script's
+  // own copy of this comment for the case where it actually matters: with
+  // a real @grant (that script needs GM_xmlhttpRequest), the script IS
+  // sandboxed, window.WFMM isn't the same object as the page's real
+  // window.WFMM, and unsafeWindow needs its own explicit grant to reach
+  // it -- confirmed as the fix for "script works standalone, but the
+  // suite's Plugin Manager shows nothing under External plugins".
+  const wfmmWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+
   function registerOrSelfStart(attemptsLeft) {
-    const plugins = window.WFMM && window.WFMM.plugins;
+    const plugins = wfmmWindow.WFMM && wfmmWindow.WFMM.plugins;
     if (plugins && typeof plugins.registerExternal === 'function') {
       try {
         plugins.registerExternal(PLUGIN_DEFINITION);

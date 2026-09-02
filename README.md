@@ -103,6 +103,16 @@ features. Disabling one there tears it down cleanly (removes its panel
 and side-panel link, stops its background watchers) rather than just
 hiding it; re-enabling rebuilds everything fresh.
 
+If a script works completely normally but doesn't show up under
+**External plugins** in that screen, that's the exact symptom of a
+Tampermonkey sandboxing issue fixed in importer v4.6.1 / extractor
+v1.21.2 — any `@grant` other than `none` runs a script in a sandbox
+where its own `window` isn't the same object as the page's, so
+`window.WFMM` (which the suite assigns on the real page window) is
+invisible to it; the script just quietly falls back to its older,
+pre-Plugin-Manager self-starting behavior instead, which is why nothing
+seems broken. If you're on an older version than that, update.
+
 ## What counts as an "abuse report" email
 
 Gmail sync only searches `support@nianticlabs.com` — Niantic Support's
@@ -404,8 +414,8 @@ needed since it's plain `@require`-able JS.
 
 ## Versions covered by this README
 
-- `wayfarer-abuse-email-importer.user.js` — v4.6.0
-- `wayfarer-abuse-report-extractor.user.js` — v1.21.1
+- `wayfarer-abuse-email-importer.user.js` — v4.6.1
+- `wayfarer-abuse-report-extractor.user.js` — v1.21.2
 - Verified against `wayfarer-map-mods.user.js` v4.0.0 (the consolidated
   suite both scripts depend on — see Requirements above).
 

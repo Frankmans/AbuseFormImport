@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         Wayfarer Abuse Email Importer
 // @namespace    https://wayfarer.scopely.com/new
-// @version      4.6.0
+// @version      4.6.1
 // @description  Imports Niantic Support "Reporting Abuse in Wayfarer" tickets from Gmail via OAuth, or from .eml files -- using a port of bilde2910/OPR-Tools' email parser -- and stores them for the Abuse Report Extractor script (and other consumers) to search.
 // @author       you
 // @match        https://wayfarer.scopely.com/new/mapview*
 // @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
 // @connect      gmail.googleapis.com
 // @connect      accounts.google.com
 // @require      https://raw.githubusercontent.com/Frankmans/AbuseFormImport/refs/heads/main/opr-email-lib.js
@@ -38,6 +39,33 @@
  * otherwise likely block a page-context request to googleapis.com. This
  * shouldn't change anything about the .eml/backup features below; @require'd
  * scripts and this script still share one execution context either way.
+ *
+ * v4.6.1 CHANGE FROM v4.6.0: fixed Plugin Manager registration silently
+ * never happening at all -- reported symptom: the script works completely
+ * normally (settings link, panel, everything) but the suite's own Plugin
+ * Manager screen says "No external plugins have registered with WFMM".
+ * Root cause: this script's @grant GM_xmlhttpRequest (needed for the
+ * Gmail sync calls) puts it in Tampermonkey's sandboxed execution mode,
+ * where this script's own `window` is a SEPARATE object from the real
+ * page window -- so window.WFMM (assigned by the suite onto the real
+ * page window) was always invisible here. registerOrSelfStart()'s 5s
+ * polling loop always timed out and fell back to self-starting, which is
+ * exactly why everything still worked -- just never through the Plugin
+ * Manager. Fixed by reading through unsafeWindow instead of window.
+ * Per Tampermonkey's own docs, unsafeWindow needs its OWN explicit
+ * @grant entry alongside other grants (unlike @grant none, where window
+ * already IS unsafeWindow with nothing extra needed) -- added @grant
+ * unsafeWindow to this script's header, without which the unsafeWindow
+ * fallback would have silently resolved to undefined and fallen straight
+ * back to the same broken sandboxed window.
+ *
+ * Caveat: this is a real userscript-manager sandboxing behavior that
+ * can't be reproduced in a Node/jsdom test harness -- there's no actual
+ * GM sandbox to simulate. This fix is grounded in Tampermonkey's own
+ * documented @grant/unsafeWindow behavior and the specific symptom
+ * reported, not something verified end-to-end the way other fixes in
+ * this file have been. Worth confirming directly against the real Plugin
+ * Manager screen after updating.
  *
  * v4.6.0 CHANGE FROM v4.5.1: two changes.
  *   1. The dialog had no padding at all -- confirmed .wfmapmods-modal-
@@ -1049,8 +1077,24 @@
     },
   };
 
+  // @grant GM_xmlhttpRequest sandboxes this script -- its own `window` is
+  // a SEPARATE object from the real page window, so window.WFMM (which
+  // the suite assigns on the real page window) is invisible from here.
+  // This is the confirmed cause of "script works standalone, but the
+  // suite's Plugin Manager shows nothing under External plugins":
+  // registration silently never happens, the 5s timeout below always
+  // elapses, and self-start quietly takes over every time.
+  //
+  // unsafeWindow reaches through the sandbox to the real page window --
+  // but per Tampermonkey's own docs, it is NOT automatically available
+  // just because some other @grant exists; it needs its own explicit
+  // @grant unsafeWindow entry too (only @grant none is special-cased to
+  // make `window` itself already unsafe, no separate grant needed) --
+  // see @grant unsafeWindow in this script's own header above.
+  const wfmmWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+
   function registerOrSelfStart(attemptsLeft) {
-    const plugins = window.WFMM && window.WFMM.plugins;
+    const plugins = wfmmWindow.WFMM && wfmmWindow.WFMM.plugins;
     if (plugins && typeof plugins.registerExternal === 'function') {
       try {
         plugins.registerExternal(PLUGIN_DEFINITION);
