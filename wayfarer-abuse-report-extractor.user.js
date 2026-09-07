@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Abuse Report Extractor
 // @namespace    https://wayfarer.scopely.com/new
-// @version      1.22.1
+// @version      1.23.0
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map, and exports as CSV.
 // @author       you
 // @match        https://wayfarer.scopely.com/new/mapview*
@@ -14,6 +14,18 @@
 // ==/UserScript==
 
 /*
+ * v1.23.0 CHANGE FROM v1.22.1: adds a "Marker Style" section to this
+ * panel, letting the color/size/opacity of the map markers this plugin
+ * draws be changed, backed by a real WFMM.markerAppearance.registerStyle()
+ * registration (confirmed against the real source, src/core/marker-
+ * appearance.js) rather than the hardcoded #dc2626 X/circle from earlier
+ * versions. See the WAE_APPEARANCE_* block (just above waeGetMarkerIcon())
+ * for the full "why this isn't a literal new row in Wayspot Overlay's own
+ * Wayspots/Pok\u00e9stops/Gyms/Power Spots settings grid" explanation --
+ * short version: that specific grid is hardcoded to those four kinds with
+ * no third-party registration point, but the underlying styling ENGINE it
+ * sits on top of is genuinely plugin-facing, and this now uses it.
+ *
  * v1.22.0 CHANGE FROM v1.21.2: the panel was previously a hand-rolled
  * lookalike of a Map Mods modal -- its own "#wae-panel"/backdrop/dialog
  * DOM built from an innerHTML string, styled by reverse-engineering
@@ -878,6 +890,89 @@
   let waeNearbyMap = new Map();
   let waeSearchQuery = '';
   let waeCurrentPage = 1;
+
+  // ---------------------------------------------------------------------
+  // Marker appearance -- v1.23.0. Registered with WFMM.markerAppearance
+  // (confirmed against the real source, src/core/marker-appearance.js) so
+  // this plugin's marker style is a genuine, discoverable entry in the
+  // suite's own marker-styling engine, not just an internal constant. Kept
+  // in the exact same shape WFMM.markerAppearance itself normalizes
+  // "generic" styles to -- {markerSize, borderColor, borderWidth,
+  // borderOpacity, fillColor, fillOpacity} -- so a resolve() lookup
+  // against our style key returns something any WFMM-aware code already
+  // knows how to interpret.
+  //
+  // IMPORTANT HONESTY NOTE, since this was asked for as "add ours to
+  // that [Wayspots/Pok\u00e9stops/Gyms/Power Spots] system": the actual
+  // settings SCREEN with that grid (wayspot-overlay's own marker-settings-
+  // modal.js) is hardcoded to those four built-in kinds -- STYLE_KINDS in
+  // src/plugins/wayspot-overlay/settings.js is a frozen array, with no
+  // registration point for a third-party plugin to add a new row/column.
+  // There's no real API path to literally insert into that specific grid.
+  // What IS real and plugin-facing is the underlying engine that grid is
+  // built on (WFMM.markerAppearance.registerStyle()/.resolve()) -- so
+  // this plugin registers its own style bucket there (a legitimate use of
+  // real public API, confirmed against source) and gets its OWN "Marker
+  // Style" section in this panel to edit it, using the same
+  // colorInput/numberInput/rangeInput controls the suite's own settings
+  // screens use. Same underlying engine, same look, own section -- not a
+  // literal new row in that one hardcoded grid.
+  const WAE_APPEARANCE_STYLE_KEY = 'wae:abuse-report';
+  const WAE_APPEARANCE_STORAGE_KEY = 'wae_marker_appearance';
+  const WAE_APPEARANCE_DEFAULTS = Object.freeze({
+    markerSize: 9,
+    fillColor: '#dc2626',
+    fillOpacity: 1,
+    borderColor: '#ffffff',
+    borderWidth: 2,
+    borderOpacity: 1,
+  });
+  // Set once at startPlugin() (WFMM.markerAppearance.registerStyle()'s
+  // return value) and called at stopPlugin() -- registerStyle() throws
+  // "already registered" if called twice for the same key without an
+  // unregister in between, which matters here since startPlugin() can run
+  // again if the plugin is toggled off and back on in Plugin Manager.
+  let waeUnregisterAppearance = null;
+
+  function waeClampNumber(value, min, max, fallback) {
+    const n = Number(value);
+    return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
+  }
+  function waeNormalizeHexColor(value, fallback) {
+    const s = String(value || '').trim();
+    return /^#[0-9a-f]{3}$/i.test(s) || /^#[0-9a-f]{6}$/i.test(s) ? s : fallback;
+  }
+  function waeNormalizeAppearance(raw) {
+    const a = raw || {};
+    return {
+      markerSize: waeClampNumber(a.markerSize, 4, 24, WAE_APPEARANCE_DEFAULTS.markerSize),
+      fillColor: waeNormalizeHexColor(a.fillColor, WAE_APPEARANCE_DEFAULTS.fillColor),
+      fillOpacity: waeClampNumber(a.fillOpacity, 0, 1, WAE_APPEARANCE_DEFAULTS.fillOpacity),
+      borderColor: waeNormalizeHexColor(a.borderColor, WAE_APPEARANCE_DEFAULTS.borderColor),
+      borderWidth: waeClampNumber(a.borderWidth, 0, 8, WAE_APPEARANCE_DEFAULTS.borderWidth),
+      borderOpacity: waeClampNumber(a.borderOpacity, 0, 1, WAE_APPEARANCE_DEFAULTS.borderOpacity),
+    };
+  }
+  function waeLoadAppearance() {
+    try {
+      return waeNormalizeAppearance(JSON.parse(localStorage.getItem(WAE_APPEARANCE_STORAGE_KEY) || '{}'));
+    } catch (e) {
+      return { ...WAE_APPEARANCE_DEFAULTS };
+    }
+  }
+  function waeSaveAppearance(appearance) {
+    localStorage.setItem(WAE_APPEARANCE_STORAGE_KEY, JSON.stringify(appearance));
+    // Cached SVG icons (WAE_MARKER_ICON/WAE_CLUSTER_ICON, see below) are
+    // built from these values -- stale otherwise until the next full page
+    // load.
+    WAE_MARKER_ICON = null;
+    WAE_CLUSTER_ICON = null;
+    // Only live-redraw if pulses are actually already visible -- editing
+    // colors shouldn't be what makes the map attach/show pulses if the
+    // user never turned "Show on Map" on.
+    if (WAE_PULSES.map && isMapPulsesEnabled()) waeRefreshPulses();
+  }
+
   const WAE_PAGE_SIZE = 200;
 
   // WFMM.ui, set while the panel is open (buildPanelContent()) and used by
@@ -913,37 +1008,58 @@
     }
     return r._waeHaystack.includes(q);
   }
-  // Built lazily (needs `google` to already be loaded) and cached --
-  // same icon object reused for every marker instead of rebuilt per-call.
+  // Built lazily and cached -- same icon object reused for every marker
+  // instead of rebuilt per-call. Invalidated (set back to null) by
+  // waeSaveAppearance() whenever the user changes a marker-style setting.
   let WAE_MARKER_ICON = null;
   function waeGetMarkerIcon() {
     if (WAE_MARKER_ICON) return WAE_MARKER_ICON;
-    const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20">'
-      + '<line x1="3" y1="3" x2="17" y2="17" stroke="#dc2626" stroke-width="4" stroke-linecap="round"/>'
-      + '<line x1="17" y1="3" x2="3" y2="17" stroke="#dc2626" stroke-width="4" stroke-linecap="round"/>'
+    const a = waeLoadAppearance();
+    // Kept as a distinct X glyph (not the same filled-circle look as a
+    // regular Wayspot/Pok\u00e9stop/Gym marker) so an abuse-report location
+    // still reads as "a problem here", not just another POI dot -- only
+    // its color/size are what's user-configurable via fillColor/
+    // markerSize. borderColor/borderWidth/borderOpacity/fillOpacity don't
+    // apply to this shape (an X has no fill region or ring) -- they only
+    // affect the cluster icon below, which IS a filled circle with a
+    // ring, matching WFMM's own "generic" marker shape exactly.
+    const size = a.markerSize * 2;
+    const half = size / 2;
+    const arm = size * 0.35;
+    const stroke = Math.max(2, Math.round(a.markerSize * 0.45));
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}">`
+      + `<line x1="${half - arm}" y1="${half - arm}" x2="${half + arm}" y2="${half + arm}" stroke="${a.fillColor}" stroke-width="${stroke}" stroke-linecap="round"/>`
+      + `<line x1="${half + arm}" y1="${half - arm}" x2="${half - arm}" y2="${half + arm}" stroke="${a.fillColor}" stroke-width="${stroke}" stroke-linecap="round"/>`
       + '</svg>';
     WAE_MARKER_ICON = {
       url: 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(svg),
-      scaledSize: new google.maps.Size(20, 20),
-      anchor: new google.maps.Point(10, 10),
+      scaledSize: new google.maps.Size(size, size),
+      anchor: new google.maps.Point(half, half),
     };
     return WAE_MARKER_ICON;
   }
 
-  // Same red as the single-report marker, just bigger, filled, and with
-  // room for a count label -- reads as "many of the same thing" rather
-  // than a different kind of marker.
+  // Same color as the single-report marker, just as a filled circle
+  // (matching WFMM's own "generic" POI marker shape) with room for a
+  // count label -- reads as "many of the same thing" rather than a
+  // different kind of marker. Every field here (fillColor/fillOpacity/
+  // borderColor/borderWidth/borderOpacity/markerSize) is user-
+  // configurable through the Marker Style section.
   let WAE_CLUSTER_ICON = null;
   function waeGetClusterIcon() {
     if (WAE_CLUSTER_ICON) return WAE_CLUSTER_ICON;
-    const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22">'
-      + '<circle cx="11" cy="11" r="9.5" fill="#dc2626" stroke="#ffffff" stroke-width="2"/>'
+    const a = waeLoadAppearance();
+    const r = a.markerSize * 1.15;
+    const size = (r + a.borderWidth) * 2;
+    const c = size / 2;
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}">`
+      + `<circle cx="${c}" cy="${c}" r="${r}" fill="${a.fillColor}" fill-opacity="${a.fillOpacity}" stroke="${a.borderColor}" stroke-width="${a.borderWidth}" stroke-opacity="${a.borderOpacity}"/>`
       + '</svg>';
     WAE_CLUSTER_ICON = {
       url: 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(svg),
-      scaledSize: new google.maps.Size(22, 22),
-      anchor: new google.maps.Point(11, 11),
-      labelOrigin: new google.maps.Point(11, 11),
+      scaledSize: new google.maps.Size(size, size),
+      anchor: new google.maps.Point(c, c),
+      labelOrigin: new google.maps.Point(c, c),
     };
     return WAE_CLUSTER_ICON;
   }
@@ -1709,7 +1825,82 @@
     const tableContainer = ui.createElement('div', { className: 'wae-table-container' });
     const logEl = ui.createElement('div', { className: 'wae-log' });
 
-    modal.body.append(countEl, buttonRowEl, progressEl, searchInput, tableContainer, logEl);
+    // ---- Marker Style ----
+    // See the WAE_APPEARANCE_* block up top for why this is its own
+    // section here rather than a literal new entry in Wayspot Overlay's
+    // built-in Wayspots/Pok\u00e9stops/Gyms/Power Spots grid (not
+    // possible -- that grid is hardcoded to those four kinds). This uses
+    // the same generic-style shape and the same colorInput/rangeInput
+    // controls the suite's own settings screens use, and is backed by a
+    // real WFMM.markerAppearance.registerStyle() registration (see
+    // startPlugin()) so it's genuinely part of that engine, just
+    // surfaced through this panel instead of that one fixed grid.
+    function updateAppearance(partial) {
+      const next = waeNormalizeAppearance({ ...waeLoadAppearance(), ...partial });
+      waeSaveAppearance(next);
+      return next;
+    }
+    const initialAppearance = waeLoadAppearance();
+    const styleColorInput = ui.colorInput({
+      value: initialAppearance.fillColor,
+      onInput: (v) => updateAppearance({ fillColor: v }),
+    });
+    const styleSizeRange = ui.rangeInput({
+      min: 4, max: 24, step: 1, value: initialAppearance.markerSize,
+      formatValue: (v) => `${v}px`,
+      onInput: (v) => updateAppearance({ markerSize: Number(v) }),
+    });
+    const styleFillOpacityRange = ui.rangeInput({
+      min: 0, max: 1, step: 0.05, value: initialAppearance.fillOpacity,
+      formatValue: (v) => `${Math.round(Number(v) * 100)}%`,
+      onInput: (v) => updateAppearance({ fillOpacity: Number(v) }),
+    });
+    const styleBorderColorInput = ui.colorInput({
+      value: initialAppearance.borderColor,
+      onInput: (v) => updateAppearance({ borderColor: v }),
+    });
+    const styleBorderWidthRange = ui.rangeInput({
+      min: 0, max: 8, step: 1, value: initialAppearance.borderWidth,
+      formatValue: (v) => `${v}px`,
+      onInput: (v) => updateAppearance({ borderWidth: Number(v) }),
+    });
+    const styleBorderOpacityRange = ui.rangeInput({
+      min: 0, max: 1, step: 0.05, value: initialAppearance.borderOpacity,
+      formatValue: (v) => `${Math.round(Number(v) * 100)}%`,
+      onInput: (v) => updateAppearance({ borderOpacity: Number(v) }),
+    });
+    const resetStyleBtn = ui.button({
+      text: 'Reset to default',
+      onClick: () => {
+        const d = waeNormalizeAppearance(WAE_APPEARANCE_DEFAULTS);
+        waeSaveAppearance(d);
+        styleColorInput.value = d.fillColor;
+        styleBorderColorInput.value = d.borderColor;
+        styleSizeRange.input.value = String(d.markerSize);
+        styleSizeRange.valueEl.textContent = `${d.markerSize}px`;
+        styleFillOpacityRange.input.value = String(d.fillOpacity);
+        styleFillOpacityRange.valueEl.textContent = `${Math.round(d.fillOpacity * 100)}%`;
+        styleBorderWidthRange.input.value = String(d.borderWidth);
+        styleBorderWidthRange.valueEl.textContent = `${d.borderWidth}px`;
+        styleBorderOpacityRange.input.value = String(d.borderOpacity);
+        styleBorderOpacityRange.valueEl.textContent = `${Math.round(d.borderOpacity * 100)}%`;
+      },
+    });
+    const styleSection = ui.section({
+      title: 'Marker Style',
+      hint: 'Color/size for the map markers this plugin draws (single reports and clusters).',
+      children: [
+        ui.fieldRow({ label: 'Color', input: styleColorInput }),
+        ui.fieldRow({ label: 'Size', input: styleSizeRange.row }),
+        ui.fieldRow({ label: 'Fill opacity', input: styleFillOpacityRange.row, help: 'Only visible on cluster markers -- a single X marker is always fully opaque.' }),
+        ui.fieldRow({ label: 'Ring color', input: styleBorderColorInput, help: 'Cluster markers only.' }),
+        ui.fieldRow({ label: 'Ring width', input: styleBorderWidthRange.row }),
+        ui.fieldRow({ label: 'Ring opacity', input: styleBorderOpacityRange.row }),
+        ui.buttonRow([resetStyleBtn]),
+      ],
+    });
+
+    modal.body.append(countEl, buttonRowEl, progressEl, searchInput, tableContainer, logEl, styleSection);
 
     waeUI = { countEl, tableContainer, logEl, scanBtn, mapToggleBtn, exportBtn, clearBtn, searchInput };
 
@@ -1940,11 +2131,27 @@
     // Registering as an external plugin (the only path startPlugin() is
     // reached from -- see registerOrSelfStart() below) already implies
     // WFMM.plugins exists, which per the real v4.0.0+ source means
-    // WFMM.ui does too -- both are populated by the same suite bootstrap.
+    // WFMM.ui and WFMM.markerAppearance do too -- all populated by the
+    // same suite bootstrap (confirmed: WFMM.markerAppearance is assigned
+    // right alongside WFMM.ui in that bootstrap sequence).
     // injectStyle() is idempotent (replaces by id, see WFMM.ui's own
     // dom.js), so this is safe to call every startPlugin() -- no separate
     // "already injected" guard needed.
     wfmmWindow.WFMM.ui.injectStyle('wae-extra-styles', STYLE);
+    // registerStyle() itself is NOT idempotent -- it throws if the same
+    // key is already registered, which matters here since startPlugin()
+    // can run again if the plugin's toggled off/on in Plugin Manager. The
+    // unregister function it returns is called in stopPlugin() below for
+    // exactly that reason.
+    waeUnregisterAppearance = wfmmWindow.WFMM.markerAppearance.registerStyle({
+      key: WAE_APPEARANCE_STYLE_KEY,
+      pluginId: PLUGIN_ID,
+      // normalizeResolvedStyle() (marker-appearance.js) reads style.generic.*,
+      // not a flat object -- waeLoadAppearance() stays flat for our own
+      // icon-building code's convenience, wrapped here to match what the
+      // registry actually expects from a resolve() callback.
+      resolve: () => ({ markerType: 'generic', generic: waeLoadAppearance() }),
+    });
     startSidePanelWatcher();
     waeResyncMapIfVisible();
   }
@@ -1956,6 +2163,8 @@
     closePanel(); // no-op if the panel isn't open; openModal's own close() tears its DOM down
     waeStopStaleWatch();
     waeClearPulses();
+    waeUnregisterAppearance?.();
+    waeUnregisterAppearance = null;
   }
 
   // ---------------------------------------------------------------------
