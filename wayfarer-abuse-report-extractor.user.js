@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Abuse Report Extractor
 // @namespace    https://wayfarer.scopely.com/new
-// @version      1.22.0
+// @version      1.22.1
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map, and exports as CSV.
 // @author       you
 // @match        https://wayfarer.scopely.com/new/mapview*
@@ -1842,6 +1842,19 @@
       className: 'wae-dialog',
       showFooterButtons: false,
       ownerPluginId: PLUGIN_ID,
+      // Dragging/resizing itself isn't something a plugin can turn on for
+      // its own modal -- confirmed against the real source
+      // (resolveDesktopModalInteractionOptions() in
+      // desktop-modal-interactions.js): whatever draggable/resizable a
+      // modal passes in gets OVERWRITTEN with the suite-wide "Make modals
+      // draggable"/"Make modals resizeable" preference (Base's own Side
+      // Panel settings), same as every other WFMM.ui modal, including the
+      // suite's own (e.g. Reporting History). Since this panel already
+      // goes through openModal(), it's automatically draggable/resizable
+      // too, for free, once the user turns that preference on -- nothing
+      // to opt into here. minWidth/minHeight below only matter once
+      // resizing is on, same as Reporting History's own desktopInteractions.
+      desktopInteractions: { minWidth: 420, minHeight: 320 },
       buildContent: buildPanelContent,
     });
   }

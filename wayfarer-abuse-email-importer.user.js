@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Abuse Email Importer
 // @namespace    https://wayfarer.scopely.com/new
-// @version      4.7.0
+// @version      4.7.1
 // @description  Imports Niantic Support "Reporting Abuse in Wayfarer" tickets from Gmail via OAuth, or from .eml files -- using a port of bilde2910/OPR-Tools' email parser -- and stores them for the Abuse Report Extractor script (and other consumers) to search.
 // @author       you
 // @match        https://wayfarer.scopely.com/new/mapview*
@@ -916,6 +916,13 @@
       className: 'wei-dialog',
       showFooterButtons: false,
       ownerPluginId: PLUGIN_ID,
+      // See wae.js's own openPanel() comment -- same story here.
+      // Draggable/resizable already work automatically through
+      // openModal() once the user turns on "Make modals draggable"/"Make
+      // modals resizeable" in Base's Side Panel settings; a plugin can't
+      // force it on for just its own modal. minWidth/minHeight only
+      // matter once resizing is on.
+      desktopInteractions: { minWidth: 360, minHeight: 280 },
       buildContent: buildPanelContent,
     });
   }
