@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Abuse Email Importer
 // @namespace    https://wayfarer.scopely.com/new
-// @version      4.6.1
+// @version      4.7.0
 // @description  Imports Niantic Support "Reporting Abuse in Wayfarer" tickets from Gmail via OAuth, or from .eml files -- using a port of bilde2910/OPR-Tools' email parser -- and stores them for the Abuse Report Extractor script (and other consumers) to search.
 // @author       you
 // @match        https://wayfarer.scopely.com/new/mapview*
@@ -17,6 +17,33 @@
 // ==/UserScript==
 
 /*
+ * v4.7.0 CHANGE FROM v4.6.1: same underlying change as the Abuse Report
+ * Extractor script's own v1.22.0 -- see that file's changelog note for the
+ * fuller explanation. Short version: buildPanel()'s hand-rolled backdrop/
+ * dialog (an innerHTML string styled by copying the suite's own
+ * .wfmapmods-modal-* class names) is gone, replaced with a real
+ * WFMM.ui.openModal() call, with the body built via WFMM.ui.createElement/
+ * section/button/buttonRow/textInput/checkboxRow/selectInput. openPanel()/
+ * closePanel()/togglePanel() now work through the modalController
+ * openModal() returns instead of toggling a hidden panel's display style
+ * -- since openModal() tears the dialog down on close rather than hiding
+ * it, this panel's live DOM refs are only valid while it's open, tracked
+ * via a single weiUI object set in buildContent() and cleared in the
+ * onClose hook.
+ *
+ * IMPORTANT DIFFERENCE FROM THE EXTRACTOR SCRIPT: this script runs
+ * sandboxed (@grant GM_xmlhttpRequest -- see the v4.6.1 note further down
+ * on why window.WFMM isn't reachable as a bare global from in here), so
+ * every WFMM.ui.* call in this file goes through wfmmWindow.WFMM.ui, never
+ * a bare WFMM/window.WFMM. wfmmWindow itself moved up to the top of the
+ * file (it used to only be declared right before the Plugin Manager
+ * registration code at the bottom) so the same reference covers both that
+ * registration bootstrap AND every UI call in the panel.
+ *
+ * Only the panel-*building* code changed here -- Gmail OAuth/sync, the
+ * .eml import path, auto-sync, and the backup/restore JSON export are all
+ * untouched, since none of that is UI-service surface.
+ *
  * Companion to wayfarer-abuse-report-extractor.user.js. This script's ONLY
  * job is getting your raw emails into the shared IndexedDB store
  * ("wst_email_store", see wst-storage.js) as parsed-but-unclassified
@@ -245,6 +272,19 @@
 (function () {
   'use strict';
 
+  // @grant GM_xmlhttpRequest (needed for the Gmail API calls) sandboxes
+  // this script -- its own `window` is a SEPARATE object from the real
+  // page window, so a bare `WFMM`/`window.WFMM` reference from in here
+  // would resolve to nothing, or to a stale sandboxed copy, never the
+  // real page's window.WFMM the suite actually assigns to. unsafeWindow
+  // reaches through the sandbox to the real page window -- see the
+  // v4.6.1 changelog note further up for the fuller story (and why it
+  // needs its own explicit @grant unsafeWindow entry, unlike @grant none
+  // where window already IS unsafeWindow). Declared once, here, and
+  // reused for every wfmmWindow.WFMM.* call in this file, not just the
+  // Plugin Manager registration bootstrap at the bottom.
+  const wfmmWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+
   const GMAIL_SCOPE = 'https://www.googleapis.com/auth/gmail.readonly';
   // Niantic Support's Helpshift ticket threads, e.g. "Reporting Abuse in
   // Wayfarer" (confirmed real From address) -- see opr-email-lib.js's
@@ -262,34 +302,30 @@
   const AUTOSYNC_INTERVAL_KEY = 'wei_autosync_interval_min';
   const CONCURRENCY = 5;
 
+  // Only what WFMM.ui's own base styles (injected via ui.injectStyle()/
+  // ui.openModal() itself) don't already cover -- the modal shell,
+  // buttons, text inputs, checkboxes, selects, and section headers all
+  // come from the suite's own wfmm-* classes now (WFMM.ui.createElement/
+  // button/textInput/checkboxRow/selectInput/section), so there's much
+  // less left to define here than the old hand-copied .wfmapmods-modal-*
+  // lookalike needed. See wae.js's own v1.22.0 changelog note for the
+  // fuller story -- same change, applied here.
   const STYLE = `
-    #wei-panel .wei-dialog{
-      width:480px; max-width:calc(100vw - 24px);
-      padding:18px 22px; overflow-y:auto;
-    }
-    #wei-panel .wei-sub{ font-size:11px; color:#6b7280; margin-bottom:8px; }
+    #wei-panel .wfmapmods-modal-dialog{ width:480px; max-width:calc(100vw - 24px); }
+    .wei-sub{ font-size:11px; color:var(--wfmm-muted-text, #667085); margin-bottom:8px; }
     #wei-dropzone{
       border:2px dashed #d1d5db; border-radius:6px; padding:20px 10px; text-align:center;
       color:#6b7280; margin:6px 0; cursor:pointer; font-size:12px;
     }
     #wei-dropzone.drag{ border-color:#2563eb; color:#2563eb; }
-    .wei-text-input{
-      width:100%; box-sizing:border-box; border:1px solid #d1d5db; border-radius:4px;
-      padding:5px 8px; font-size:12px; margin-bottom:6px; font-family:inherit;
-    }
-    .wei-btn-row{ display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin:6px 0; }
-    .wei-btn-row .wfmapmods-modal-btn{ margin:0; }
-    .wei-btn-danger{ color:#dc2626; border-color:#dc2626; }
-    #wei-panel button:disabled{ opacity:0.5; cursor:default; }
     .wei-autosync-row{ display:flex; align-items:center; gap:6px; font-size:12px; color:#374151; margin:6px 0; cursor:default; }
-    .wei-checkbox{ width:16px; height:16px; margin:0; accent-color:#2563eb; cursor:pointer; }
-    #wei-progress{ font-size:11px; color:#2563eb; margin:4px 0; min-height:14px; }
-    #wei-log{
+    .wei-progress{ font-size:11px; color:#2563eb; margin:4px 0; min-height:14px; }
+    .wei-log{
       margin-top:8px; max-height:180px; overflow-y:auto; font-size:11px; line-height:1.5;
     }
-    #wei-log div.ok{ color:#16a34a; }
-    #wei-log div.skip{ color:#6b7280; }
-    #wei-log div.err{ color:#dc2626; }
+    .wei-log div.ok{ color:#16a34a; }
+    .wei-log div.skip{ color:#6b7280; }
+    .wei-log div.err{ color:#dc2626; }
   `;
 
   // ---------------------------------------------------------------------
@@ -455,166 +491,196 @@
     localStorage.setItem(AUTOSYNC_INTERVAL_KEY, String(intervalMin));
   }
 
+  // WFMM.ui, set while the panel is open, and the currently-open panel's
+  // live DOM refs -- same pattern as the extractor script's own waeUiApi/
+  // waeUI (see its v1.22.0 changelog note). Both null while the panel is
+  // closed, since WFMM.ui.openModal() tears the dialog down on close
+  // instead of just hiding it, the way the old backdrop did.
+  let weiUiApi = null;
+  let weiUI = null;
+  let weiPanelController = null;
+
+  // Auto-sync keeps running in the background whether or not the panel is
+  // open (that was already true before this refactor -- the old backdrop
+  // just stayed in the DOM hidden). Logging and progress text now have to
+  // tolerate the panel being closed: weiLog() below buffers into
+  // weiPendingLog (oldest-first, capped) when there's no logEl to write
+  // into, and flushes it into the fresh logEl next time the panel opens,
+  // so nothing a background tick logged gets silently lost.
+  let weiPendingLog = [];
+
+  function weiLog(msg, cls) {
+    if (weiUI) {
+      weiUI.logEl.prepend(weiUiApi.createElement('div', { className: cls || '', text: msg }));
+      while (weiUI.logEl.children.length > 200) weiUI.logEl.removeChild(weiUI.logEl.lastChild);
+      return;
+    }
+    weiPendingLog.push({ msg, cls });
+    if (weiPendingLog.length > 50) weiPendingLog.shift();
+  }
+
+  function weiSetProgress(text) {
+    if (weiUI) weiUI.progressEl.textContent = text;
+  }
+
   async function refreshCount() {
-    const countEl = document.getElementById('wei-count');
-    if (!countEl) return;
+    if (!weiUI) return;
     try {
       const n = await WSTStorage.countEmails();
-      countEl.textContent = `${n} email(s) stored. Open the Abuse Report Extractor to scan them.`;
+      weiUI.countEl.textContent = `${n} email(s) stored. Open the Abuse Report Extractor to scan them.`;
     } catch (e) {
-      countEl.textContent = 'Could not read the email store.';
+      weiUI.countEl.textContent = 'Could not read the email store.';
     }
   }
 
   function updateGmailStatus() {
-    const gmailStatusEl = document.getElementById('wei-gmail-status');
-    if (!gmailStatusEl) return;
+    if (!weiUI) return;
     const lastSync = localStorage.getItem(LAST_SYNC_KEY);
     const auto = loadAutoSyncSettings();
     const autoSuffix = auto.enabled ? ` Auto-sync: every ${auto.intervalMin} min.` : '';
     if (accessToken) {
-      gmailStatusEl.textContent = (lastSync
+      weiUI.gmailStatusEl.textContent = (lastSync
         ? `Connected. Last synced ${new Date(Number(lastSync)).toLocaleString()}.`
         : 'Connected. Never synced yet.') + autoSuffix;
     } else {
-      gmailStatusEl.textContent = (lastSync
+      weiUI.gmailStatusEl.textContent = (lastSync
         ? `Not connected this session. Last synced ${new Date(Number(lastSync)).toLocaleString()}.`
         : 'Not connected.') + autoSuffix;
     }
   }
 
-  function buildPanel() {
-    if (document.getElementById('wei-panel')) return;
+  // ---- .eml import (unchanged from v2) ----
 
-    const style = document.createElement('style');
-    style.textContent = STYLE;
-    document.head.appendChild(style);
+  function normalizeEml(text) {
+    return text.replace(/\r\n/g, '\n').replace(/\n/g, '\r\n');
+  }
 
-    const panel = document.createElement('div');
-    panel.id = 'wei-panel';
-    panel.className = 'wfmapmods-modal-backdrop';
-    panel.style.display = 'none';
-    panel.innerHTML = `
-      <div class="wfmapmods-modal-dialog wei-dialog">
-        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
-          <div class="wfmapmods-modal-title">Wayfarer Abuse Email Importer</div>
-          <button type="button" id="wei-close" class="wfmapmods-close-btn" title="Close" aria-label="Close">&times;</button>
-        </div>
-        <div class="wei-sub" id="wei-count">Loading...</div>
+  function emlToRecord(text, fallbackName) {
+    const email = OPREmail.parseMIME(normalizeEml(text));
+    const messageId = email.getFirstHeaderValue('Message-ID', null);
+    const id = messageId || `synthetic:${fallbackName}:${text.length}`;
+    return { id, filename: fallbackName, ts: Date.now(), headers: email.headers, body: email.body };
+  }
 
-        <div class="wfmapmods-modal-section">
-          <div class="wfmapmods-modal-section-header">Connect Gmail</div>
-          <input type="text" id="wei-client-id" class="wei-text-input" placeholder="OAuth Client ID (ends in .apps.googleusercontent.com)">
-          <div class="wei-sub" id="wei-gmail-status">Not connected.</div>
-          <div class="wei-sub" id="wei-progress"></div>
-          <div class="wei-btn-row">
-            <button id="wei-sync" class="wfmapmods-modal-btn wfmapmods-modal-btn-primary">Sync new emails</button>
-            <button id="wei-full-resync" class="wfmapmods-modal-btn">Force full re-sync</button>
-          </div>
-          <label class="wei-autosync-row">
-            <input type="checkbox" id="wei-autosync-toggle" class="wei-checkbox"> Auto-sync every
-            <select id="wei-autosync-interval" class="wfmapmods-modal-select">
-              <option value="5">5 min</option>
-              <option value="15">15 min</option>
-              <option value="30">30 min</option>
-              <option value="60">60 min</option>
-            </select>
-          </label>
-        </div>
-
-        <div class="wfmapmods-modal-section">
-          <div class="wfmapmods-modal-section-header">Or drop .eml files</div>
-          <div id="wei-dropzone">Drop .eml files here, or click to choose</div>
-          <input type="file" id="wei-file-input" accept=".eml" multiple style="display:none;">
-        </div>
-
-        <div class="wfmapmods-modal-section" style="border-bottom:none; margin-bottom:0; padding-bottom:0;">
-          <div class="wfmapmods-modal-section-header">Backup / maintenance</div>
-          <div class="wei-btn-row">
-            <button id="wei-export" class="wfmapmods-modal-btn">Export backup JSON</button>
-            <button id="wei-import-backup" class="wfmapmods-modal-btn">Import backup JSON</button>
-            <input type="file" id="wei-backup-input" accept=".json,application/json" style="display:none;">
-            <button id="wei-clear" class="wfmapmods-modal-btn wei-btn-danger">Clear all stored emails</button>
-          </div>
-          <div id="wei-log"></div>
-        </div>
-      </div>
-    `;
-    document.body.appendChild(panel);
-
-    const dropzone = panel.querySelector('#wei-dropzone');
-    const fileInput = panel.querySelector('#wei-file-input');
-    const backupInput = panel.querySelector('#wei-backup-input');
-    const logEl = panel.querySelector('#wei-log');
-    const clientIdInput = panel.querySelector('#wei-client-id');
-    const progressEl = panel.querySelector('#wei-progress');
-    const syncBtn = panel.querySelector('#wei-sync');
-    const fullResyncBtn = panel.querySelector('#wei-full-resync');
-
-    clientIdInput.value = localStorage.getItem(CLIENT_ID_KEY) || '';
-    clientIdInput.addEventListener('change', () => {
-      localStorage.setItem(CLIENT_ID_KEY, clientIdInput.value.trim());
-    });
-
-    function log(msg, cls) {
-      const div = document.createElement('div');
-      div.className = cls || '';
-      div.textContent = msg;
-      logEl.prepend(div);
+  // Transient-only: used to add an "N abuse report ticket(s)" count to the
+  // import log line. Never persisted -- stored records stay the
+  // deliberately-unclassified {headers, body} shape described up top, so
+  // the extractor script re-classifies from the raw email itself, the
+  // same way this helper does.
+  function isAbuseReportRecord(record) {
+    try {
+      // record.headers/body are already the decoded {name, value} pairs
+      // and raw body that emlToRecord() stored, in exactly the shape
+      // OPREmail.Email's constructor expects -- no need to re-serialize
+      // and re-parse the whole MIME message just to classify it.
+      const email = new OPREmail.Email(record.headers, record.body);
+      const { type } = email.classify();
+      return typeof type === 'string' && type.startsWith('ABUSE_REPORT_');
+    } catch (e) {
+      return false;
     }
+  }
 
-    // ---- .eml import (unchanged from v2) ----
+  function countAbuseReports(records) {
+    return records.reduce((n, r) => n + (isAbuseReportRecord(r) ? 1 : 0), 0);
+  }
 
-    function normalizeEml(text) {
-      return text.replace(/\r\n/g, '\n').replace(/\n/g, '\r\n');
-    }
-
-    function emlToRecord(text, fallbackName) {
-      const email = OPREmail.parseMIME(normalizeEml(text));
-      const messageId = email.getFirstHeaderValue('Message-ID', null);
-      const id = messageId || `synthetic:${fallbackName}:${text.length}`;
-      return { id, filename: fallbackName, ts: Date.now(), headers: email.headers, body: email.body };
-    }
-
-    // Transient-only: used to add an "N abuse report ticket(s)" count to the
-    // import log line. Never persisted -- stored records stay the
-    // deliberately-unclassified {headers, body} shape described up top, so
-    // the extractor script re-classifies from the raw email itself, the
-    // same way this helper does.
-    function isAbuseReportRecord(record) {
+  async function importFiles(files) {
+    const records = [];
+    let parseErrors = 0;
+    for (const file of files) {
+      let text;
       try {
-        // record.headers/body are already the decoded {name, value} pairs
-        // and raw body that emlToRecord() stored, in exactly the shape
-        // OPREmail.Email's constructor expects -- no need to re-serialize
-        // and re-parse the whole MIME message just to classify it.
-        const email = new OPREmail.Email(record.headers, record.body);
-        const { type } = email.classify();
-        return typeof type === 'string' && type.startsWith('ABUSE_REPORT_');
+        text = await file.text();
       } catch (e) {
-        return false;
+        weiLog(`✗ ${file.name}: could not read file`, 'err');
+        parseErrors++;
+        continue;
+      }
+      try {
+        records.push(emlToRecord(text, file.name));
+      } catch (e) {
+        weiLog(`✗ ${file.name}: ${e.message || e}`, 'err');
+        parseErrors++;
       }
     }
 
-    function countAbuseReports(records) {
-      return records.reduce((n, r) => n + (isAbuseReportRecord(r) ? 1 : 0), 0);
+    if (records.length) {
+      const { inserted, updated } = await WSTStorage.putEmails(records);
+      const abuseCount = countAbuseReports(records);
+      const abuseSuffix = abuseCount ? `, ${abuseCount} abuse report ticket${abuseCount === 1 ? '' : 's'}` : '';
+      weiLog(`✓ Imported ${records.length} file(s): ${inserted} new, ${updated} updated${abuseSuffix}`, 'ok');
+    }
+    if (parseErrors) weiLog(`${parseErrors} file(s) could not be parsed as MIME email`, 'err');
+    await refreshCount();
+  }
+
+  // ---- Gmail sync ----
+  //
+  // Moved to module scope (used to live inside buildPanel(), closed over
+  // that one persistent panel's elements). Now reads the OAuth Client ID
+  // from localStorage directly rather than a live input -- this needs to
+  // keep working from a background auto-sync tick even while the panel is
+  // closed and no such input exists. weiSetProgress()/weiUI-guarded button
+  // toggling below are no-ops in that case; see weiLog()'s comment above
+  // for the same reasoning applied to logging.
+  async function runSync(forceFull, opts) {
+    const auto = !!(opts && opts.auto);
+    const clientId = (localStorage.getItem(CLIENT_ID_KEY) || '').trim();
+    if (!clientId) {
+      if (!auto) weiLog('Paste your OAuth Client ID first', 'err');
+      return;
     }
 
-    async function importFiles(files) {
+    if (weiUI) { weiUI.syncBtn.disabled = true; weiUI.fullResyncBtn.disabled = true; }
+    weiSetProgress(auto ? 'Auto-sync: connecting to Gmail\u2026' : 'Connecting to Gmail\u2026');
+
+    const lastSyncMs = forceFull ? null : Number(localStorage.getItem(LAST_SYNC_KEY)) || null;
+    const syncStartedAt = Date.now();
+
+    try {
+      let token;
+      try {
+        token = await getValidToken(clientId, { forceNonInteractive: auto });
+      } catch (e) {
+        if (auto) {
+          weiLog('Auto-sync skipped this round: Gmail sign-in needed -- click "Sync new emails" once to reconnect', 'skip');
+          return;
+        }
+        throw e;
+      }
+      updateGmailStatus();
+
+      const query = buildGmailQuery(lastSyncMs);
+      weiSetProgress('Listing matching messages\u2026');
+      const ids = await listAllMessageIds(query, token, (n) => {
+        weiSetProgress(`Found ${n} matching message(s) so far\u2026`);
+      });
+
+      if (ids.length === 0) {
+        weiLog(auto ? 'Auto-sync: no new messages found' : 'No new messages found', 'skip');
+        localStorage.setItem(LAST_SYNC_KEY, String(syncStartedAt));
+        updateGmailStatus();
+        return;
+      }
+
+      weiSetProgress(`Fetching ${ids.length} message(s)\u2026`);
+      const raws = await fetchMessagesRaw(ids, token, (done, total) => {
+        weiSetProgress(`Fetching messages\u2026 ${done}/${total}`);
+      });
+
       const records = [];
-      let parseErrors = 0;
-      for (const file of files) {
-        let text;
-        try {
-          text = await file.text();
-        } catch (e) {
-          log(`✗ ${file.name}: could not read file`, 'err');
-          parseErrors++;
+      let fetchErrors = 0, parseErrors = 0;
+      for (const r of raws) {
+        if (r.error) {
+          fetchErrors++;
+          if (r.error.authExpired) weiLog('Gmail token expired mid-sync -- run Sync again to resume', 'err');
           continue;
         }
         try {
-          records.push(emlToRecord(text, file.name));
+          const text = base64UrlToText(r.raw);
+          records.push(emlToRecord(text, `gmail:${r.id}`));
         } catch (e) {
-          log(`✗ ${file.name}: ${e.message || e}`, 'err');
           parseErrors++;
         }
       }
@@ -623,12 +689,132 @@
         const { inserted, updated } = await WSTStorage.putEmails(records);
         const abuseCount = countAbuseReports(records);
         const abuseSuffix = abuseCount ? `, ${abuseCount} abuse report ticket${abuseCount === 1 ? '' : 's'}` : '';
-        log(`✓ Imported ${records.length} file(s): ${inserted} new, ${updated} updated${abuseSuffix}`, 'ok');
+        weiLog(`✓ ${auto ? 'Auto-sync: synced' : 'Synced'} ${records.length} message(s) from Gmail: ${inserted} new, ${updated} updated${abuseSuffix}`, 'ok');
       }
-      if (parseErrors) log(`${parseErrors} file(s) could not be parsed as MIME email`, 'err');
+      if (fetchErrors) weiLog(`${fetchErrors} message(s) failed to fetch (see above)`, 'err');
+      if (parseErrors) weiLog(`${parseErrors} message(s) could not be parsed as MIME email`, 'err');
+
+      localStorage.setItem(LAST_SYNC_KEY, String(syncStartedAt));
+    } catch (e) {
+      weiLog(`${auto ? 'Auto-sync failed: ' : 'Gmail sync failed: '}${e.message || e}`, 'err');
+    } finally {
+      weiSetProgress('');
+      if (weiUI) { weiUI.syncBtn.disabled = false; weiUI.fullResyncBtn.disabled = false; }
+      updateGmailStatus();
       await refreshCount();
     }
+  }
 
+  // ---- Auto-sync ----
+  // Also moved to module scope -- this has to keep ticking for the page's
+  // lifetime regardless of whether the panel is currently mounted.
+
+  function stopAutoSync() {
+    if (autoSyncTimer) { clearInterval(autoSyncTimer); autoSyncTimer = null; }
+  }
+
+  async function runAutoSyncTick() {
+    if (autoSyncInProgress) return; // don't overlap with an in-flight sync
+    autoSyncInProgress = true;
+    try {
+      await runSync(false, { auto: true });
+    } finally {
+      autoSyncInProgress = false;
+    }
+  }
+
+  function startAutoSync(intervalMin) {
+    stopAutoSync();
+    autoSyncTimer = setInterval(runAutoSyncTick, intervalMin * 60 * 1000);
+  }
+
+  // Builds the panel's BODY content into an already-open WFMM.ui modal --
+  // called as openModal()'s buildContent(modalController). See wae.js's
+  // own buildPanelContent() for the fuller explanation of this pattern;
+  // same shape here.
+  function buildPanelContent(modal) {
+    const ui = modal.ui;
+    weiUiApi = ui;
+
+    const countEl = ui.createElement('div', { className: 'wei-sub', text: 'Loading...' });
+
+    // -- Connect Gmail --
+    const clientIdInput = ui.textInput({
+      className: 'wfmm-input wfmm-input-large',
+      placeholder: 'OAuth Client ID (ends in .apps.googleusercontent.com)',
+      value: localStorage.getItem(CLIENT_ID_KEY) || '',
+    });
+    clientIdInput.addEventListener('change', () => {
+      localStorage.setItem(CLIENT_ID_KEY, clientIdInput.value.trim());
+    });
+
+    const gmailStatusEl = ui.createElement('div', { className: 'wei-sub', text: 'Not connected.' });
+    const progressEl = ui.createElement('div', { className: 'wei-progress' });
+
+    const syncBtn = ui.button({
+      text: 'Sync new emails',
+      variant: 'primary',
+      onClick: () => runSync(false),
+    });
+    const fullResyncBtn = ui.button({
+      text: 'Force full re-sync',
+      onClick: () => {
+        if (confirm('Re-fetch your entire matching mailbox history from Gmail, not just what\u2019s new since last sync?')) {
+          runSync(true);
+        }
+      },
+    });
+    const syncBtnRow = ui.buttonRow([syncBtn, fullResyncBtn]);
+
+    const savedAutoSync = loadAutoSyncSettings();
+    const autoSyncInterval = ui.selectInput({
+      options: [
+        { value: '5', label: '5 min' },
+        { value: '15', label: '15 min' },
+        { value: '30', label: '30 min' },
+        { value: '60', label: '60 min' },
+      ],
+      value: String(savedAutoSync.intervalMin),
+      onChange: (value) => {
+        const intervalMin = Number(value);
+        saveAutoSyncSettings(autoSyncToggle.input.checked, intervalMin);
+        if (autoSyncToggle.input.checked) startAutoSync(intervalMin);
+      },
+    });
+    const autoSyncToggle = ui.checkboxRow({
+      label: 'Auto-sync every',
+      checked: savedAutoSync.enabled,
+      onChange: (checked) => {
+        const intervalMin = Number(autoSyncInterval.value);
+        saveAutoSyncSettings(checked, intervalMin);
+        if (checked) {
+          // This click IS a direct user gesture, so an interactive consent
+          // popup is allowed here if needed -- establishes the session that
+          // subsequent silent background ticks can then reuse.
+          runSync(false, { auto: false });
+          startAutoSync(intervalMin);
+          weiLog(`Auto-sync enabled -- syncing every ${intervalMin} minute(s)`, 'ok');
+        } else {
+          stopAutoSync();
+          weiLog('Auto-sync disabled', 'skip');
+        }
+      },
+    });
+    // checkboxRow()'s own label only covers "Auto-sync every" -- the
+    // interval select belongs in the same row, after it.
+    autoSyncToggle.row.appendChild(autoSyncInterval);
+
+    const gmailSection = ui.section({
+      title: 'Connect Gmail',
+      children: [clientIdInput, gmailStatusEl, progressEl, syncBtnRow, autoSyncToggle.row],
+    });
+
+    // -- Or drop .eml files --
+    const dropzone = ui.createElement('div', { id: 'wei-dropzone', text: 'Drop .eml files here, or click to choose' });
+    const fileInput = ui.createElement('input', {
+      attrs: { type: 'file', accept: '.eml', multiple: true },
+      style: { display: 'none' },
+    });
     dropzone.addEventListener('click', () => fileInput.click());
     dropzone.addEventListener('dragover', (e) => { e.preventDefault(); dropzone.classList.add('drag'); });
     dropzone.addEventListener('dragleave', () => dropzone.classList.remove('drag'));
@@ -637,171 +823,36 @@
       dropzone.classList.remove('drag');
       const files = Array.from(e.dataTransfer.files).filter((f) => f.name.toLowerCase().endsWith('.eml'));
       if (files.length) importFiles(files);
-      else log('No .eml files found in the drop', 'skip');
+      else weiLog('No .eml files found in the drop', 'skip');
     });
     fileInput.addEventListener('change', () => {
       const files = Array.from(fileInput.files);
       fileInput.value = '';
       if (files.length) importFiles(files);
     });
-
-    // ---- Gmail sync ----
-
-    async function runSync(forceFull, opts) {
-      const auto = !!(opts && opts.auto);
-      const clientId = clientIdInput.value.trim();
-      if (!clientId) {
-        if (!auto) log('Paste your OAuth Client ID first', 'err');
-        return;
-      }
-      localStorage.setItem(CLIENT_ID_KEY, clientId);
-
-      syncBtn.disabled = true;
-      fullResyncBtn.disabled = true;
-      progressEl.textContent = auto ? 'Auto-sync: connecting to Gmail\u2026' : 'Connecting to Gmail\u2026';
-
-      const lastSyncMs = forceFull ? null : Number(localStorage.getItem(LAST_SYNC_KEY)) || null;
-      const syncStartedAt = Date.now();
-
-      try {
-        let token;
-        try {
-          token = await getValidToken(clientId, { forceNonInteractive: auto });
-        } catch (e) {
-          if (auto) {
-            log('Auto-sync skipped this round: Gmail sign-in needed -- click "Sync new emails" once to reconnect', 'skip');
-            return;
-          }
-          throw e;
-        }
-        updateGmailStatus();
-
-        const query = buildGmailQuery(lastSyncMs);
-        progressEl.textContent = 'Listing matching messages\u2026';
-        const ids = await listAllMessageIds(query, token, (n) => {
-          progressEl.textContent = `Found ${n} matching message(s) so far\u2026`;
-        });
-
-        if (ids.length === 0) {
-          log(auto ? 'Auto-sync: no new messages found' : 'No new messages found', 'skip');
-          localStorage.setItem(LAST_SYNC_KEY, String(syncStartedAt));
-          updateGmailStatus();
-          return;
-        }
-
-        progressEl.textContent = `Fetching ${ids.length} message(s)\u2026`;
-        const raws = await fetchMessagesRaw(ids, token, (done, total) => {
-          progressEl.textContent = `Fetching messages\u2026 ${done}/${total}`;
-        });
-
-        const records = [];
-        let fetchErrors = 0, parseErrors = 0;
-        for (const r of raws) {
-          if (r.error) {
-            fetchErrors++;
-            if (r.error.authExpired) log('Gmail token expired mid-sync -- run Sync again to resume', 'err');
-            continue;
-          }
-          try {
-            const text = base64UrlToText(r.raw);
-            records.push(emlToRecord(text, `gmail:${r.id}`));
-          } catch (e) {
-            parseErrors++;
-          }
-        }
-
-        if (records.length) {
-          const { inserted, updated } = await WSTStorage.putEmails(records);
-          const abuseCount = countAbuseReports(records);
-          const abuseSuffix = abuseCount ? `, ${abuseCount} abuse report ticket${abuseCount === 1 ? '' : 's'}` : '';
-          log(`✓ ${auto ? 'Auto-sync: synced' : 'Synced'} ${records.length} message(s) from Gmail: ${inserted} new, ${updated} updated${abuseSuffix}`, 'ok');
-        }
-        if (fetchErrors) log(`${fetchErrors} message(s) failed to fetch (see above)`, 'err');
-        if (parseErrors) log(`${parseErrors} message(s) could not be parsed as MIME email`, 'err');
-
-        localStorage.setItem(LAST_SYNC_KEY, String(syncStartedAt));
-      } catch (e) {
-        log(`${auto ? 'Auto-sync failed: ' : 'Gmail sync failed: '}${e.message || e}`, 'err');
-      } finally {
-        progressEl.textContent = '';
-        syncBtn.disabled = false;
-        fullResyncBtn.disabled = false;
-        updateGmailStatus();
-        await refreshCount();
-      }
-    }
-
-    syncBtn.addEventListener('click', () => runSync(false));
-    fullResyncBtn.addEventListener('click', () => {
-      if (confirm('Re-fetch your entire matching mailbox history from Gmail, not just what\u2019s new since last sync?')) {
-        runSync(true);
-      }
+    const emlSection = ui.section({
+      title: 'Or drop .eml files',
+      children: [dropzone, fileInput],
     });
 
-    // ---- Auto-sync ----
-
-    const autoSyncToggle = panel.querySelector('#wei-autosync-toggle');
-    const autoSyncInterval = panel.querySelector('#wei-autosync-interval');
-
-    function stopAutoSync() {
-      if (autoSyncTimer) { clearInterval(autoSyncTimer); autoSyncTimer = null; }
-    }
-
-    async function runAutoSyncTick() {
-      if (autoSyncInProgress) return; // don't overlap with an in-flight sync
-      autoSyncInProgress = true;
-      try {
-        await runSync(false, { auto: true });
-      } finally {
-        autoSyncInProgress = false;
-      }
-    }
-
-    function startAutoSync(intervalMin) {
-      stopAutoSync();
-      autoSyncTimer = setInterval(runAutoSyncTick, intervalMin * 60 * 1000);
-    }
-
-    const savedAutoSync = loadAutoSyncSettings();
-    autoSyncToggle.checked = savedAutoSync.enabled;
-    autoSyncInterval.value = String(savedAutoSync.intervalMin);
-    if (savedAutoSync.enabled) startAutoSync(savedAutoSync.intervalMin);
-
-    autoSyncToggle.addEventListener('change', () => {
-      const intervalMin = Number(autoSyncInterval.value);
-      saveAutoSyncSettings(autoSyncToggle.checked, intervalMin);
-      if (autoSyncToggle.checked) {
-        // This click IS a direct user gesture, so an interactive consent
-        // popup is allowed here if needed -- establishes the session that
-        // subsequent silent background ticks can then reuse.
-        runSync(false, { auto: false });
-        startAutoSync(intervalMin);
-        log(`Auto-sync enabled -- syncing every ${intervalMin} minute(s)`, 'ok');
-      } else {
-        stopAutoSync();
-        log('Auto-sync disabled', 'skip');
-      }
+    // -- Backup / maintenance --
+    const exportBtn = ui.button({
+      text: 'Export backup JSON',
+      onClick: async () => {
+        const all = await WSTStorage.getAllEmails();
+        const blob = new Blob([JSON.stringify({ exported_at: new Date().toISOString(), emails: all })], { type: 'application/json' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = `wst-email-backup-${new Date().toISOString().slice(0, 10)}.json`;
+        a.click();
+        weiLog(`Exported ${all.length} email(s) to a backup file`, 'ok');
+      },
     });
-
-    autoSyncInterval.addEventListener('change', () => {
-      const intervalMin = Number(autoSyncInterval.value);
-      saveAutoSyncSettings(autoSyncToggle.checked, intervalMin);
-      if (autoSyncToggle.checked) startAutoSync(intervalMin);
+    const backupInput = ui.createElement('input', {
+      attrs: { type: 'file', accept: '.json,application/json' },
+      style: { display: 'none' },
     });
-
-    // ---- Backup / maintenance (unchanged from v2) ----
-
-    panel.querySelector('#wei-export').addEventListener('click', async () => {
-      const all = await WSTStorage.getAllEmails();
-      const blob = new Blob([JSON.stringify({ exported_at: new Date().toISOString(), emails: all })], { type: 'application/json' });
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = `wst-email-backup-${new Date().toISOString().slice(0, 10)}.json`;
-      a.click();
-      log(`Exported ${all.length} email(s) to a backup file`, 'ok');
-    });
-
-    panel.querySelector('#wei-import-backup').addEventListener('click', () => backupInput.click());
+    const importBackupBtn = ui.button({ text: 'Import backup JSON', onClick: () => backupInput.click() });
     backupInput.addEventListener('change', async () => {
       const file = backupInput.files[0];
       backupInput.value = '';
@@ -809,62 +860,73 @@
       try {
         const parsed = JSON.parse(await file.text());
         const emails = Array.isArray(parsed) ? parsed : parsed.emails;
-        if (!Array.isArray(emails)) { log('That file doesn\u2019t look like a valid backup', 'err'); return; }
+        if (!Array.isArray(emails)) { weiLog('That file doesn\u2019t look like a valid backup', 'err'); return; }
         const { inserted, updated } = await WSTStorage.putEmails(emails);
-        log(`✓ Restored backup: ${inserted} new, ${updated} updated`, 'ok');
+        weiLog(`✓ Restored backup: ${inserted} new, ${updated} updated`, 'ok');
         await refreshCount();
       } catch (e) {
-        log(`Could not read that backup file: ${e.message || e}`, 'err');
+        weiLog(`Could not read that backup file: ${e.message || e}`, 'err');
       }
     });
-
-    panel.querySelector('#wei-clear').addEventListener('click', async () => {
-      if (!confirm('Delete every stored email from this browser? This cannot be undone (export a backup first if unsure).')) return;
-      await WSTStorage.clearAll();
-      log('All stored emails cleared', 'skip');
-      await refreshCount();
+    const clearBtn = ui.button({
+      text: 'Clear all stored emails',
+      variant: 'danger',
+      onClick: async () => {
+        if (!confirm('Delete every stored email from this browser? This cannot be undone (export a backup first if unsure).')) return;
+        await WSTStorage.clearAll();
+        weiLog('All stored emails cleared', 'skip');
+        await refreshCount();
+      },
+    });
+    const backupBtnRow = ui.buttonRow([exportBtn, importBackupBtn, clearBtn]);
+    const logEl = ui.createElement('div', { className: 'wei-log' });
+    const backupSection = ui.section({
+      title: 'Backup / maintenance',
+      noBorder: true,
+      children: [backupBtnRow, backupInput, logEl],
     });
 
-    let pointerDownOnBackdrop = false;
-    panel.addEventListener('pointerdown', (ev) => {
-      pointerDownOnBackdrop = (ev.target === panel);
-    });
-    panel.addEventListener('pointerup', (ev) => {
-      if (pointerDownOnBackdrop && ev.target === panel) closePanel();
-      pointerDownOnBackdrop = false;
-    });
-    panel.addEventListener('pointercancel', () => { pointerDownOnBackdrop = false; });
+    modal.body.append(countEl, gmailSection, emlSection, backupSection);
 
-    panel.querySelector('#wei-close').addEventListener('click', closePanel);
+    weiUI = { countEl, gmailStatusEl, progressEl, syncBtn, fullResyncBtn, logEl };
+
+    // Flush anything logged while the panel was closed (a background
+    // auto-sync tick, most likely) -- see weiLog()'s comment above.
+    for (const entry of weiPendingLog) {
+      logEl.prepend(ui.createElement('div', { className: entry.cls || '', text: entry.msg }));
+    }
+    weiPendingLog = [];
 
     refreshCount();
     updateGmailStatus();
-  }
 
-  function weiEscHandler(ev) {
-    if (ev.key === 'Escape') closePanel();
+    return {
+      onClose() {
+        weiUI = null;
+        weiPanelController = null;
+      },
+    };
   }
 
   function openPanel() {
-    buildPanel();
-    const panel = document.getElementById('wei-panel');
-    panel.style.display = 'flex';
-    document.addEventListener('keydown', weiEscHandler);
-    refreshCount();
-    updateGmailStatus();
+    if (weiPanelController) return; // already open
+    weiPanelController = wfmmWindow.WFMM.ui.openModal({
+      id: 'wei-panel',
+      title: 'Wayfarer Abuse Email Importer',
+      className: 'wei-dialog',
+      showFooterButtons: false,
+      ownerPluginId: PLUGIN_ID,
+      buildContent: buildPanelContent,
+    });
   }
 
   function closePanel() {
-    const panel = document.getElementById('wei-panel');
-    if (panel) panel.style.display = 'none';
-    document.removeEventListener('keydown', weiEscHandler);
+    weiPanelController?.close();
   }
 
   function togglePanel() {
-    buildPanel();
-    const panel = document.getElementById('wei-panel');
-    if (panel.style.display === 'none') openPanel();
-    else closePanel();
+    if (weiPanelController) closePanel();
+    else openPanel();
   }
 
   // ---------------------------------------------------------------------
@@ -1029,16 +1091,25 @@
 
   function startPlugin() {
     registerWithMapModsBase();
-    buildPanel();
+    // Registering as an external plugin already implies WFMM.ui exists --
+    // see wae.js's own startPlugin() comment for why. injectStyle() is
+    // idempotent (replaces by id), safe to call on every startPlugin().
+    wfmmWindow.WFMM.ui.injectStyle('wei-extra-styles', STYLE);
     startSidePanelWatcher();
+    // Auto-sync used to only start the first time buildPanel() ever ran
+    // (which happened here too, since startPlugin() called it eagerly).
+    // Now that the panel's DOM is only built on open, this has moved out
+    // on its own -- auto-sync should begin as soon as the plugin starts,
+    // whether or not anyone ever opens the panel.
+    const savedAutoSync = loadAutoSyncSettings();
+    if (savedAutoSync.enabled) startAutoSync(savedAutoSync.intervalMin);
   }
 
   function stopPlugin() {
     stopSidePanelWatcher();
     document.getElementById('wei-settings-link')?.remove();
-    closePanel();
-    document.getElementById('wei-panel')?.remove();
-    if (autoSyncTimer) { clearInterval(autoSyncTimer); autoSyncTimer = null; }
+    closePanel(); // no-op if the panel isn't open; openModal's own close() tears its DOM down
+    stopAutoSync();
   }
 
   // ---------------------------------------------------------------------
@@ -1077,22 +1148,12 @@
     },
   };
 
-  // @grant GM_xmlhttpRequest sandboxes this script -- its own `window` is
-  // a SEPARATE object from the real page window, so window.WFMM (which
-  // the suite assigns on the real page window) is invisible from here.
-  // This is the confirmed cause of "script works standalone, but the
-  // suite's Plugin Manager shows nothing under External plugins":
-  // registration silently never happens, the 5s timeout below always
-  // elapses, and self-start quietly takes over every time.
-  //
-  // unsafeWindow reaches through the sandbox to the real page window --
-  // but per Tampermonkey's own docs, it is NOT automatically available
-  // just because some other @grant exists; it needs its own explicit
-  // @grant unsafeWindow entry too (only @grant none is special-cased to
-  // make `window` itself already unsafe, no separate grant needed) --
-  // see @grant unsafeWindow in this script's own header above.
-  const wfmmWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-
+  // wfmmWindow is declared once, near the top of this file (see that
+  // comment for why) -- reused here unchanged from earlier versions. This
+  // is the confirmed cause of "script works standalone, but the suite's
+  // Plugin Manager shows nothing under External plugins" if it's ever
+  // missing: registration silently never happens, the 5s timeout below
+  // always elapses, and self-start quietly takes over every time.
   function registerOrSelfStart(attemptsLeft) {
     const plugins = wfmmWindow.WFMM && wfmmWindow.WFMM.plugins;
     if (plugins && typeof plugins.registerExternal === 'function') {

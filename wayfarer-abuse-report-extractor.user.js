@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Abuse Report Extractor
 // @namespace    https://wayfarer.scopely.com/new
-// @version      1.21.2
+// @version      1.22.0
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map, and exports as CSV.
 // @author       you
 // @match        https://wayfarer.scopely.com/new/mapview*
@@ -14,6 +14,46 @@
 // ==/UserScript==
 
 /*
+ * v1.22.0 CHANGE FROM v1.21.2: the panel was previously a hand-rolled
+ * lookalike of a Map Mods modal -- its own "#wae-panel"/backdrop/dialog
+ * DOM built from an innerHTML string, styled by reverse-engineering
+ * (guessing at, then copying) the suite's own .wfmapmods-modal-* class
+ * names rather than calling anything the suite actually exposes. Now that
+ * the real suite source is available (Wayfarer_Map_Mods-4_1_20.txt),
+ * confirmed it exposes a full UI service at window.WFMM.ui --
+ * createElement/section/emptyState/table/pager/button/textInput/etc, and
+ * critically a real openModal({id, title, buildContent, ...}) that builds
+ * and manages the entire modal shell itself (backdrop, dialog, header,
+ * close button, Escape/backdrop-click handling, focus return -- all of
+ * it). Switched to that entirely -- buildPanel()'s manual backdrop/dialog
+ * construction is gone; openPanel() now just calls WFMM.ui.openModal()
+ * and builds the body content in buildContent() using WFMM.ui.createElement/
+ * section/button/buttonRow/textInput/table/pager/emptyState/notice, and
+ * closePanel()/togglePanel() work through the modalController it returns
+ * instead of toggling a hidden panel's display style. Since openModal tears
+ * the whole dialog down again on close (rather than just hiding it, the
+ * way the old backdrop did), the panel's live DOM refs (count/table/log/
+ * buttons) are now only valid while it's actually open -- tracked via a
+ * single waeUI object, set in buildContent() and cleared in the onClose
+ * hook, with refreshPanel()/waeRenderFilteredTable() now no-ops if it's
+ * null instead of assuming document.getElementById() will find anything.
+ *
+ * Only the panel-*building* code changed -- scanning/matching (opr-email-
+ * lib.js), the nearby-duplicate grid search, native-Marker map plotting,
+ * and CSV export are untouched, since none of that is UI-service surface.
+ * The nearby-ticket popover is still a manually-positioned floating
+ * element (WFMM.ui has no floating-popover primitive to hand off to), but
+ * its contents are now built with WFMM.ui.createElement instead of an
+ * innerHTML string. The Google Maps InfoWindow content (waeShowPulseInfoWindow)
+ * is deliberately left as a plain HTML string -- that's the Maps SDK's own
+ * setContent() API, not this suite's modal system, so there's nothing to
+ * hand off there.
+ *
+ * wfmmWindow (the unsafeWindow-vs-window resolution the Plugin Manager
+ * registration already depended on) moved up to the top of the file so
+ * the same reference can be reused for every WFMM.ui.* call in the panel,
+ * not just the registration bootstrap at the bottom.
+ *
  * Companion to wayfarer-abuse-email-importer.user.js. That script's job
  * stops at storing raw, unclassified emails; this one is the "different
  * plugin" mentioned while building it -- it does the actual work:
@@ -469,6 +509,16 @@
 (function () {
   'use strict';
 
+  // @grant none (see this script's header) means window already IS
+  // unsafeWindow -- no sandbox -- per Tampermonkey's own docs, so this is
+  // a no-op indirection here, not a functional necessity the way it is in
+  // the importer script (which runs sandboxed under @grant
+  // GM_xmlhttpRequest). Kept anyway and used everywhere WFMM.ui is
+  // touched, not just the Plugin Manager registration at the bottom of
+  // this file, so both scripts share the exact same access pattern
+  // regardless of which one you're reading.
+  const wfmmWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+
   const EXTRACT_DB_NAME = 'wf-abuse-report-extract-db';
   const EXTRACT_DB_VERSION = 2;
   const EXTRACT_STORE_NAME = 'extractedReports';
@@ -759,14 +809,27 @@
   function waeOpenNearbyPopover(anchorEl, nearby) {
     waeCloseNearbyPopover();
 
-    const items = waeSortedNearbyMatches(nearby).map((n) => {
-      const label = `${n.record.wayspotName || '(unnamed)'} \u2014 ${Math.round(n.distanceMeters)}m \u2014 ticket ${n.record.conversationId || n.record.sourceEmailId}`;
-      return `<button type="button" class="wae-nearby-item" data-id="${escapeHtml(n.record.id)}">${escapeHtml(label)}</button>`;
-    }).join('');
+    const titleEl = waeUiApi.createElement('div', {
+      className: 'wae-nearby-popover-title',
+      text: `Within ${WAE_NEARBY_THRESHOLD_METERS}m, other ticket(s) -- click to go there:`,
+    });
+    const itemEls = waeSortedNearbyMatches(nearby).map((n) => waeUiApi.createElement('button', {
+      className: 'wae-nearby-item',
+      text: `${n.record.wayspotName || '(unnamed)'} \u2014 ${Math.round(n.distanceMeters)}m \u2014 ticket ${n.record.conversationId || n.record.sourceEmailId}`,
+      attrs: { type: 'button' },
+      dataset: { id: n.record.id },
+    }));
 
-    const pop = document.createElement('div');
-    pop.id = 'wae-nearby-popover';
-    pop.innerHTML = `<div class="wae-nearby-popover-title">Within ${WAE_NEARBY_THRESHOLD_METERS}m, other ticket(s) -- click to go there:</div>${items}`;
+    // The popover itself is still a manually-positioned floating element,
+    // not something built or managed by WFMM.ui -- the suite's UI service
+    // has no equivalent of an anchored popover (only full dialogs via
+    // openModal()), so this stays outside it, same as before. Only its
+    // CONTENTS (title + items above) are now built with ui.createElement
+    // instead of an innerHTML string.
+    const pop = waeUiApi.createElement('div', {
+      id: 'wae-nearby-popover',
+      children: [titleEl, ...itemEls],
+    });
     document.body.appendChild(pop);
 
     const anchorRect = anchorEl.getBoundingClientRect();
@@ -816,6 +879,23 @@
   let waeSearchQuery = '';
   let waeCurrentPage = 1;
   const WAE_PAGE_SIZE = 200;
+
+  // WFMM.ui, set while the panel is open (buildPanelContent()) and used by
+  // every DOM-building helper below (log(), the nearby popover, the
+  // table). Not just wfmmWindow.WFMM.ui directly everywhere, so those
+  // helpers don't need to know or care whether they're being called from
+  // inside openModal's buildContent() callback (which is handed its own
+  // `ui` reference) or from further down the call stack (a scan/clear
+  // handler, a table row click) where only this module-level reference is
+  // in scope.
+  let waeUiApi = null;
+  // Live refs into the currently-open panel's DOM -- null whenever the
+  // panel is closed, since WFMM.ui.openModal() tears the dialog down on
+  // close instead of just hiding it (unlike the old hand-rolled backdrop,
+  // which stayed in the DOM with display:none). Every render/refresh
+  // function below checks this first and no-ops if the panel isn't open.
+  let waeUI = null;
+  let waePanelController = null;
 
   // Search matches across everything a person might actually search by --
   // not just the visible name/conversation columns, but the raw
@@ -1092,8 +1172,7 @@
     if (!Number.isFinite(record.latitude) || !Number.isFinite(record.longitude)) return;
     const attached = await waeAttachToMapIfNeeded();
     if (!attached) {
-      const logEl = document.getElementById('wae-log');
-      if (logEl) log(logEl, '✗ Could not find the Wayfarer map on this page -- try again from the mapview.', 'err');
+      if (waeUI) log(waeUI.logEl, '✗ Could not find the Wayfarer map on this page -- try again from the mapview.', 'err');
       return;
     }
     const map = WAE_PULSES.map;
@@ -1299,48 +1378,36 @@
   // collides with the importer script's "wei-" ids/classes.
   // ---------------------------------------------------------------------
 
+  // Only the bits WFMM.ui's own base styles (injected by
+  // ui.injectBaseStyles()/ui.openModal() itself) don't already cover --
+  // the modal shell, buttons, inputs, section headers, empty/loading
+  // states, and the table's core look all come from the suite's own
+  // wfmm-* classes now, applied via WFMM.ui.createElement/button/
+  // textInput/table/etc rather than reimplemented here. This is layered
+  // ON TOP of ui.table()'s own .wfmm-table styling for the report-
+  // specific semantics it doesn't know about (missing-value styling,
+  // status badges, nearby-duplicate highlighting, the floating nearby-
+  // ticket popover, which has no equivalent in the suite's UI service).
   const STYLE = `
-    #wae-panel .wae-dialog{
-      width:560px; max-width:calc(100vw - 24px);
-      padding:18px 22px; overflow-y:auto;
-    }
-    #wae-panel .wae-sub{ font-size:11px; color:#6b7280; margin-bottom:8px; }
-    .wae-btn-row{ display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin:6px 0; }
-    .wae-btn-row .wfmapmods-modal-btn{ margin:0; }
-    .wae-text-input{
-      width:100%; box-sizing:border-box; border:1px solid #d1d5db; border-radius:4px;
-      padding:5px 8px; font-size:12px; margin:6px 0; font-family:inherit;
-    }
-    .wae-btn-danger{ color:#dc2626; border-color:#dc2626; }
-    #wae-panel button:disabled{ opacity:0.5; cursor:default; }
-    #wae-progress{ font-size:11px; color:#2563eb; margin:4px 0; min-height:14px; }
-    #wae-log{ margin-top:8px; max-height:110px; overflow-y:auto; font-size:11px; line-height:1.5; }
-    #wae-log div.ok{ color:#16a34a; }
-    #wae-log div.warn{ color:#b45309; }
-    #wae-log div.err{ color:#dc2626; }
-    #wae-table-wrap{ margin-top:8px; max-height:260px; overflow:auto; border:1px solid #e5e7eb; border-radius:4px; }
-    #wae-pagination{ display:flex; align-items:center; justify-content:center; gap:10px; margin-top:8px; }
-    #wae-pagination .wfmapmods-modal-btn{ margin:0; padding:4px 10px; font-size:11px; }
-    #wae-pagination .wae-sub{ margin:0; white-space:nowrap; }
-    #wae-table{ width:100%; border-collapse:collapse; font-size:11px; }
-    #wae-table th{
-      position:sticky; top:0; background:#f9fafb; color:#374151; text-align:left;
-      padding:5px 6px; border-bottom:1px solid #e5e7eb; white-space:nowrap;
-    }
-    #wae-table td{
-      padding:5px 6px; border-bottom:1px solid #f3f4f6; white-space:nowrap;
-      max-width:160px; overflow:hidden; text-overflow:ellipsis; color:#111827;
-    }
-    #wae-table td.wae-missing{ color:#9ca3af; font-style:italic; }
-    #wae-table td.wae-comment{ text-align:center; cursor:help; max-width:24px; }
-    #wae-table td.wae-nearby-flag{ text-align:center; cursor:help; max-width:24px; }
+    #wae-panel .wfmapmods-modal-dialog{ width:600px; max-width:calc(100vw - 24px); }
+    .wae-sub{ font-size:11px; color:var(--wfmm-muted-text, #667085); margin-bottom:8px; }
+    .wae-progress{ font-size:11px; color:#2563eb; margin:4px 0; min-height:14px; }
+    .wae-log{ margin-top:8px; max-height:110px; overflow-y:auto; font-size:11px; line-height:1.5; }
+    .wae-log div.ok{ color:#16a34a; }
+    .wae-log div.warn{ color:#b45309; }
+    .wae-log div.err{ color:#dc2626; }
+    .wae-search-input{ margin:6px 0; }
+    .wae-pagination{ display:flex; align-items:center; justify-content:center; gap:10px; margin-top:8px; }
+    .wae-pagination .wae-sub{ margin:0; white-space:nowrap; }
+    td.wae-missing{ color:#9ca3af; font-style:italic; }
+    td.wae-comment, td.wae-nearby-flag{ text-align:center; cursor:help; max-width:24px; }
     .wae-status-badge{
       display:inline-block; border:1px solid; border-radius:9999px;
       padding:1px 8px; font-size:10.5px; font-weight:600; white-space:nowrap;
     }
-    #wae-table tr.wae-row-nearby td{ background:#fffbeb; }
-    #wae-table tr.wae-row-clickable{ cursor:pointer; }
-    #wae-table tr.wae-row-clickable:hover td{ background:#fff7ed; }
+    tr.wae-row-nearby td{ background:#fffbeb; }
+    tr.wae-row-clickable{ cursor:pointer; }
+    tr.wae-row-clickable:hover td{ background:#fff7ed; }
 
     #wae-nearby-popover{
       position:fixed; z-index:2100; background:#fff; border:1px solid #e5e7eb;
@@ -1359,9 +1426,7 @@
   `;
 
   function log(container, msg, cls) {
-    const line = document.createElement('div');
-    if (cls) line.className = cls;
-    line.textContent = msg;
+    const line = waeUiApi.createElement('div', { className: cls || '', text: msg });
     container.prepend(line);
     while (container.children.length > 50) container.removeChild(container.lastChild);
   }
@@ -1389,16 +1454,29 @@
     return info ? info.label : String(ticketStatus).replace('ABUSE_REPORT_', '');
   }
 
-  function waeStatusBadge(ticketStatus) {
+  function waeStatusBadgeEl(ticketStatus) {
     const info = WAE_STATUS_BADGES[ticketStatus] || { label: waeStatusLabel(ticketStatus), color: '#6b7280' };
-    return `<span class="wae-status-badge" style="color:${info.color};border-color:${info.color};">${escapeHtml(info.label)}</span>`;
+    return waeUiApi.createElement('span', {
+      className: 'wae-status-badge',
+      text: info.label,
+      style: { color: info.color, borderColor: info.color },
+    });
   }
 
-  function renderTable(sorted, hasQuery, nearbyMap) {
+  // Builds the table (or an empty-state) for the current page, using
+  // WFMM.ui.table()/pager()/emptyState() instead of an innerHTML string --
+  // see the v1.22.0 changelog note. table()'s own onRowClick fires for
+  // ANY click on a row, so the nearby-flag trigger has to be special-cased
+  // inside it (checked via event.target.closest()) rather than getting
+  // its own listener the way the old delegated click handler on
+  // #wae-table-container used to split these apart.
+  function buildTableSection(sorted, hasQuery, nearbyMap) {
     if (!sorted.length) {
-      return hasQuery
-        ? '<div class="wae-sub">No rows match that search.</div>'
-        : '<div class="wae-sub">No abuse reports extracted yet -- click "Scan Imported Emails".</div>';
+      return waeUiApi.emptyState(
+        hasQuery
+          ? 'No rows match that search.'
+          : 'No abuse reports extracted yet -- click "Scan Imported Emails".'
+      );
     }
 
     const totalPages = Math.max(1, Math.ceil(sorted.length / WAE_PAGE_SIZE));
@@ -1407,53 +1485,96 @@
     const startIdx = (waeCurrentPage - 1) * WAE_PAGE_SIZE;
     const pageRecords = sorted.slice(startIdx, startIdx + WAE_PAGE_SIZE);
 
-    const rows = pageRecords
-      .map((r) => {
-        const name = r.wayspotName
-          ? `<td title="${escapeHtml(r.wayspotName)}">${escapeHtml(r.wayspotName)}</td>`
-          : '<td class="wae-missing">(none found)</td>';
-        const hasCoords = r.latitude !== null && r.longitude !== null;
-        const lat = hasCoords ? r.latitude.toFixed(6) : '<span class="wae-missing">-</span>';
-        const lng = hasCoords ? r.longitude.toFixed(6) : '<span class="wae-missing">-</span>';
-        const comment = r.comment
-          ? `<td class="wae-comment" title="${escapeHtml(r.comment)}">\uD83D\uDCAC</td>`
-          : '<td></td>';
-        const nearby = nearbyMap && nearbyMap.get(r.id);
-        const nearbyCell = nearby && nearby.length
-          ? `<td class="wae-nearby-flag" data-nearby-id="${escapeHtml(r.id)}" title="Click to see nearby ticket(s)">\u26A0\uFE0F</td>`
-          : '<td></td>';
-        const classes = [];
-        if (hasCoords) classes.push('wae-row-clickable');
-        if (nearby && nearby.length) classes.push('wae-row-nearby');
-        const rowAttrs = (classes.length ? ` class="${classes.join(' ')}"` : '') +
-          (hasCoords ? ` data-id="${escapeHtml(r.id)}" title="Click to locate on the map"` : '');
-        return `<tr${rowAttrs}>
-          <td>${escapeHtml(r.conversationId || r.sourceEmailId)}</td>
-          ${name}
-          <td>${lat}</td>
-          <td>${lng}</td>
-          ${comment}
-          ${nearbyCell}
-          <td>${waeStatusBadge(r.ticketStatus)}</td>
-        </tr>`;
-      })
-      .join('');
+    const columns = [
+      { key: 'conversation', label: 'Conversation', render: (r) => r.conversationId || r.sourceEmailId },
+      {
+        key: 'name', label: 'Wayspot Name',
+        render: (r) => r.wayspotName
+          ? waeUiApi.createElement('span', { text: r.wayspotName, attrs: { title: r.wayspotName } })
+          : waeUiApi.createElement('span', { className: 'wae-missing', text: '(none found)' }),
+      },
+      {
+        key: 'lat', label: 'Lat',
+        render: (r) => r.latitude !== null
+          ? r.latitude.toFixed(6)
+          : waeUiApi.createElement('span', { className: 'wae-missing', text: '-' }),
+      },
+      {
+        key: 'lng', label: 'Lng',
+        render: (r) => r.longitude !== null
+          ? r.longitude.toFixed(6)
+          : waeUiApi.createElement('span', { className: 'wae-missing', text: '-' }),
+      },
+      {
+        key: 'comment', label: '', cellClassName: 'wae-comment',
+        render: (r) => r.comment ? waeUiApi.createElement('span', { text: '\uD83D\uDCAC', attrs: { title: r.comment } }) : '',
+      },
+      {
+        key: 'nearby', label: '', cellClassName: 'wae-nearby-flag',
+        render: (r) => {
+          const nearby = nearbyMap && nearbyMap.get(r.id);
+          if (!nearby || !nearby.length) return '';
+          return waeUiApi.createElement('span', {
+            className: 'wae-nearby-trigger',
+            text: '\u26A0\uFE0F',
+            attrs: { title: 'Click to see nearby ticket(s)' },
+            dataset: { nearbyId: r.id },
+          });
+        },
+      },
+      { key: 'status', label: 'Status', render: (r) => waeStatusBadgeEl(r.ticketStatus) },
+    ];
 
-    const pagination = totalPages > 1 ? `
-      <div id="wae-pagination">
-        <button type="button" class="wfmapmods-modal-btn" id="wae-page-prev"${waeCurrentPage <= 1 ? ' disabled' : ''}>\u00AB Prev</button>
-        <span class="wae-sub">Page ${waeCurrentPage} of ${totalPages} (rows ${startIdx + 1}\u2013${Math.min(startIdx + WAE_PAGE_SIZE, sorted.length)} of ${sorted.length})</span>
-        <button type="button" class="wfmapmods-modal-btn" id="wae-page-next"${waeCurrentPage >= totalPages ? ' disabled' : ''}>Next \u00BB</button>
-      </div>` : '';
+    const { wrap, tbody } = waeUiApi.table({
+      columns,
+      rows: pageRecords,
+      className: 'wae-table',
+      stickyHeader: true,
+      maxHeight: 260,
+      onRowClick: (record, rowIndex, event) => {
+        const flagTrigger = event.target.closest('.wae-nearby-trigger');
+        if (flagTrigger) {
+          event.stopPropagation();
+          const nearby = nearbyMap.get(flagTrigger.dataset.nearbyId);
+          if (nearby && nearby.length) waeOpenNearbyPopover(flagTrigger, nearby);
+          return;
+        }
+        if (record.latitude !== null && record.longitude !== null) {
+          waeGoToLocation(record);
+        }
+      },
+    });
 
-    return `
-      <div id="wae-table-wrap">
-        <table id="wae-table">
-          <thead><tr><th>Conversation</th><th>Wayspot Name</th><th>Lat</th><th>Lng</th><th></th><th></th><th>Status</th></tr></thead>
-          <tbody>${rows}</tbody>
-        </table>
-      </div>
-      ${pagination}`;
+    // table() has no per-row className/title option -- applied directly
+    // to the rendered <tr> elements afterward instead, matched back up to
+    // pageRecords by index (same order table() rendered them in).
+    pageRecords.forEach((record, i) => {
+      const tr = tbody.children[i];
+      if (!tr) return;
+      const hasCoords = record.latitude !== null && record.longitude !== null;
+      const nearby = nearbyMap && nearbyMap.get(record.id);
+      if (hasCoords) {
+        tr.classList.add('wae-row-clickable');
+        tr.title = 'Click to locate on the map';
+      }
+      if (nearby && nearby.length) tr.classList.add('wae-row-nearby');
+    });
+
+    const children = [wrap];
+    if (totalPages > 1) {
+      children.push(waeUiApi.pager({
+        page: waeCurrentPage,
+        pageCount: totalPages,
+        label: `Page ${waeCurrentPage} of ${totalPages} (rows ${startIdx + 1}\u2013${Math.min(startIdx + WAE_PAGE_SIZE, sorted.length)} of ${sorted.length})`,
+        onPage: (nextPage) => {
+          waeCurrentPage = nextPage;
+          waeRenderFilteredTable();
+        },
+        className: 'wae-pagination',
+      }));
+    }
+
+    return waeUiApi.createElement('div', { children });
   }
 
   function escapeHtml(s) {
@@ -1502,30 +1623,23 @@
   }
 
   function waeRenderFilteredTable() {
-    const countEl = document.getElementById('wae-count');
-    const tableEl = document.getElementById('wae-table-container');
+    if (!waeUI) return; // panel isn't open -- nothing to render into
     const q = waeSearchQuery.trim().toLowerCase();
     const sorted = waeGetFilteredSorted();
 
-    if (tableEl) tableEl.innerHTML = renderTable(sorted, !!q, waeNearbyMap);
+    waeUiApi.empty(waeUI.tableContainer);
+    waeUI.tableContainer.appendChild(buildTableSection(sorted, !!q, waeNearbyMap));
 
     const { withCoords, withName, ticketCount } = waeGetStats();
     const nearbyCount = waeNearbyMap.size;
-    if (countEl) {
-      let base = `${waeAllRecords.length} location(s) extracted from ${ticketCount} ticket(s) -- ${withCoords} with coordinates, ${withName} with a name guess.`;
-      if (nearbyCount) base += ` \u26A0\uFE0F ${nearbyCount} within ${WAE_NEARBY_THRESHOLD_METERS}m of a report from another ticket.`;
-      countEl.textContent = q ? `${sorted.length} match${sorted.length === 1 ? '' : 'es'} -- ${base}` : base;
-    }
+    let base = `${waeAllRecords.length} location(s) extracted from ${ticketCount} ticket(s) -- ${withCoords} with coordinates, ${withName} with a name guess.`;
+    if (nearbyCount) base += ` \u26A0\uFE0F ${nearbyCount} within ${WAE_NEARBY_THRESHOLD_METERS}m of a report from another ticket.`;
+    waeUI.countEl.textContent = q ? `${sorted.length} match${sorted.length === 1 ? '' : 'es'} -- ${base}` : base;
 
-    const exportBtn = document.getElementById('wae-export-btn');
-    if (exportBtn) exportBtn.disabled = waeAllRecords.length === 0;
-    const clearBtn = document.getElementById('wae-clear-btn');
-    if (clearBtn) clearBtn.disabled = waeAllRecords.length === 0;
-    const mapToggleBtn = document.getElementById('wae-map-toggle-btn');
-    if (mapToggleBtn) {
-      mapToggleBtn.disabled = withCoords === 0;
-      mapToggleBtn.textContent = isMapPulsesEnabled() ? 'Hide from Map' : 'Show on Map';
-    }
+    waeUI.exportBtn.disabled = waeAllRecords.length === 0;
+    waeUI.clearBtn.disabled = waeAllRecords.length === 0;
+    waeUI.mapToggleBtn.disabled = withCoords === 0;
+    waeUI.mapToggleBtn.textContent = isMapPulsesEnabled() ? 'Hide from Map' : 'Show on Map';
   }
 
   let waeNearbyMapFingerprint = null;
@@ -1543,12 +1657,12 @@
   }
 
   async function refreshPanel() {
-    const countEl = document.getElementById('wae-count');
+    if (!waeUI) return; // panel isn't open
     try {
       waeAllRecords = await getAllExtractedRecords();
       waeRecordsById = new Map(waeAllRecords.map((r) => [r.id, r]));
     } catch (e) {
-      if (countEl) countEl.textContent = 'Could not read extracted-report storage.';
+      waeUI.countEl.textContent = 'Could not read extracted-report storage.';
       return;
     }
     // This used to recompute unconditionally, which meant a full O(n^2)
@@ -1565,79 +1679,40 @@
     waeRenderFilteredTable();
   }
 
-  function buildPanel() {
-    if (document.getElementById('wae-panel')) return;
+  // Builds the panel's BODY content into an already-open WFMM.ui modal --
+  // called as openModal()'s buildContent(modalController). The modal
+  // itself (backdrop, dialog, header/title, close button, Escape/
+  // backdrop-click handling) is entirely WFMM.ui's own doing now; this
+  // only ever touches modal.body. Every button/input/section is built via
+  // the `ui` service handed in here, same one openModal() itself uses
+  // internally, so this panel matches the rest of the suite's look
+  // instead of a hand-copied approximation of it.
+  function buildPanelContent(modal) {
+    const ui = modal.ui;
+    waeUiApi = ui; // so helpers called outside buildContent's own scope (log(), the popover, table row clicks) can still reach it
 
-    const style = document.createElement('style');
-    style.textContent = STYLE;
-    document.head.appendChild(style);
+    const countEl = ui.createElement('div', { className: 'wae-sub', text: 'Loading...' });
 
-    const panel = document.createElement('div');
-    panel.id = 'wae-panel';
-    panel.className = 'wfmapmods-modal-backdrop';
-    panel.style.display = 'none';
-    panel.innerHTML = `
-      <div class="wfmapmods-modal-dialog wae-dialog">
-        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
-          <div class="wfmapmods-modal-title">Wayfarer Abuse Report Extractor</div>
-          <button type="button" id="wae-close-btn" class="wfmapmods-close-btn" title="Close" aria-label="Close">&times;</button>
-        </div>
-        <div class="wae-sub" id="wae-count">Loading...</div>
+    const scanBtn = ui.button({ text: 'Scan Imported Emails', variant: 'primary' });
+    const mapToggleBtn = ui.button({ text: 'Show on Map', disabled: true });
+    const exportBtn = ui.button({ text: 'Export CSV', disabled: true });
+    const clearBtn = ui.button({ text: 'Clear Extracted Data', variant: 'danger', disabled: true });
+    const buttonRowEl = ui.buttonRow([scanBtn, mapToggleBtn, exportBtn, clearBtn]);
 
-        <div class="wae-btn-row">
-          <button id="wae-scan-btn" class="wfmapmods-modal-btn wfmapmods-modal-btn-primary">Scan Imported Emails</button>
-          <button id="wae-map-toggle-btn" class="wfmapmods-modal-btn" disabled>Show on Map</button>
-          <button id="wae-export-btn" class="wfmapmods-modal-btn" disabled>Export CSV</button>
-          <button id="wae-clear-btn" class="wfmapmods-modal-btn wae-btn-danger" disabled>Clear Extracted Data</button>
-        </div>
-        <div id="wae-progress"></div>
+    const progressEl = ui.createElement('div', { className: 'wae-progress' });
 
-        <input type="text" id="wae-search-input" class="wae-text-input" placeholder="Search name, ticket, location/report text...">
-
-        <div id="wae-table-container"></div>
-        <div id="wae-log"></div>
-      </div>
-    `;
-    document.body.appendChild(panel);
-
-    let pointerDownOnBackdrop = false;
-    panel.addEventListener('pointerdown', (ev) => {
-      pointerDownOnBackdrop = (ev.target === panel);
-    });
-    panel.addEventListener('pointerup', (ev) => {
-      if (pointerDownOnBackdrop && ev.target === panel) closePanel();
-      pointerDownOnBackdrop = false;
-    });
-    panel.addEventListener('pointercancel', () => { pointerDownOnBackdrop = false; });
-
-    panel.querySelector('#wae-close-btn').addEventListener('click', closePanel);
-
-    const tableContainerEl = panel.querySelector('#wae-table-container');
-    tableContainerEl.addEventListener('click', (ev) => {
-      if (ev.target.closest('#wae-page-prev')) {
-        waeCurrentPage--;
-        waeRenderFilteredTable();
-        return;
-      }
-      if (ev.target.closest('#wae-page-next')) {
-        waeCurrentPage++;
-        waeRenderFilteredTable();
-        return;
-      }
-      const flagCell = ev.target.closest('.wae-nearby-flag[data-nearby-id]');
-      if (flagCell) {
-        ev.stopPropagation();
-        const nearby = waeNearbyMap.get(flagCell.dataset.nearbyId);
-        if (nearby && nearby.length) waeOpenNearbyPopover(flagCell, nearby);
-        return;
-      }
-      const tr = ev.target.closest('tr[data-id]');
-      if (!tr) return;
-      const record = waeRecordsById.get(tr.dataset.id);
-      if (record) waeGoToLocation(record);
+    const searchInput = ui.textInput({
+      className: 'wfmm-input wfmm-input-large wae-search-input',
+      placeholder: 'Search name, ticket, location/report text\u2026',
     });
 
-    const searchInput = panel.querySelector('#wae-search-input');
+    const tableContainer = ui.createElement('div', { className: 'wae-table-container' });
+    const logEl = ui.createElement('div', { className: 'wae-log' });
+
+    modal.body.append(countEl, buttonRowEl, progressEl, searchInput, tableContainer, logEl);
+
+    waeUI = { countEl, tableContainer, logEl, scanBtn, mapToggleBtn, exportBtn, clearBtn, searchInput };
+
     let waeSearchDebounceTimer = null;
     searchInput.addEventListener('input', () => {
       clearTimeout(waeSearchDebounceTimer);
@@ -1647,13 +1722,6 @@
         waeRenderFilteredTable();
       }, 200);
     });
-
-    const progressEl = panel.querySelector('#wae-progress');
-    const logEl = panel.querySelector('#wae-log');
-    const scanBtn = panel.querySelector('#wae-scan-btn');
-    const mapToggleBtn = panel.querySelector('#wae-map-toggle-btn');
-    const exportBtn = panel.querySelector('#wae-export-btn');
-    const clearBtn = panel.querySelector('#wae-clear-btn');
 
     mapToggleBtn.addEventListener('click', async () => {
       const turningOn = !isMapPulsesEnabled();
@@ -1748,32 +1816,43 @@
         waeResyncMapIfVisible();
       }
     });
-  }
 
-  function waeEscHandler(ev) {
-    if (ev.key === 'Escape') closePanel();
+    refreshPanel();
+
+    // Returned as this modal's contentHooks -- WFMM.ui.openModal() calls
+    // onClose() itself once the dialog is actually torn down, regardless
+    // of whether that happened via the × button, Escape, a backdrop
+    // click, or our own waeGoToLocation() calling modal.close()
+    // programmatically -- one place to null out the now-stale DOM refs
+    // instead of every close path having to remember to do it.
+    return {
+      onClose() {
+        waeUI = null;
+        waePanelController = null;
+        waeCloseNearbyPopover();
+      },
+    };
   }
 
   function openPanel() {
-    buildPanel();
-    const panel = document.getElementById('wae-panel');
-    panel.style.display = 'flex';
-    document.addEventListener('keydown', waeEscHandler);
-    refreshPanel();
+    if (waePanelController) return; // already open
+    waePanelController = wfmmWindow.WFMM.ui.openModal({
+      id: 'wae-panel',
+      title: 'Wayfarer Abuse Report Extractor',
+      className: 'wae-dialog',
+      showFooterButtons: false,
+      ownerPluginId: PLUGIN_ID,
+      buildContent: buildPanelContent,
+    });
   }
 
   function closePanel() {
-    const panel = document.getElementById('wae-panel');
-    if (panel) panel.style.display = 'none';
-    document.removeEventListener('keydown', waeEscHandler);
-    waeCloseNearbyPopover();
+    waePanelController?.close();
   }
 
   function togglePanel() {
-    buildPanel();
-    const panel = document.getElementById('wae-panel');
-    if (panel.style.display === 'none') openPanel();
-    else closePanel();
+    if (waePanelController) closePanel();
+    else openPanel();
   }
 
   // ---------------------------------------------------------------------
@@ -1845,7 +1924,14 @@
   }
 
   function startPlugin() {
-    buildPanel();
+    // Registering as an external plugin (the only path startPlugin() is
+    // reached from -- see registerOrSelfStart() below) already implies
+    // WFMM.plugins exists, which per the real v4.0.0+ source means
+    // WFMM.ui does too -- both are populated by the same suite bootstrap.
+    // injectStyle() is idempotent (replaces by id, see WFMM.ui's own
+    // dom.js), so this is safe to call every startPlugin() -- no separate
+    // "already injected" guard needed.
+    wfmmWindow.WFMM.ui.injectStyle('wae-extra-styles', STYLE);
     startSidePanelWatcher();
     waeResyncMapIfVisible();
   }
@@ -1854,8 +1940,7 @@
     stopSidePanelWatcher();
     document.getElementById('wae-settings-link')?.remove();
     waeCloseNearbyPopover();
-    closePanel();
-    document.getElementById('wae-panel')?.remove();
+    closePanel(); // no-op if the panel isn't open; openModal's own close() tears its DOM down
     waeStopStaleWatch();
     waeClearPulses();
   }
@@ -1885,20 +1970,8 @@
     },
   };
 
-  // @grant none (see this script's header) means window already IS
-  // unsafeWindow -- no sandbox, no separate grant needed -- per
-  // Tampermonkey's own docs. This wasn't always explicit here; omitting
-  // @grant entirely is usually inferred as "none" too, but that inference
-  // isn't identical across userscript managers/versions, so it's spelled
-  // out now rather than relied on implicitly. See the importer script's
-  // own copy of this comment for the case where it actually matters: with
-  // a real @grant (that script needs GM_xmlhttpRequest), the script IS
-  // sandboxed, window.WFMM isn't the same object as the page's real
-  // window.WFMM, and unsafeWindow needs its own explicit grant to reach
-  // it -- confirmed as the fix for "script works standalone, but the
-  // suite's Plugin Manager shows nothing under External plugins".
-  const wfmmWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-
+  // wfmmWindow is declared once, near the top of this file (see that
+  // comment for why) -- reused here unchanged from earlier versions.
   function registerOrSelfStart(attemptsLeft) {
     const plugins = wfmmWindow.WFMM && wfmmWindow.WFMM.plugins;
     if (plugins && typeof plugins.registerExternal === 'function') {
