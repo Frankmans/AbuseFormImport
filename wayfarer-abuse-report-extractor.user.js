@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Abuse Report Extractor
 // @namespace    https://wayfarer.scopely.com/new
-// @version      1.23.0
+// @version      1.24.0
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map, and exports as CSV.
 // @author       you
 // @match        https://wayfarer.scopely.com/new/mapview*
@@ -14,6 +14,32 @@
 // ==/UserScript==
 
 /*
+ * v1.24.0 CHANGE FROM v1.23.1: the "Conversation" and "Status" table
+ * columns are now sortable -- using table()'s own built-in sortable-
+ * header support (column.sortable/options.sortState/options.onSort,
+ * confirmed against the real source), the same clickable-header-with-
+ * \u25B2/\u25BC-marker look the suite's own tables use, rather than
+ * anything custom-built here. Status sorts by pipeline stage (Received ->
+ * Pending Review -> a settled state), not alphabetically -- see
+ * WAE_STATUS_SORT_RANK just below WAE_STATUS_BADGES. The original
+ * newest-scanned-first order is still what you get before either header's
+ * been clicked; there's no third header to click back to it, though your
+ * choice does persist across closing and reopening the panel (waeSortKey/
+ * waeSortDirection are module-level, not reset on close) -- only a full
+ * page reload clears it back to the default.
+ *
+ * v1.23.1 CHANGE FROM v1.23.0: adds a "Clickable markers" toggle to the
+ * same Marker Style section -- backed by google.maps.Marker's own
+ * setClickable(), not a WFMM.markerAppearance field (that registry is
+ * about appearance, not interactivity, so this one setting is saved/
+ * normalized alongside the appearance fields for convenience but isn't
+ * part of what gets handed to registerStyle()'s resolve() -- harmless
+ * either way, since normalizeResolvedStyle() only reads the six fields it
+ * knows about and ignores extras, but kept the resolve() payload to just
+ * those six for clarity). Turning it off drops the pointer cursor and
+ * lets clicks reach whatever's underneath a marker instead of opening its
+ * popup/zooming into its cluster.
+ *
  * v1.23.0 CHANGE FROM v1.22.1: adds a "Marker Style" section to this
  * panel, letting the color/size/opacity of the map markers this plugin
  * draws be changed, backed by a real WFMM.markerAppearance.registerStyle()
@@ -890,6 +916,12 @@
   let waeNearbyMap = new Map();
   let waeSearchQuery = '';
   let waeCurrentPage = 1;
+  // null waeSortKey = the original default (newest-scanned first).
+  // 'conversation'/'status' match the two sortable column keys in
+  // buildTableSection() below -- table()'s own onSort(key) callback hands
+  // back exactly one of those.
+  let waeSortKey = null;
+  let waeSortDirection = 'desc';
 
   // ---------------------------------------------------------------------
   // Marker appearance -- v1.23.0. Registered with WFMM.markerAppearance
@@ -926,6 +958,7 @@
     borderColor: '#ffffff',
     borderWidth: 2,
     borderOpacity: 1,
+    clickable: true,
   });
   // Set once at startPlugin() (WFMM.markerAppearance.registerStyle()'s
   // return value) and called at stopPlugin() -- registerStyle() throws
@@ -951,6 +984,14 @@
       borderColor: waeNormalizeHexColor(a.borderColor, WAE_APPEARANCE_DEFAULTS.borderColor),
       borderWidth: waeClampNumber(a.borderWidth, 0, 8, WAE_APPEARANCE_DEFAULTS.borderWidth),
       borderOpacity: waeClampNumber(a.borderOpacity, 0, 1, WAE_APPEARANCE_DEFAULTS.borderOpacity),
+      // Not a marker-appearance field WFMM.markerAppearance itself knows
+      // about (that registry is purely about how a marker looks, not
+      // whether it responds to clicks) -- kept alongside it here anyway
+      // since it's still a per-marker Google Maps option this same
+      // Marker Style section is the natural place to expose, and it's
+      // simplest to save/normalize/reset together with the rest rather
+      // than as a separate localStorage key.
+      clickable: typeof a.clickable === 'boolean' ? a.clickable : WAE_APPEARANCE_DEFAULTS.clickable,
     };
   }
   function waeLoadAppearance() {
@@ -1189,6 +1230,7 @@
     const wanted = waeAllRecords.filter((r) => Number.isFinite(r.latitude) && Number.isFinite(r.longitude));
     const clusters = waeComputeClusters(map, wanted);
     const wantedKeys = new Set(clusters.map(waeClusterKey));
+    const appearance = waeLoadAppearance();
 
     for (const [key, marker] of WAE_PULSES.markersById.entries()) {
       if (!wantedKeys.has(key)) {
@@ -1224,6 +1266,11 @@
       marker.setIcon(isCluster ? waeGetClusterIcon() : waeGetMarkerIcon());
       marker.setLabel(isCluster ? { text: String(cluster.records.length), color: '#ffffff', fontSize: '10px', fontWeight: '700' } : null);
       marker.setTitle(isCluster ? `${cluster.records.length} reports` : (cluster.records[0].wayspotName || '(unnamed report)'));
+      // setClickable(false) doesn't just suppress the click listener above
+      // -- it also drops the pointer cursor and lets the click reach
+      // whatever's underneath (the map itself, or a Wayspot marker at the
+      // same spot), which is the point of turning this off.
+      marker.setClickable(appearance.clickable);
       marker.setMap(map);
     }
   }
@@ -1570,6 +1617,17 @@
     return info ? info.label : String(ticketStatus).replace('ABUSE_REPORT_', '');
   }
 
+  // Status pipeline order (not alphabetical) -- Received -> Pending Review
+  // -> a settled state (Actioned/Denied/Updated) -- so sorting by status
+  // groups tickets by where they are in that pipeline instead of by
+  // label text. Anything not in WAE_STATUS_BADGES (a status value this
+  // plugin doesn't recognize) sorts last, after every known stage.
+  const WAE_STATUS_SORT_RANK = Object.keys(WAE_STATUS_BADGES).reduce((m, key, i) => { m[key] = i; return m; }, {});
+  function waeStatusSortRank(ticketStatus) {
+    return ticketStatus in WAE_STATUS_SORT_RANK ? WAE_STATUS_SORT_RANK[ticketStatus] : 999;
+  }
+
+
   function waeStatusBadgeEl(ticketStatus) {
     const info = WAE_STATUS_BADGES[ticketStatus] || { label: waeStatusLabel(ticketStatus), color: '#6b7280' };
     return waeUiApi.createElement('span', {
@@ -1602,7 +1660,7 @@
     const pageRecords = sorted.slice(startIdx, startIdx + WAE_PAGE_SIZE);
 
     const columns = [
-      { key: 'conversation', label: 'Conversation', render: (r) => r.conversationId || r.sourceEmailId },
+      { key: 'conversation', label: 'Conversation', sortable: true, render: (r) => r.conversationId || r.sourceEmailId },
       {
         key: 'name', label: 'Wayspot Name',
         render: (r) => r.wayspotName
@@ -1638,7 +1696,7 @@
           });
         },
       },
-      { key: 'status', label: 'Status', render: (r) => waeStatusBadgeEl(r.ticketStatus) },
+      { key: 'status', label: 'Status', sortable: true, render: (r) => waeStatusBadgeEl(r.ticketStatus) },
     ];
 
     const { wrap, tbody } = waeUiApi.table({
@@ -1647,6 +1705,19 @@
       className: 'wae-table',
       stickyHeader: true,
       maxHeight: 260,
+      sortState: { key: waeSortKey, direction: waeSortDirection },
+      onSort: (key) => {
+        // Clicking the already-active column's header flips direction;
+        // clicking a different sortable column switches to it, starting
+        // ascending. Back to page 1 too -- sorting reshuffles which
+        // records land on which page, so staying on e.g. page 3 after a
+        // re-sort would show an arbitrary slice rather than what's
+        // actually 3 pages in under the new order.
+        waeSortDirection = (waeSortKey === key && waeSortDirection === 'asc') ? 'desc' : 'asc';
+        waeSortKey = key;
+        waeCurrentPage = 1;
+        waeRenderFilteredTable();
+      },
       onRowClick: (record, rowIndex, event) => {
         const flagTrigger = event.target.closest('.wae-nearby-trigger');
         if (flagTrigger) {
@@ -1708,15 +1779,40 @@
   // changed, so it hits this cache instead of redoing the same filter and
   // sort pass across the whole dataset for the sake of showing 200
   // already-known rows.
+  // Only re-filters/re-sorts when the underlying data, search query, or
+  // sort column/direction actually changed since last time -- refreshPanel()
+  // always assigns a fresh array to waeAllRecords on a real data reload,
+  // so comparing by reference (not content) is enough to detect that
+  // cheaply. A pure page turn (Prev/Next) calls waeRenderFilteredTable()
+  // with none of those changed, so it hits this cache instead of redoing
+  // the same filter and sort pass across the whole dataset for the sake
+  // of showing 200 already-known rows.
   function waeGetFilteredSorted() {
     const q = waeSearchQuery.trim().toLowerCase();
-    if (waeFilteredSortedCacheFor && waeFilteredSortedCacheFor.recordsRef === waeAllRecords && waeFilteredSortedCacheFor.query === q) {
+    if (
+      waeFilteredSortedCacheFor
+      && waeFilteredSortedCacheFor.recordsRef === waeAllRecords
+      && waeFilteredSortedCacheFor.query === q
+      && waeFilteredSortedCacheFor.sortKey === waeSortKey
+      && waeFilteredSortedCacheFor.sortDirection === waeSortDirection
+    ) {
       return waeFilteredSortedCache;
     }
     const filtered = q ? waeAllRecords.filter((r) => waeMatchesQuery(r, q)) : waeAllRecords;
-    const sorted = filtered.slice().sort((a, b) => (b.scannedAt || 0) - (a.scannedAt || 0));
+    const dir = waeSortDirection === 'asc' ? 1 : -1;
+    let compare;
+    if (waeSortKey === 'conversation') {
+      compare = (a, b) => dir * String(a.conversationId || a.sourceEmailId).localeCompare(String(b.conversationId || b.sourceEmailId), undefined, { numeric: true, sensitivity: 'base' });
+    } else if (waeSortKey === 'status') {
+      compare = (a, b) => dir * (waeStatusSortRank(a.ticketStatus) - waeStatusSortRank(b.ticketStatus));
+    } else {
+      // Default/original behavior -- newest-scanned first, direction not
+      // user-adjustable since there's no header for it to click.
+      compare = (a, b) => (b.scannedAt || 0) - (a.scannedAt || 0);
+    }
+    const sorted = filtered.slice().sort(compare);
     waeFilteredSortedCache = sorted;
-    waeFilteredSortedCacheFor = { recordsRef: waeAllRecords, query: q };
+    waeFilteredSortedCacheFor = { recordsRef: waeAllRecords, query: q, sortKey: waeSortKey, sortDirection: waeSortDirection };
     return sorted;
   }
 
@@ -1884,7 +1980,13 @@
         styleBorderWidthRange.valueEl.textContent = `${d.borderWidth}px`;
         styleBorderOpacityRange.input.value = String(d.borderOpacity);
         styleBorderOpacityRange.valueEl.textContent = `${Math.round(d.borderOpacity * 100)}%`;
+        styleClickableToggle.input.checked = d.clickable;
       },
+    });
+    const styleClickableToggle = ui.checkboxRow({
+      label: 'Clickable markers',
+      checked: initialAppearance.clickable,
+      onChange: (checked) => updateAppearance({ clickable: checked }),
     });
     const styleSection = ui.section({
       title: 'Marker Style',
@@ -1896,6 +1998,7 @@
         ui.fieldRow({ label: 'Ring color', input: styleBorderColorInput, help: 'Cluster markers only.' }),
         ui.fieldRow({ label: 'Ring width', input: styleBorderWidthRange.row }),
         ui.fieldRow({ label: 'Ring opacity', input: styleBorderOpacityRange.row }),
+        styleClickableToggle.row,
         ui.buttonRow([resetStyleBtn]),
       ],
     });
@@ -2150,7 +2253,15 @@
       // not a flat object -- waeLoadAppearance() stays flat for our own
       // icon-building code's convenience, wrapped here to match what the
       // registry actually expects from a resolve() callback.
-      resolve: () => ({ markerType: 'generic', generic: waeLoadAppearance() }),
+      // Only the six fields normalizeResolvedStyle() (marker-appearance.js)
+      // actually reads from style.generic -- clickable isn't a WFMM
+      // marker-appearance concept, so it's left out here even though
+      // waeLoadAppearance() itself carries it (see the v1.23.1 changelog
+      // note up top).
+      resolve: () => {
+        const { markerSize, fillColor, fillOpacity, borderColor, borderWidth, borderOpacity } = waeLoadAppearance();
+        return { markerType: 'generic', generic: { markerSize, fillColor, fillOpacity, borderColor, borderWidth, borderOpacity } };
+      },
     });
     startSidePanelWatcher();
     waeResyncMapIfVisible();
