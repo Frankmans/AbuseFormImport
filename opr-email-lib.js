@@ -174,6 +174,25 @@
   const decodeBodyUsingCTE = (body, cte, charset) => {
     switch (cte) {
       case null:
+      // BUGFIX (not upstream -- confirmed against a real ticket-reply
+      // export that used this exact CTE, which is why it wasn't caught
+      // sooner): 7bit/8bit/binary are legal Content-Transfer-Encoding
+      // values per RFC 2045 \u00a76 -- they mean "no transfer encoding was
+      // applied", not "unencoded/absent" specifically, which is a
+      // distinct case from CTE being missing entirely (the `null` this
+      // switch already handled). Both cases need the exact same
+      // treatment though: the body is already usable text as read off
+      // the wire, nothing to decode. Falling through to `case null`'s
+      // `return body` for these was missing entirely before -- any
+      // abuse-report (or other) email using one of these instead of
+      // quoted-printable/base64 hit the `default` branch below and threw
+      // NotImplementedError, which classify()'s caller (isAbuseReportRecord()/
+      // scanImportedEmails() in the extractor script) treats as "not an
+      // abuse report" and silently drops -- so the whole ticket just
+      // never showed up in a scan, with nothing in the log to say why.
+      case "7bit":
+      case "8bit":
+      case "binary":
         return body;
       case "quoted-printable":
         return unfoldQuotedPrintable(body, charset);
@@ -346,7 +365,25 @@
   const HELPSHIFT_CONVERSATION_ID_RE = /^Conversation ID:\s*#?(\d+)/;
 
   const parseHelpshiftThread = (plaintext) => {
-    const lines = (plaintext || "").split("\n");
+    // BUGFIX (not upstream -- found via the same real ticket-reply export
+    // as the CTE fix above): splitting on "\n" alone, when the decoded
+    // body is still CRLF (which it always is here -- parseMIME normalizes
+    // the whole raw message to CRLF up front, and nothing decodes it away
+    // in between), leaves every line's trailing "\r" attached to the
+    // *start* of the next split, i.e. embedded at each line boundary
+    // inside `raw` once bodyLines.join("\n") reassembles them. Harmless
+    // for most of this file's regexes ([\s\S]*? swallows it fine), but
+    // HELPSHIFT_FORM_FIELD_RE's *last* field in a message has to end at
+    // "<br><br>" or the true end of string ($) -- and the real end of
+    // string here was "...</strong>\r", one character past where $ could
+    // match. That silently dropped the LAST field in any Helpshift form
+    // submission from `fields` -- which for Niantic's abuse-report form
+    // is "Provide details of the location(s)", i.e. the one field this
+    // whole plugin most needs. Normalizing to bare "\n" before splitting,
+    // rather than leaving it to whoever consumes `raw` later to notice
+    // and strip it themselves, fixes this at the source for every
+    // consumer at once.
+    const lines = (plaintext || "").replace(/\r\n?/g, "\n").split("\n");
     const ruleIdx = [];
     lines.forEach((l, i) => {
       if (HELPSHIFT_RULE_RE.test(l.trim())) ruleIdx.push(i);
@@ -476,6 +513,23 @@
   // coordinate (usually itself a wrapped correction split onto its own
   // line, e.g. "Name, lat,lng (is actually here:\n<lat,lng>)") doesn't
   // steal a comment meant for the location actually named above it.
+  //
+  // BUGFIX (not upstream -- found via the same real ticket export as the
+  // two fixes above, in a location list with an entry like "Kleurrijke
+  // Handsculptuur (51.65..., 5.02...) (https://www.pol.nl/...)" -- a
+  // coordinate AND a URL on the SAME line, both belonging to that one
+  // entry): the original version checked for a URL first and, if found,
+  // treated the ENTIRE line as a comment-for-the-previous-entry, never
+  // even checking whether that same line also carried its own coordinate
+  // -- silently dropping a real reported Wayspot and misattributing its
+  // URL to an unrelated earlier one instead. Checking for a coordinate
+  // FIRST (regardless of whether a URL is also present) fixes that: a
+  // line's own coordinate always wins it a real entry, and any URL
+  // trailing that SAME coordinate on the line becomes THIS entry's
+  // comment rather than falling through to the "attach to `current`"
+  // branch at all. The comment-on-a-later/prior line case this docblock
+  // originally described (an unnamed follow-up line that's pure URL, no
+  // coordinate of its own) still works exactly as before.
   const extractLocationLines = (text) => {
     const out = [];
     const lines = (text || "").split("\n");
@@ -483,18 +537,17 @@
     for (const rawLine of lines) {
       const line = rawLine.trim();
       if (!line) continue;
-      if (!/https?:\/\//i.test(line)) {
-        HELPSHIFT_COORD_RE.lastIndex = 0;
-        const m = HELPSHIFT_COORD_RE.exec(line);
-        if (m) {
-          const name = line.slice(0, m.index).replace(/[,\s(]+$/, "").trim() || null;
-          const entry = { name, latitude: m[1], longitude: m[2], comment: null };
-          out.push(entry);
-          if (name) current = entry;
-        }
+      HELPSHIFT_COORD_RE.lastIndex = 0;
+      const m = HELPSHIFT_COORD_RE.exec(line);
+      if (m) {
+        const name = line.slice(0, m.index).replace(/[,\s(]+$/, "").trim() || null;
+        const trailing = line.slice(m.index + m[0].length).replace(/^[\s),]+/, "").trim();
+        const entry = { name, latitude: m[1], longitude: m[2], comment: /https?:\/\//i.test(trailing) ? trailing : null };
+        out.push(entry);
+        if (name) current = entry;
         continue;
       }
-      if (current) {
+      if (/https?:\/\//i.test(line) && current) {
         current.comment = current.comment ? `${current.comment} ${line}` : line;
       }
     }
