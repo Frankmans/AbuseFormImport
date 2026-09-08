@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Wayfarer Abuse Email Importer
+// @name         Wayfarer Map Mods - Abuse Email Importer
 // @namespace    https://wayfarer.scopely.com/new
-// @version      4.7.1
+// @version      4.7.2
 // @description  Imports Niantic Support "Reporting Abuse in Wayfarer" tickets from Gmail via OAuth, or from .eml files -- using a port of bilde2910/OPR-Tools' email parser -- and stores them for the Abuse Report Extractor script (and other consumers) to search.
 // @author       you
 // @match        https://wayfarer.scopely.com/new/mapview*
@@ -17,6 +17,13 @@
 // ==/UserScript==
 
 /*
+ * v4.7.2 CHANGE FROM v4.7.1: renamed to "Wayfarer Map Mods - Abuse Email
+ * Importer" (@name, modal title, Plugin Manager listing, console log
+ * prefixes) -- see wae.js's own v1.24.1 changelog note for the fuller
+ * explanation of what did and didn't change and why (same reasoning
+ * applies here: @downloadURL/@updateURL/@require and internal identifiers
+ * are untouched, only user-visible display strings).
+ *
  * v4.7.0 CHANGE FROM v4.6.1: same underlying change as the Abuse Report
  * Extractor script's own v1.22.0 -- see that file's changelog note for the
  * fuller explanation. Short version: buildPanel()'s hand-rolled backdrop/
@@ -912,7 +919,7 @@
     if (weiPanelController) return; // already open
     weiPanelController = wfmmWindow.WFMM.ui.openModal({
       id: 'wei-panel',
-      title: 'Wayfarer Abuse Email Importer',
+      title: 'Wayfarer Map Mods - Abuse Email Importer',
       className: 'wei-dialog',
       showFooterButtons: false,
       ownerPluginId: PLUGIN_ID,
@@ -979,7 +986,7 @@
     }
     if (!poiBridgeWarned) {
       poiBridgeWarned = true;
-      console.warn('[Wayfarer Abuse Email Importer] publishPoiToMap() is a no-op: Map Mods - Base v4.0.0 removed the POI bridge this used to write to. Use the Abuse Report Extractor\'s own "Show on Map" instead.');
+      console.warn('[Wayfarer Map Mods - Abuse Email Importer] publishPoiToMap() is a no-op: Map Mods - Base v4.0.0 removed the POI bridge this used to write to. Use the Abuse Report Extractor\'s own "Show on Map" instead.');
     }
   }
 
@@ -1014,7 +1021,7 @@
 
   function registerWithMapModsBase() {
     if (isMapModsBaseActive()) {
-      console.info('[Wayfarer Abuse Email Importer] Map Mods - Base detected -- window.WayfarerAbuseEmailImporter is available.');
+      console.info('[Wayfarer Map Mods - Abuse Email Importer] Map Mods - Base detected -- window.WayfarerAbuseEmailImporter is available.');
     } else {
       // Not necessarily an error -- Base uses @run-at document-start and
       // we're document-idle, so this is usually just "hasn't run yet".
@@ -1023,8 +1030,8 @@
       setTimeout(() => {
         console.info(
           isMapModsBaseActive()
-            ? '[Wayfarer Abuse Email Importer] Map Mods - Base detected -- window.WayfarerAbuseEmailImporter is available.'
-            : '[Wayfarer Abuse Email Importer] Map Mods - Base not detected on this page. window.WayfarerAbuseEmailImporter is still available, but publishPoiToMap() will have nothing to show until Base loads.'
+            ? '[Wayfarer Map Mods - Abuse Email Importer] Map Mods - Base detected -- window.WayfarerAbuseEmailImporter is available.'
+            : '[Wayfarer Map Mods - Abuse Email Importer] Map Mods - Base not detected on this page. window.WayfarerAbuseEmailImporter is still available, but publishPoiToMap() will have nothing to show until Base loads.'
         );
       }, 2000);
     }
@@ -1142,7 +1149,7 @@
   const PLUGIN_ID = 'wayfarer-abuse-email-importer';
   const PLUGIN_DEFINITION = {
     id: PLUGIN_ID,
-    name: (typeof GM_info !== 'undefined' && GM_info.script?.name) || 'Wayfarer Abuse Email Importer',
+    name: (typeof GM_info !== 'undefined' && GM_info.script?.name) || 'Wayfarer Map Mods - Abuse Email Importer',
     description: 'Imports Niantic Support "Reporting Abuse in Wayfarer" tickets from Gmail or .eml files, for the Abuse Report Extractor to scan.',
     source: 'external',
     requirement: 'optional',
@@ -1168,7 +1175,7 @@
         plugins.registerExternal(PLUGIN_DEFINITION);
         return; // registered -- WFMM owns calling start()/stop() from here
       } catch (e) {
-        console.warn('[Wayfarer Abuse Email Importer] Plugin Manager registration failed, self-starting instead:', e);
+        console.warn('[Wayfarer Map Mods - Abuse Email Importer] Plugin Manager registration failed, self-starting instead:', e);
         startPlugin();
         return;
       }
@@ -1177,7 +1184,7 @@
       setTimeout(() => registerOrSelfStart(attemptsLeft - 1), 250);
       return;
     }
-    console.warn('[Wayfarer Abuse Email Importer] Map Mods plugin manager not detected after 5s -- self-starting instead.');
+    console.warn('[Wayfarer Map Mods - Abuse Email Importer] Map Mods plugin manager not detected after 5s -- self-starting instead.');
     startPlugin();
   }
 

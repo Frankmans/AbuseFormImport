@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Wayfarer Abuse Report Extractor
+// @name         Wayfarer Map Mods - Abuse Report Extractor
 // @namespace    https://wayfarer.scopely.com/new
-// @version      1.24.0
+// @version      1.25.0
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map, and exports as CSV.
 // @author       you
 // @match        https://wayfarer.scopely.com/new/mapview*
@@ -14,6 +14,31 @@
 // ==/UserScript==
 
 /*
+ * v1.25.0 CHANGE FROM v1.24.1: restores the table column-width/truncation
+ * constraint the old hand-rolled #wae-table had (max-width + ellipsis)
+ * that quietly didn't carry over when the table switched to
+ * WFMM.ui.table() -- see the STYLE block's own comment right above
+ * ".wae-table{ table-layout: fixed; }" for the mechanics. Long content in
+ * the Conversation/Wayspot Name columns (most commonly a URL that ended
+ * up in the name field -- see the companion fix in opr-email-lib.js's
+ * extractLocationLines() for that root cause) could otherwise blow a
+ * column out wide enough to push Status/the nearby-flag column out of
+ * view.
+ *
+ * v1.24.1 CHANGE FROM v1.24.0: renamed to "Wayfarer Map Mods - Abuse
+ * Report Extractor" (@name, modal title, Plugin Manager listing, console
+ * log prefixes) so it reads as clearly WFMM-affiliated wherever it shows
+ * up standalone (Tampermonkey's dashboard, Plugin Manager's own list,
+ * devtools console) -- not changed: @downloadURL/@updateURL/@require,
+ * which point at actual filenames in the GitHub repo this is hosted from
+ * and would break auto-update if renamed here without also renaming the
+ * files there; the short in-panel settings-link text ("Abuse Report
+ * Extractor"), left alone since it already sits inside a WFMM-branded
+ * settings list where the full prefix would just be redundant; and every
+ * internal identifier this doesn't actually display to a user -- PLUGIN_ID,
+ * localStorage/IndexedDB keys, element ids -- since changing any of those
+ * would orphan existing users' already-stored data.
+ *
  * v1.24.0 CHANGE FROM v1.23.1: the "Conversation" and "Status" table
  * columns are now sortable -- using table()'s own built-in sortable-
  * header support (column.sortable/options.sortState/options.onSort,
@@ -1560,6 +1585,30 @@
     .wae-log div.warn{ color:#b45309; }
     .wae-log div.err{ color:#dc2626; }
     .wae-search-input{ margin:6px 0; }
+    /* BUGFIX v1.25.0: WFMM.ui.table()'s own base CSS (.wfmm-table) has no
+       table-layout:fixed and no per-cell max-width/overflow -- columns
+       size purely to content, so one long unbroken string (e.g. a URL)
+       could blow a column out wide enough to push Status/the nearby-flag
+       column out of the visible/scrollable area entirely. The old hand-
+       rolled #wae-table had this constraint (max-width:160px + ellipsis
+       on every td) and it silently didn't carry over when the table
+       switched to WFMM.ui.table() -- fixed widths per column below (by
+       position, since table() has no per-column width option) plus
+       ellipsis truncation on the two variable-length text columns
+       (Conversation, Wayspot Name) restores it, this time scoped to just
+       those two rather than every td (lat/lng/status are short fixed-
+       format values that were never the problem). */
+    .wae-table{ table-layout: fixed; }
+    .wae-table th:nth-child(1), .wae-table td:nth-child(1){ width: 18%; }
+    .wae-table th:nth-child(2), .wae-table td:nth-child(2){ width: 34%; }
+    .wae-table th:nth-child(3), .wae-table td:nth-child(3){ width: 12%; }
+    .wae-table th:nth-child(4), .wae-table td:nth-child(4){ width: 12%; }
+    .wae-table th:nth-child(5), .wae-table td:nth-child(5){ width: 6%; }
+    .wae-table th:nth-child(6), .wae-table td:nth-child(6){ width: 6%; }
+    .wae-table th:nth-child(7), .wae-table td:nth-child(7){ width: 12%; }
+    .wae-table td:nth-child(1), .wae-table td:nth-child(2){
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
     .wae-pagination{ display:flex; align-items:center; justify-content:center; gap:10px; margin-top:8px; }
     .wae-pagination .wae-sub{ margin:0; white-space:nowrap; }
     td.wae-missing{ color:#9ca3af; font-style:italic; }
@@ -1660,7 +1709,13 @@
     const pageRecords = sorted.slice(startIdx, startIdx + WAE_PAGE_SIZE);
 
     const columns = [
-      { key: 'conversation', label: 'Conversation', sortable: true, render: (r) => r.conversationId || r.sourceEmailId },
+      {
+        key: 'conversation', label: 'Conversation', sortable: true,
+        render: (r) => {
+          const v = r.conversationId || r.sourceEmailId;
+          return waeUiApi.createElement('span', { text: v, attrs: { title: v } });
+        },
+      },
       {
         key: 'name', label: 'Wayspot Name',
         render: (r) => r.wayspotName
@@ -2132,7 +2187,7 @@
     if (waePanelController) return; // already open
     waePanelController = wfmmWindow.WFMM.ui.openModal({
       id: 'wae-panel',
-      title: 'Wayfarer Abuse Report Extractor',
+      title: 'Wayfarer Map Mods - Abuse Report Extractor',
       className: 'wae-dialog',
       showFooterButtons: false,
       ownerPluginId: PLUGIN_ID,
@@ -2290,7 +2345,7 @@
   const PLUGIN_ID = 'wayfarer-abuse-report-extractor';
   const PLUGIN_DEFINITION = {
     id: PLUGIN_ID,
-    name: (typeof GM_info !== 'undefined' && GM_info.script?.name) || 'Wayfarer Abuse Report Extractor',
+    name: (typeof GM_info !== 'undefined' && GM_info.script?.name) || 'Wayfarer Map Mods - Abuse Report Extractor',
     description: 'Scans imported abuse-report emails for reported Wayspot names/coordinates, flags nearby duplicates, and plots them on the map.',
     source: 'external',
     requirement: 'optional',
@@ -2312,7 +2367,7 @@
         plugins.registerExternal(PLUGIN_DEFINITION);
         return; // registered -- WFMM owns calling start()/stop() from here
       } catch (e) {
-        console.warn('[Wayfarer Abuse Report Extractor] Plugin Manager registration failed, self-starting instead:', e);
+        console.warn('[Wayfarer Map Mods - Abuse Report Extractor] Plugin Manager registration failed, self-starting instead:', e);
         startPlugin();
         return;
       }
@@ -2321,7 +2376,7 @@
       setTimeout(() => registerOrSelfStart(attemptsLeft - 1), 250);
       return;
     }
-    console.warn('[Wayfarer Abuse Report Extractor] Map Mods plugin manager not detected after 5s -- self-starting instead.');
+    console.warn('[Wayfarer Map Mods - Abuse Report Extractor] Map Mods plugin manager not detected after 5s -- self-starting instead.');
     startPlugin();
   }
 

@@ -540,7 +540,24 @@
       HELPSHIFT_COORD_RE.lastIndex = 0;
       const m = HELPSHIFT_COORD_RE.exec(line);
       if (m) {
-        const name = line.slice(0, m.index).replace(/[,\s(]+$/, "").trim() || null;
+        // BUGFIX (not upstream): the text before the coordinate
+        // match was used verbatim as `name`, with nothing filtering out a
+        // URL if one happened to sit there instead of an actual name --
+        // e.g. a "corrected location" line that's just a pasted map link
+        // followed by the real coordinates, with no name of its own
+        // ("https://maps.app.goo.gl/xyz 52.123, 4.456"). That produced a
+        // location entry whose "name" was a raw URL rather than the null
+        // that should mean "no name found" -- stripping any URL
+        // substring out of the pre-coordinate text before using what's
+        // left as the name fixes it (and still preserves a real name that
+        // happens to have a link elsewhere on the same line, unlike just
+        // discarding the whole name whenever a URL is present anywhere in
+        // it).
+        const namePart = line.slice(0, m.index)
+          .replace(/https?:\/\/\S+/gi, "")
+          .replace(/^[,\s()]+|[,\s(]+$/g, "")
+          .trim();
+        const name = namePart || null;
         const trailing = line.slice(m.index + m[0].length).replace(/^[\s),]+/, "").trim();
         const entry = { name, latitude: m[1], longitude: m[2], comment: /https?:\/\//i.test(trailing) ? trailing : null };
         out.push(entry);
