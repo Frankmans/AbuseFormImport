@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Report Extractor
 // @namespace    https://wayfarer.scopely.com/new
-// @version      1.25.0
+// @version      1.25.1
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map, and exports as CSV.
 // @author       you
 // @match        https://wayfarer.scopely.com/new/mapview*
@@ -14,6 +14,16 @@
 // ==/UserScript==
 
 /*
+ * v1.25.1 CHANGE FROM v1.25.0: the sort column/direction chosen via the
+ * Conversation/Status headers (see v1.24.0) is now saved to localStorage
+ * (WAE_SORT_STORAGE_KEY) and reloaded on next use -- previously
+ * waeSortKey/waeSortDirection were module-level only, so the choice
+ * survived closing and reopening the panel within the same page load, but
+ * reset back to newest-scanned-first on every fresh page load. Loaded
+ * once up front (waeInitialSortState) rather than on each panel open,
+ * same as every other setting in this file; saved right alongside the
+ * existing in-memory update in the header's onSort() handler.
+ *
  * v1.25.0 CHANGE FROM v1.24.1: restores the table column-width/truncation
  * constraint the old hand-rolled #wae-table had (max-width + ellipsis)
  * that quietly didn't carry over when the table switched to
@@ -48,10 +58,9 @@
  * Pending Review -> a settled state), not alphabetically -- see
  * WAE_STATUS_SORT_RANK just below WAE_STATUS_BADGES. The original
  * newest-scanned-first order is still what you get before either header's
- * been clicked; there's no third header to click back to it, though your
- * choice does persist across closing and reopening the panel (waeSortKey/
- * waeSortDirection are module-level, not reset on close) -- only a full
- * page reload clears it back to the default.
+ * been clicked; there's no third header to click back to it. Persisted
+ * across page reloads too as of v1.25.1, not just panel close/reopen --
+ * see that entry.
  *
  * v1.23.1 CHANGE FROM v1.23.0: adds a "Clickable markers" toggle to the
  * same Marker Style section -- backed by google.maps.Marker's own
@@ -944,9 +953,26 @@
   // null waeSortKey = the original default (newest-scanned first).
   // 'conversation'/'status' match the two sortable column keys in
   // buildTableSection() below -- table()'s own onSort(key) callback hands
-  // back exactly one of those.
-  let waeSortKey = null;
-  let waeSortDirection = 'desc';
+  // back exactly one of those. Persisted to localStorage (see
+  // waeLoadSortState()/waeSaveSortState() below) so the chosen sort
+  // survives a full page reload, not just closing/reopening the panel --
+  // module-level state alone already covered that part, same as before.
+  const WAE_SORT_STORAGE_KEY = 'wae_sort_state';
+  function waeLoadSortState() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(WAE_SORT_STORAGE_KEY) || 'null');
+      if (saved && (saved.key === 'conversation' || saved.key === 'status') && (saved.direction === 'asc' || saved.direction === 'desc')) {
+        return saved;
+      }
+    } catch (e) { /* fall through to default below */ }
+    return { key: null, direction: 'desc' };
+  }
+  function waeSaveSortState() {
+    localStorage.setItem(WAE_SORT_STORAGE_KEY, JSON.stringify({ key: waeSortKey, direction: waeSortDirection }));
+  }
+  const waeInitialSortState = waeLoadSortState();
+  let waeSortKey = waeInitialSortState.key;
+  let waeSortDirection = waeInitialSortState.direction;
 
   // ---------------------------------------------------------------------
   // Marker appearance -- v1.23.0. Registered with WFMM.markerAppearance
@@ -1428,7 +1454,7 @@
 
       let thread;
       try {
-        thread = OPREmail.helpshift.parseThread(email.getBody('text/plain') || '');
+        thread = OPREmail.helpshift.parseThread(email.getBody('text/plain') || '', email.getFirstHeaderValue('Date', null));
       } catch (e) { continue; }
 
       const key = thread.conversationId ? `conv:${thread.conversationId}` : `email:${record.id}`;
@@ -1770,6 +1796,7 @@
         // actually 3 pages in under the new order.
         waeSortDirection = (waeSortKey === key && waeSortDirection === 'asc') ? 'desc' : 'asc';
         waeSortKey = key;
+        waeSaveSortState();
         waeCurrentPage = 1;
         waeRenderFilteredTable();
       },

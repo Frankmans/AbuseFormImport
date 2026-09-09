@@ -364,7 +364,135 @@
   const HELPSHIFT_HEADER_RE = /^(.*?)\s*\|\s*(.+?)\s*\|\s*([\d:]{3,5}\s*[+-]\d{2}:?\d{2})$/;
   const HELPSHIFT_CONVERSATION_ID_RE = /^Conversation ID:\s*#?(\d+)/;
 
-  const parseHelpshiftThread = (plaintext) => {
+  // A second, structurally different transcript shape -- confirmed via a
+  // real reply the reporter sent from their own Gmail account (see the
+  // GMAIL_QUOTE_ATTRIBUTION_RE block below for the full story). Instead of
+  // a PAIR of rule lines bracketing one pipe-separated "Author | Date |
+  // Time" header line, each message here is separated by a SINGLE rule
+  // line, followed by an optional author line, then a date/time line ON
+  // ITS OWN ("August 27, 2026, 08:17 +0200" -- comma-separated, no pipes)
+  // -- e.g. "------------------------------\nNiantic Support\nAugust 27,
+  // 2026, 08:17 +0200\n<body>". Most likely explained by Gmail generating
+  // the quoted plaintext from the ORIGINAL email's rendered HTML rather
+  // than reusing Helpshift's own text/plain MIME part verbatim -- Gmail's
+  // own HTML-to-text conversion doesn't preserve the paired-rule/pipe-
+  // header convention, so replies sent this way carry a different
+  // "plaintext" shape for the exact same underlying thread than an export
+  // of the original notification would.
+  const HELPSHIFT_DATE_LINE_RE = /^([A-Za-z]+ \d{1,2}, \d{4}),\s*(\d{1,2}:\d{2}\s*[+-]\d{2}:?\d{2})$/;
+  // Not anchored to line-start ("^") like HELPSHIFT_CONVERSATION_ID_RE
+  // above -- this variant's footer line is "From Niantic Support.
+  // Conversation ID: #12345678", not a bare "Conversation ID: #12345678"
+  // starting the line.
+  const HELPSHIFT_CONVERSATION_ID_ANYWHERE_RE = /Conversation ID:\s*#?(\d+)/;
+
+  // Fallback for the single-rule/two-line-header shape described above --
+  // tried only when the primary paired-rule parse below finds zero
+  // messages, so the well-tested primary path is completely unaffected
+  // for every previously-working export.
+  const parseHelpshiftThreadSingleRuleVariant = (lines, ruleIdx) => {
+    const messages = [];
+    let conversationId = null;
+    for (let idx = 0; idx < ruleIdx.length; idx++) {
+      const start = ruleIdx[idx];
+      const blockEnd = idx + 1 < ruleIdx.length ? ruleIdx[idx + 1] : lines.length;
+      let cursor = start + 1;
+      while (cursor < blockEnd && lines[cursor].trim() === "") cursor++;
+      if (cursor >= blockEnd) continue;
+
+      const convMatch = HELPSHIFT_CONVERSATION_ID_ANYWHERE_RE.exec(lines[cursor]);
+      if (convMatch) {
+        conversationId = convMatch[1];
+        continue;
+      }
+
+      let author = "";
+      let dateMatch = HELPSHIFT_DATE_LINE_RE.exec(lines[cursor].trim());
+      if (!dateMatch && cursor + 1 < blockEnd) {
+        // This line wasn't a date line -- try treating it as an author
+        // name, with the date on the line right after it.
+        const nextDateMatch = HELPSHIFT_DATE_LINE_RE.exec((lines[cursor + 1] || "").trim());
+        if (nextDateMatch) {
+          author = lines[cursor].trim();
+          dateMatch = nextDateMatch;
+          cursor += 1;
+        }
+      }
+      if (!dateMatch) continue; // unrecognized block -- skip just this one, same as the primary parser above
+
+      const bodyLines = lines.slice(cursor + 1, blockEnd);
+      while (bodyLines.length && bodyLines[0].trim() === "") bodyLines.shift();
+      while (bodyLines.length && bodyLines[bodyLines.length - 1].trim() === "") bodyLines.pop();
+      messages.push({ author, date: dateMatch[1], time: dateMatch[2], raw: bodyLines.join("\n") });
+    }
+    return { conversationId, messages };
+  };
+
+  // Matches the "On <date>, <name> <<email>> wrote:" attribution line
+  // Gmail (and most other mail clients, with only minor wording
+  // variance) inserts above a quoted reply -- confirmed real example
+  // (support agent's own name and address genericized here):
+  // "On Fri, Aug 28, 2026, 11:02 Alex <support@nianticlabs.com> wrote:".
+  // Deliberately loose (".+ wrote:" rather than trying to fully parse the
+  // name/date/email out of it) since the exact wording/punctuation varies
+  // by client and locale and none of those pieces are actually needed --
+  // parseHelpshiftThread only needs to know WHERE the quote starts, not
+  // what this line says.
+  const GMAIL_QUOTE_ATTRIBUTION_RE = /^>?\s*On .{0,160}wrote:\s*$/m;
+
+  // BUGFIX (not upstream -- found via a real ticket reply the reporter
+  // sent from their own Gmail account, replying directly rather than
+  // through Helpshift's own web reply link): when someone replies using
+  // their mail client's normal reply feature instead of Helpshift's own
+  // "reply to this email" flow, the client wraps the ENTIRE quoted
+  // Helpshift thread in ITS OWN quoting convention -- every line
+  // (including Helpshift's own "---" rule separators) gets a leading
+  // "> ", which broke every regex below that anchors on line-start ("^"),
+  // most consequentially HELPSHIFT_RULE_RE never matching a single
+  // separator line, so `messages` came back completely empty and
+  // classify() threw DisambiguationFailedError -- a perfectly ordinary,
+  // valid abuse-report ticket that happened to receive one Gmail-native
+  // reply became entirely unclassifiable, not just missing that one
+  // reply's own content.
+  //
+  // Fixed by detecting the attribution line, splitting off whatever new
+  // text came before it (the reporter's own new reply, not part of
+  // Helpshift's own thread format at all) as its own synthetic message,
+  // then stripping the leading ">" quote markers from every remaining
+  // line and re-parsing THAT recursively -- once de-quoted, it's
+  // byte-identical in shape to a normal non-wrapped Helpshift export, so
+  // the exact same parsing logic below just works on it unmodified.
+  //
+  // fallbackDateHeader (the outer email's own raw "Date:" header, e.g.
+  // "Thu, 3 Sep 2026 14:27:28 +0200") times the synthetic new-reply
+  // message -- there's no Helpshift-style timestamp for it anywhere in
+  // the plaintext itself (only the ATTRIBUTION line has a date, and
+  // that's the date of the message being replied TO, not this new one).
+  // Passed through by every caller below; not required (classification
+  // of a single thread's own newest message only cares about array
+  // order, not a real parsed date -- see classifyAbuseReportStatus) but
+  // needed for mergeThreads() to correctly rank this reply against other
+  // separately-exported emails of the same ticket.
+  const parseHelpshiftThread = (plaintext, fallbackDateHeader = null) => {
+    const normalized = (plaintext || "").replace(/\r\n?/g, "\n");
+    const attributionMatch = GMAIL_QUOTE_ATTRIBUTION_RE.exec(normalized);
+    if (attributionMatch) {
+      const newReplyText = normalized.slice(0, attributionMatch.index).trim();
+      const quotedRemainder = normalized
+        .slice(attributionMatch.index + attributionMatch[0].length)
+        .replace(/^>+ ?/gm, "");
+      const inner = parseHelpshiftThread(quotedRemainder, fallbackDateHeader);
+      if (newReplyText) {
+        inner.messages.unshift({
+          author: "", // reporter's own message -- see classifyAbuseReportStatus's own author-blank convention
+          date: fallbackDateHeader || "",
+          time: "",
+          raw: newReplyText,
+        });
+      }
+      return inner;
+    }
+
     // BUGFIX (not upstream -- found via the same real ticket-reply export
     // as the CTE fix above): splitting on "\n" alone, when the decoded
     // body is still CRLF (which it always is here -- parseMIME normalizes
@@ -383,7 +511,7 @@
     // rather than leaving it to whoever consumes `raw` later to notice
     // and strip it themselves, fixes this at the source for every
     // consumer at once.
-    const lines = (plaintext || "").replace(/\r\n?/g, "\n").split("\n");
+    const lines = normalized.split("\n");
     const ruleIdx = [];
     lines.forEach((l, i) => {
       if (HELPSHIFT_RULE_RE.test(l.trim())) ruleIdx.push(i);
@@ -425,6 +553,16 @@
       }
     }
 
+    if (messages.length === 0 && ruleIdx.length > 0) {
+      // Primary (paired-rule/pipe-header) parse found rule lines but no
+      // actual messages between them -- try the single-rule variant
+      // before giving up. Only reached when the primary parse yields
+      // NOTHING, so this never overrides a thread that already parsed
+      // correctly the normal way.
+      const fallback = parseHelpshiftThreadSingleRuleVariant(lines, ruleIdx);
+      if (fallback.messages.length > 0) return fallback;
+    }
+
     return { conversationId, messages };
   };
 
@@ -443,6 +581,29 @@
   const HELPSHIFT_FORM_TITLE_RE = /^<strong>(.*?)<\/strong><br\s*\/?><br\s*\/?>/i;
   const HELPSHIFT_FORM_FIELD_RE = /([^<]+?)<br\s*\/?><strong>([\s\S]*?)<\/strong>(?:<br\s*\/?><br\s*\/?>|$)/gi;
 
+  // Markdown-ish fallback for the same form, tried only when the format
+  // above finds nothing -- confirmed via the same Gmail-native-reply
+  // export as the thread-parsing fixes above. Same form, same fields,
+  // but rendered as "*{form title}*\n\n{label}\n\n?*{value}*\n\n..." (a
+  // blank line between label and value is sometimes present, sometimes
+  // not -- both seen in the one confirmed sample) rather than literal
+  // <strong>/<br> tags -- consistent with the working theory that this
+  // whole shape comes from Gmail converting the original HTML rather than
+  // reusing Helpshift's own plaintext part, which doesn't preserve the
+  // HTML tags literally the way Helpshift's own plaintext MIME part does.
+  //
+  // *** UNCONFIRMED beyond that one sample *** -- only known real example
+  // is a report with 4 fields (issue/details/location(s)/abuser(s)) and
+  // none of the fields spanning a genuine multi-paragraph value, so
+  // soft-wrap-collapsing every internal single newline (not a real "\n\n"
+  // break) to a space is a reasonable guess at undoing Gmail's own
+  // word-wrap, not something actually verified
+  // against a field long enough to contain its own intentional paragraph
+  // break.
+  const HELPSHIFT_FORM_TITLE_MARKDOWN_RE = /^\*(.+?)\*\s*\n+/;
+  const HELPSHIFT_FORM_FIELD_MARKDOWN_RE = /^([^\n*][^\n]*)\n+\*([\s\S]*?)\*(?:\n+|$)/gm;
+  const collapseSoftWraps = (text) => (text || "").replace(/([^\n])\n(?!\n)/g, "$1 ");
+
   const extractHelpshiftFormFields = (rawMessage) => {
     const text = rawMessage || "";
     const titleMatch = HELPSHIFT_FORM_TITLE_RE.exec(text);
@@ -457,7 +618,21 @@
       const value = stripHelpshiftMarkup(m[2]).trim();
       if (label) fields[label] = value;
     }
-    return { title, fields };
+    if (title !== null || Object.keys(fields).length > 0) {
+      return { title, fields };
+    }
+
+    const titleMatchMd = HELPSHIFT_FORM_TITLE_MARKDOWN_RE.exec(text);
+    const titleMd = titleMatchMd ? titleMatchMd[1].trim() : null;
+    const restMd = titleMatchMd ? text.slice(titleMatchMd[0].length) : text;
+    const fieldsMd = {};
+    HELPSHIFT_FORM_FIELD_MARKDOWN_RE.lastIndex = 0;
+    while ((m = HELPSHIFT_FORM_FIELD_MARKDOWN_RE.exec(restMd)) !== null) {
+      const label = m[1].trim();
+      const value = collapseSoftWraps(m[2]).trim();
+      if (label) fieldsMd[label] = value;
+    }
+    return { title: titleMd, fields: fieldsMd };
   };
 
   // Finds bare "lat,lon" pairs (no surrounding parentheses, unlike the
@@ -514,11 +689,10 @@
   // line, e.g. "Name, lat,lng (is actually here:\n<lat,lng>)") doesn't
   // steal a comment meant for the location actually named above it.
   //
-  // BUGFIX (not upstream -- found via the same real ticket export as the
-  // two fixes above, in a location list with an entry like "Kleurrijke
-  // Handsculptuur (51.65..., 5.02...) (https://www.pol.nl/...)" -- a
-  // coordinate AND a URL on the SAME line, both belonging to that one
-  // entry): the original version checked for a URL first and, if found,
+  // BUGFIX (not upstream -- found via a real ticket export, in a location
+  // list with an entry like "Public Art Sculpture (51.65..., 5.02...)
+  // (https://example.com/news-article-about-it)" -- a coordinate AND a
+  // URL on the SAME line, both belonging to that one entry): the original version checked for a URL first and, if found,
   // treated the ENTIRE line as a comment-for-the-previous-entry, never
   // even checking whether that same line also carried its own coordinate
   // -- silently dropping a real reported Wayspot and misattributing its
@@ -530,6 +704,25 @@
   // branch at all. The comment-on-a-later/prior line case this docblock
   // originally described (an unnamed follow-up line that's pure URL, no
   // coordinate of its own) still works exactly as before.
+  // BUGFIX (not upstream -- found via a real reply sent through Gmail's
+  // own reply UI rather than Helpshift's, see the GMAIL_QUOTE_ATTRIBUTION_RE
+  // block earlier in this file): that same email's quoted original
+  // submission renders its location list as "NameA (latA,lngA)NameB
+  // (latB,lngB)" -- two full entries run together on one line with NO
+  // separator at all between the first ")" and the second name, not even
+  // a space. Most likely explained the same way as everything else about
+  // that email's format: Gmail generated this text from the original
+  // HTML, and a <br> that should have separated the two entries got
+  // silently dropped rather than turned into a newline. Previously this
+  // function only ever looked for ONE coordinate match per line (`exec()`
+  // called once, then `continue`s to the next line no matter what),
+  // so a second entry sharing a line with an already-matched one was
+  // invisible to it entirely -- a real reported Wayspot just silently
+  // never became a row. Looping with the coordinate regex's own
+  // lastIndex until a line is exhausted, and treating the text between
+  // consecutive matches (not just before the first one) as each entry's
+  // name, fixes this while leaving single-match lines (everything tested
+  // before this) working exactly as before.
   const extractLocationLines = (text) => {
     const out = [];
     const lines = (text || "").split("\n");
@@ -538,38 +731,58 @@
       const line = rawLine.trim();
       if (!line) continue;
       HELPSHIFT_COORD_RE.lastIndex = 0;
-      const m = HELPSHIFT_COORD_RE.exec(line);
-      if (m) {
-        // BUGFIX (not upstream): the text before the coordinate
-        // match was used verbatim as `name`, with nothing filtering out a
-        // URL if one happened to sit there instead of an actual name --
-        // e.g. a "corrected location" line that's just a pasted map link
+      let m = HELPSHIFT_COORD_RE.exec(line);
+      if (!m) {
+        if (/https?:\/\//i.test(line) && current) {
+          current.comment = current.comment ? `${current.comment} ${line}` : line;
+        }
+        continue;
+      }
+      let sliceStart = 0;
+      while (m) {
+        const nextM = HELPSHIFT_COORD_RE.exec(line);
+        const matchEnd = m.index + m[0].length;
+        // Trailing text for THIS entry stops at the next entry's own
+        // coordinate match (if there is one on the same line), not just
+        // at the end of the whole line -- otherwise entry A would swallow
+        // entry B's name as if it were A's trailing comment.
+        const segmentEnd = nextM ? nextM.index : line.length;
+        // BUGFIX (not upstream): the text before the coordinate match was
+        // used verbatim as `name`, with nothing filtering out a URL if
+        // one happened to sit there instead of an actual name -- e.g. a
+        // "corrected location" line that's just a pasted map link
         // followed by the real coordinates, with no name of its own
         // ("https://maps.app.goo.gl/xyz 52.123, 4.456"). That produced a
         // location entry whose "name" was a raw URL rather than the null
         // that should mean "no name found" -- stripping any URL
         // substring out of the pre-coordinate text before using what's
-        // left as the name fixes it (and still preserves a real name that
-        // happens to have a link elsewhere on the same line, unlike just
-        // discarding the whole name whenever a URL is present anywhere in
-        // it).
-        const namePart = line.slice(0, m.index)
+        // left as the name fixes it (and still preserves a real name
+        // that happens to have a link elsewhere on the same line, unlike
+        // just discarding the whole name whenever a URL is present
+        // anywhere in it).
+        const namePart = line.slice(sliceStart, m.index)
           .replace(/https?:\/\/\S+/gi, "")
           .replace(/^[,\s()]+|[,\s(]+$/g, "")
           .trim();
         const name = namePart || null;
-        const trailing = line.slice(m.index + m[0].length).replace(/^[\s),]+/, "").trim();
+        const trailing = line.slice(matchEnd, segmentEnd).replace(/^[\s),]+/, "").trim();
         const entry = { name, latitude: m[1], longitude: m[2], comment: /https?:\/\//i.test(trailing) ? trailing : null };
         out.push(entry);
         if (name) current = entry;
-        continue;
-      }
-      if (/https?:\/\//i.test(line) && current) {
-        current.comment = current.comment ? `${current.comment} ${line}` : line;
+        // NOT segmentEnd (= the START of the next match, if any) -- that
+        // would make the next iteration's own namePart a zero-length
+        // slice(segmentEnd, segmentEnd), always producing name: null for
+        // every entry after the first on a multi-match line (caught via
+        // the isolated test above; segmentEnd is only right for bounding
+        // THIS entry's own trailing/comment text, not for where the NEXT
+        // entry's name text starts).
+        sliceStart = matchEnd;
+        m = nextM;
       }
     }
     return out;
   };
+
 
   // High-level convenience: given a classified ABUSE_REPORT_* email, pull
   // out the transcript, the reporter's original form fields, and every
@@ -582,7 +795,7 @@
   // the same logic on the complete picture.
   const parseAbuseReportEmail = (email) => {
     const plaintext = email.getBody("text/plain") || "";
-    return parseAbuseReportThread(parseHelpshiftThread(plaintext));
+    return parseAbuseReportThread(parseHelpshiftThread(plaintext, email.getFirstHeaderValue("Date", null)));
   };
 
   const parseAbuseReportThread = ({ conversationId, messages }) => {
@@ -612,9 +825,10 @@
     //   1. the original form's structured locationDetails field, split
     //      per line -- handles reports that list several Wayspots at
     //      once, not just one.
-    //   2. every OTHER message in the thread (replies), scanned the same
-    //      line-by-line way, so Wayspots added in a later reply ("I see I
-    //      missed some: ...") are picked up too.
+    //   2. every OTHER message in the thread (replies), so a Wayspot the
+    //      reporter mentions later ("I see I missed some: ...", or a
+    //      follow-up reply flagging one more) is picked up too, not just
+    //      whatever was in the original submission.
     // Deliberately NOT scanning reportDetails/"Abuse report details" --
     // that field is free prose, and can contain a *corrected* coordinate
     // for the same Wayspot already listed in locationDetails rather than
@@ -631,10 +845,45 @@
       locations.push(loc);
     };
     extractLocationLines(locationDetails || "").forEach(addLocation);
+    // Confirmed via a real reply sent as ordinary prose (not a structured
+    // list like the original submission uses), coordinates and wording
+    // genericized here: "Thanks for taking action, but Example Park
+    // North Gate (40.316961,-74.625185) of the same type has now been
+    // added by the same user." -- word-wrapped across several lines by
+    // the mail client, same as the original submission's own soft-wrap
+    // issue (see collapseSoftWraps' own comment) but for a name+
+    // coordinate pair instead of a form field, so it needs the same
+    // treatment here before extractLocationLines gets a chance to see
+    // name and coordinate on the same line. Without it, the coordinate
+    // and the name text right before it can land on different physical
+    // lines purely because of where the mail client happened to wrap,
+    // and extractLocationLines (a per-line parser) would only ever see
+    // the coordinate's own line, with nothing before it on that line to
+    // use as a name.
+    //
+    // MAX_REPLY_LOCATION_NAME_LENGTH: unlike the original submission's
+    // structured location(s) field (short labels by construction) or a
+    // reply written as a clean "NewName (lat,lng)" list line, ordinary
+    // prose puts a whole clause or sentence before the coordinate --
+    // "Thanks for taking action, but Example Park North Gate" in the
+    // confirmed example above, once the line above reunites it with its
+    // coordinate. There's no reliable way to isolate just "Example Park
+    // North Gate" out of that without real NLP, so rather than show the
+    // whole run-on clause as if it were a clean Wayspot name, anything
+    // implausibly long for one gets treated as unnamed instead -- the
+    // coordinate itself is still real and worth keeping (same reasoning
+    // the "list" format already applies to a bare coordinate with
+    // nothing recognizable before it -- see that format's own comment
+    // above), it's specifically the NAME that's unreliable here, not the
+    // location. This is also why the name-required filter that used to
+    // gate this whole block is gone: an
+    // unnamed-but-real coordinate from a reply is exactly what this
+    // feature is for, not something to discard.
+    const MAX_REPLY_LOCATION_NAME_LENGTH = 60;
     messages.forEach((msg) => {
       if (msg === reportMsg) return;
-      extractLocationLines(stripHelpshiftMarkup(msg.raw))
-        .filter((loc) => loc.name)
+      extractLocationLines(collapseSoftWraps(stripHelpshiftMarkup(msg.raw)))
+        .map((loc) => (loc.name && loc.name.length > MAX_REPLY_LOCATION_NAME_LENGTH ? { ...loc, name: null } : loc))
         .forEach(addLocation);
     });
 
@@ -2370,7 +2619,7 @@ const TEMPLATES = [
       subject: /^(?:Re: )?\[\d+\]\s*Reporting Abuse in (?:Wayfarer|Niantic Wayspot)/i,
       disambiguate: (email) => {
         const plaintext = email.getBody("text/plain") || "";
-        const { messages } = parseHelpshiftThread(plaintext);
+        const { messages } = parseHelpshiftThread(plaintext, email.getFirstHeaderValue("Date", null));
         const type = classifyAbuseReportStatus(messages);
         if (type === null) return null;
         return { type, style: Style.SUPPORT, language: "en" };
