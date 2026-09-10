@@ -1,10 +1,9 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Report Extractor
-// @namespace    https://wayfarer.scopely.com/new
-// @version      1.26.0
+// @namespace    https://wayfarer.scopely.com/*
+// @version      1.26.1
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map, and exports as CSV.
 // @author       you
-// @match        https://wayfarer.scopely.com/new/mapview*
 // @grant        none
 // @require      https://raw.githubusercontent.com/Frankmans/AbuseFormImport/refs/heads/main/opr-email-lib.js
 // @require      https://raw.githubusercontent.com/Frankmans/AbuseFormImport/refs/heads/main/wst-storage.js
