@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Report Extractor
 // @namespace    https://wayfarer.scopely.com/new
-// @version      1.25.1
+// @version      1.26.0
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map, and exports as CSV.
 // @author       you
 // @match        https://wayfarer.scopely.com/new/mapview*
@@ -14,6 +14,23 @@
 // ==/UserScript==
 
 /*
+ * v1.26.0 CHANGE FROM v1.25.1: fixes "abuse crosses don't show on the
+ * submit map" -- switched the whole map-attachment layer over to
+ * WFMM.map, the suite's own shared map-lookup service, in place of this
+ * plugin's own from-scratch Angular __ngContext__ reflection (ported
+ * from a different, unrelated script, Report Wayspots v3.15.0 -- see the
+ * "Map attachment" section comment above, near where waeGetWfMap() used
+ * to live). WFMM.map has dedicated, actually-maintained adapters
+ * for both the mapview AND the submit-new-Wayspot map -- confirmed
+ * against the real source, and the exact thing Report History (part of
+ * this same suite) already relies on to work on both pages -- where this
+ * plugin's own hand-rolled selector had only really been exercised
+ * against mapview. Also replaces the old setInterval-based "stale map"
+ * polling (waeStartStaleWatch()/waeStopStaleWatch(), every 2s) with
+ * WFMM.map.onReady()/onCleared() plus WFMM.routes.onEnterMapRoute()/
+ * onChangeMapRoute() -- event-driven off the suite's own map/route
+ * lifecycle rather than polling for a DOM node going stale.
+ *
  * v1.25.1 CHANGE FROM v1.25.0: the sort column/direction chosen via the
  * Conversation/Status headers (see v1.24.0) is now saved to localStorage
  * (WAE_SORT_STORAGE_KEY) and reloaded on next use -- previously
@@ -699,60 +716,42 @@
   }
 
   // ---------------------------------------------------------------------
-  // Map attachment -- ported from Report Wayspots v3.15.0's own
-  // getWfMap()/extractMapFromCtxEntry(), confirmed against that real
-  // script. Base has no public API for "give me the live map instance"
-  // (its own getMap() is module-scoped, same as Report Wayspots' copy),
-  // so every companion script that needs the map reaches into Angular's
-  // __ngContext__ on the map component the same way. Kept here rather
-  // than shared, for the same reason nothing @requires Base anymore --
-  // see the v1.2.0 changelog note above.
+  // Map attachment -- v1.26.0 switched this over to WFMM.map, the
+  // suite's own shared map-lookup service (confirmed against the real
+  // source, src/core/map/service.js) -- the same one Report History and
+  // every other official WFMM plugin uses. Earlier versions here were
+  // wrong that "Base has no public API for this" -- that was true of an
+  // older Base version this was originally ported against (Report
+  // Wayspots v3.15.0's own hand-rolled Angular __ngContext__ reflection,
+  // copied here since nothing better was known to exist at the time), but
+  // the now-consolidated suite's WFMM.map has had one for a while: get(),
+  // isReady(), refresh({reason, force}) (a Promise<map|null>, cached and
+  // shared across every plugin that calls it -- cheap to call liberally),
+  // onReady(cb)/onCleared(cb) events, all backed by dedicated per-route
+  // adapters (COMPONENT_ADAPTERS["mapview"]/["submit-new"] in
+  // src/core/map/adapters/index.js) rather than one hand-rolled selector
+  // trying to cover both. Concretely fixes the "abuse crosses don't show
+  // on the submit map" report: this plugin's OWN reflection hack only
+  // ever really got exercised against the mapview page in practice, while
+  // WFMM.map's dedicated submit-new adapter is the exact thing Report
+  // History relies on to work correctly there -- using the same service
+  // instead of a parallel from-scratch reimplementation of "find the
+  // Wayfarer map" means this plugin now gets that same, actually-
+  // maintained submit-map support for free, and stays covered if
+  // Wayfarer's own markup changes again later (WFMM's own adapters would
+  // need updating either way, for every plugin that depends on them, not
+  // just this one).
+  //
+  // waeMapReadyUnsub/waeMapClearedUnsub/waeRouteEnterUnsub/
+  // waeRouteChangeUnsub (subscribed once in startPlugin(), unsubscribed
+  // in stopPlugin()) replace the old polling-based "stale watch"
+  // (waeStartStaleWatch()/waeStopStaleWatch(), setInterval every 2s)
+  // entirely -- WFMM.map.refresh() already checks staleness internally,
+  // and WFMM.routes.onEnterMapRoute()/onChangeMapRoute() firing exactly
+  // when the user actually navigates onto or between mapview/submit-new
+  // is a strictly better trigger than polling ever was, not just a
+  // like-for-like swap.
   // ---------------------------------------------------------------------
-
-  function waeLooksLikeGoogleMap(obj) {
-    return !!(obj &&
-              typeof obj.getCenter === 'function' &&
-              typeof obj.addListener === 'function' &&
-              typeof obj.getDiv === 'function');
-  }
-
-  function waeExtractMapFromCtxEntry(entry) {
-    if (!entry) return null;
-    if (waeLooksLikeGoogleMap(entry)) return entry; // mapview
-    const m = entry?.componentRef?.map;             // submit
-    return waeLooksLikeGoogleMap(m) ? m : null;
-  }
-
-  function waeGetWfMap() {
-    return new Promise((resolve) => {
-      let attempts = 80;
-      function tryFindMap() {
-        const candidates = document.querySelectorAll('app-submit-wayspot-map nia-map, app-wf-base-map');
-        for (const el of candidates) {
-          const ctx = el && el.__ngContext__;
-          if (!ctx) continue;
-          for (const entry of ctx) {
-            try {
-              const map = waeExtractMapFromCtxEntry(entry);
-              if (map) return resolve(map);
-            } catch (e) { /* ignore */ }
-          }
-        }
-        if (attempts-- <= 0) return resolve(null);
-        setTimeout(tryFindMap, 250);
-      }
-      tryFindMap();
-    });
-  }
-
-  function waeIsMapStale(map) {
-    try {
-      const div = map && map.getDiv && map.getDiv();
-      return !div || !div.isConnected;
-    } catch (e) {
-      return true;
-    }
-  }
 
   // ---------------------------------------------------------------------
   // Cross-ticket proximity flagging -- "was this same spot reported more
@@ -1270,7 +1269,11 @@
   // markers needlessly -- only a genuine zoom change or data change does.
   function waeRefreshPulses() {
     const map = WAE_PULSES.map;
-    if (!map || waeIsMapStale(map)) return;
+    // No local staleness check needed anymore -- WFMM.map.onCleared()
+    // (see waeStartMapTracking()) already nulls WAE_PULSES.map out the
+    // moment the suite's own map service considers it gone, so a non-null
+    // value here can be trusted without re-checking it ourselves.
+    if (!map) return;
     if (typeof google === 'undefined' || !google.maps?.Marker) return;
 
     if (!waeShouldShowPulses(map)) {
@@ -1326,11 +1329,14 @@
     }
   }
 
-  async function waeAttachToMapIfNeeded() {
-    if (WAE_PULSES.map && !waeIsMapStale(WAE_PULSES.map)) return true;
-    const map = await waeGetWfMap();
-    if (!map) return false;
-    if (WAE_PULSES.map !== map) waeClearPulses();
+  // Shared by waeAttachToMapIfNeeded() (on-demand) and the WFMM.map.onReady()
+  // subscription below (passive/event-driven) -- both need to react the
+  // same way to "the map WFMM.map handed us is a different object than
+  // what we had", so it's one place rather than two copies that could
+  // drift out of sync with each other.
+  function waeSetCurrentMap(map) {
+    if (WAE_PULSES.map === map) return;
+    waeClearPulses();
     WAE_PULSES.map = map;
     // Re-cluster on every zoom change -- clustering itself is zoom-
     // dependent (screen-pixel distance changes with zoom even though
@@ -1338,42 +1344,63 @@
     // anymore. Still no 'idle'/pan listener at all -- individual markers
     // within one cluster layout still reposition themselves on pan with
     // no app code involved, only a zoom step changes which records
-    // group together.
-    map.addListener?.('zoom_changed', () => waeRefreshPulses());
+    // group together. Only added here (i.e. only when the map reference
+    // actually changed) rather than on every waeAttachToMapIfNeeded()
+    // call -- WFMM.map.refresh() returns the same cached object on
+    // repeated calls as long as it's still valid, and re-adding this
+    // listener every time would stack up duplicates.
+    if (map) map.addListener?.('zoom_changed', () => waeRefreshPulses());
+  }
+
+  async function waeAttachToMapIfNeeded() {
+    const map = await wfmmWindow.WFMM.map.refresh({ reason: 'wae-attach' });
+    if (!map) return false;
+    waeSetCurrentMap(map);
     return true;
   }
 
-  // Wayfarer uses a different map component -- and a different underlying
-  // google.maps.Map object -- for its zoomed-in submit/edit view
-  // (app-submit-wayspot-map) than for the general mapview
-  // (app-wf-base-map); waeGetWfMap() above already has to check both.
-  // A Marker only ever renders on the one Map object it was created
-  // against, so switching between those views used to make every marker
-  // silently vanish until "Show on Map" was manually toggled off and on
-  // again, or a scan/clear happened to call waeResyncMapIfVisible(). This
-  // watches for exactly that swap (waeIsMapStale catching the old map's
-  // div getting detached) and re-attaches + rebuilds automatically.
-  // Cheap by design -- waeIsMapStale() is a trivial DOM check, and real
-  // work (re-fetching the map, rebuilding markers) only happens on the
-  // rare tick where something actually changed -- so this doesn't
-  // reintroduce the per-pan/zoom cost the v1.12.0/v1.13.0 fixes removed.
-  let waeStaleWatchTimer = null;
+  // WFMM.map.onReady()/onCleared() (subscribed once in startPlugin(), see
+  // that function) keep WAE_PULSES.map in sync automatically -- including
+  // across a mapview<->submit-new switch, since that's a different
+  // underlying google.maps.Map object each time and a Marker only ever
+  // renders on the one it was created against. But WFMM.map only actually
+  // SEARCHES when something calls .refresh() -- nothing in the suite's
+  // own core does that automatically on every navigation, it's genuinely
+  // each plugin's job to ask when it cares -- so onEnterMapRoute()/
+  // onChangeMapRoute() below are what actually trigger a fresh refresh()
+  // call at the moment it'd matter (landing on, or switching between,
+  // mapview/submit-new), which onReady above then reacts to.
+  let waeMapReadyUnsub = null;
+  let waeMapClearedUnsub = null;
+  let waeRouteEnterUnsub = null;
+  let waeRouteChangeUnsub = null;
 
-  function waeStartStaleWatch() {
-    if (waeStaleWatchTimer) return;
-    waeStaleWatchTimer = setInterval(async () => {
-      if (!isMapPulsesEnabled()) return;
-      if (WAE_PULSES.map && !waeIsMapStale(WAE_PULSES.map)) return;
-      const attached = await waeAttachToMapIfNeeded();
-      if (attached) waeRefreshPulses();
-    }, 2000);
+  function waeStartMapTracking() {
+    if (waeMapReadyUnsub) return; // already subscribed
+    const WFMM = wfmmWindow.WFMM;
+    waeMapReadyUnsub = WFMM.map.onReady(({ map }) => {
+      waeSetCurrentMap(map);
+      if (isMapPulsesEnabled()) waeRefreshPulses();
+    });
+    waeMapClearedUnsub = WFMM.map.onCleared(() => {
+      WAE_PULSES.map = null;
+    });
+    const onMapRouteEvent = () => {
+      if (isMapPulsesEnabled()) WFMM.map.refresh({ reason: 'wae-route-change' });
+    };
+    waeRouteEnterUnsub = WFMM.routes.onEnterMapRoute(onMapRouteEvent);
+    waeRouteChangeUnsub = WFMM.routes.onChangeMapRoute(onMapRouteEvent);
   }
 
-  function waeStopStaleWatch() {
-    if (waeStaleWatchTimer) {
-      clearInterval(waeStaleWatchTimer);
-      waeStaleWatchTimer = null;
-    }
+  function waeStopMapTracking() {
+    waeMapReadyUnsub?.();
+    waeMapClearedUnsub?.();
+    waeRouteEnterUnsub?.();
+    waeRouteChangeUnsub?.();
+    waeMapReadyUnsub = null;
+    waeMapClearedUnsub = null;
+    waeRouteEnterUnsub = null;
+    waeRouteChangeUnsub = null;
   }
 
   // Panel-row click -> jump the map to that location. The panel is a
@@ -1386,7 +1413,7 @@
     if (!Number.isFinite(record.latitude) || !Number.isFinite(record.longitude)) return;
     const attached = await waeAttachToMapIfNeeded();
     if (!attached) {
-      if (waeUI) log(waeUI.logEl, '✗ Could not find the Wayfarer map on this page -- try again from the mapview.', 'err');
+      if (waeUI) log(waeUI.logEl, '✗ Could not find the Wayfarer map on this page -- try again from the mapview or the submit-Wayspot map.', 'err');
       return;
     }
     const map = WAE_PULSES.map;
@@ -1405,15 +1432,15 @@
   // Re-syncs the map layer with whatever's currently in storage, but only
   // if the toggle is actually on -- called after scan/clear so the map
   // doesn't silently drift out of date while "Show on Map" is active, and
-  // at bootstrap so a persisted-on toggle re-attaches on page load. Also
-  // starts the stale-map watch so a later view switch recovers on its own.
+  // at bootstrap so a persisted-on toggle re-attaches on page load.
+  // Keeping in sync with view switches after this point is
+  // waeStartMapTracking()'s job (see its own comment), not this
+  // function's -- that's a one-time subscription set up in startPlugin(),
+  // not something re-armed on every resync.
   async function waeResyncMapIfVisible() {
     if (!isMapPulsesEnabled()) return;
     const attached = await waeAttachToMapIfNeeded();
-    if (attached) {
-      waeRefreshPulses();
-      waeStartStaleWatch();
-    }
+    if (attached) waeRefreshPulses();
   }
 
   // ---------------------------------------------------------------------
@@ -2107,17 +2134,21 @@
         const attached = await waeAttachToMapIfNeeded();
         mapToggleBtn.disabled = false;
         if (!attached) {
-          log(logEl, '✗ Could not find the Wayfarer map on this page -- try again from the mapview.', 'err');
+          log(logEl, '✗ Could not find the Wayfarer map on this page -- try again from the mapview or the submit-Wayspot map.', 'err');
           mapToggleBtn.textContent = 'Show on Map';
           return;
         }
         localStorage.setItem(WAE_MAP_VISIBLE_KEY, 'true');
         await waeRefreshPulses();
-        waeStartStaleWatch();
+        // No waeStartStaleWatch()-equivalent call needed here anymore --
+        // waeStartMapTracking() (see startPlugin()) subscribes once for
+        // the plugin's whole lifetime, not per-toggle; its own callbacks
+        // already check isMapPulsesEnabled() before doing any real work,
+        // so there's nothing extra to arm just because the toggle turned
+        // on.
         mapToggleBtn.textContent = 'Hide from Map';
       } else {
         localStorage.setItem(WAE_MAP_VISIBLE_KEY, 'false');
-        waeStopStaleWatch();
         waeClearPulses();
         mapToggleBtn.textContent = 'Show on Map';
       }
@@ -2346,6 +2377,13 @@
       },
     });
     startSidePanelWatcher();
+    // Subscribes to WFMM.map/WFMM.routes for this plugin's whole
+    // lifetime (see waeStartMapTracking()'s own comment for why this
+    // replaced the old setInterval-based stale watch) -- started here
+    // rather than tied to the "Show on Map" toggle, since the
+    // subscriptions themselves are cheap and their callbacks already
+    // check isMapPulsesEnabled() before doing any real work.
+    waeStartMapTracking();
     waeResyncMapIfVisible();
   }
 
@@ -2354,7 +2392,7 @@
     document.getElementById('wae-settings-link')?.remove();
     waeCloseNearbyPopover();
     closePanel(); // no-op if the panel isn't open; openModal's own close() tears its DOM down
-    waeStopStaleWatch();
+    waeStopMapTracking();
     waeClearPulses();
     waeUnregisterAppearance?.();
     waeUnregisterAppearance = null;
