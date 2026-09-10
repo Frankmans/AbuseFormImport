@@ -1,19 +1,20 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Email Importer
-// @namespace    https://wayfarer.scopely.com/new
-// @version      4.7.2
+// @namespace    https://github.com/Frankmans/AbuseFormImport
+// @version      4.7.3
 // @description  Imports Niantic Support "Reporting Abuse in Wayfarer" tickets from Gmail via OAuth, or from .eml files -- using a port of bilde2910/OPR-Tools' email parser -- and stores them for the Abuse Report Extractor script (and other consumers) to search.
-// @author       you
-// @match        https://wayfarer.scopely.com/new/mapview*
+// @author       Frankmans
+// @match        https://wayfarer.scopely.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
 // @connect      gmail.googleapis.com
 // @connect      accounts.google.com
 // @require      https://raw.githubusercontent.com/Frankmans/AbuseFormImport/refs/heads/main/opr-email-lib.js
 // @require      https://raw.githubusercontent.com/Frankmans/AbuseFormImport/refs/heads/main/wst-storage.js
-// @run-at       document-idle
+// @run-at       document-start
 // @updateURL    https://raw.githubusercontent.com/Frankmans/AbuseFormImport/refs/heads/main/wayfarer-abuse-email-importer.user.js
 // @downloadURL  https://raw.githubusercontent.com/Frankmans/AbuseFormImport/refs/heads/main/wayfarer-abuse-email-importer.user.js
+// @inject-into  page
 // ==/UserScript==
 
 /*
