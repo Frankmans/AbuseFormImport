@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Email Importer
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      4.7.4
+// @version      4.7.5
 // @description  Imports Niantic Support "Reporting Abuse in Wayfarer" tickets from Gmail via OAuth, or from .eml files -- using a port of bilde2910/OPR-Tools' email parser -- and stores them for the Abuse Report Extractor script (and other consumers) to search.
 // @author       Frankmans
 // @grant        GM_xmlhttpRequest
@@ -26,6 +26,25 @@
 // exception, not an oversight.
 
 /*
+ * v4.7.5 CHANGE FROM v4.7.4: SUPPORTED_SENDERS now also includes
+ * support@scopelyexplore.mail.helpshift.com -- confirmed via a real
+ * ticket where the only email actually available was a named agent's
+ * decision reply ("Jaxson", ACTIONED), sent from that address rather
+ * than support-explore@scopely.com (v4.7.4's addition, confirmed to be
+ * where only the automated acknowledgment comes from). Reported as "this
+ * doesn't get classified correctly" for a ticket whose opening email was
+ * never received/was deleted -- turned out unrelated to that framing:
+ * opr-email-lib.js already classifies and extracts this exact email
+ * correctly on its own (Helpshift quotes the full thread in every reply,
+ * so a missing original submission doesn't block anything as long as
+ * SOME later reply containing it gets fetched), confirmed by running the
+ * real scanImportedEmails() against it directly. The actual gap was
+ * upstream of that entirely -- Gmail sync just never fetched this sender
+ * in the first place, so extraction never got the chance to run on it at
+ * all. Likely the more consequential of the two Scopely-era addresses to
+ * have been missing: without it, sync could capture that a ticket
+ * existed but not what ultimately happened to it.
+ *
  * v4.7.4 CHANGE FROM v4.7.3: SUPPORTED_SENDERS now also includes
  * support-explore@scopely.com (confirmed real ticket reply from that
  * address, "Scopely Explore Support" as the display name) alongside
@@ -345,9 +364,28 @@
   // nothing confirms Niantic's own address has stopped sending, and
   // dropping it outright would risk missing tickets if it's still in use
   // for some accounts/regions.
+  //
+  // support@scopelyexplore.mail.helpshift.com added afterward, confirmed
+  // via a real ticket where the only email actually received was a named
+  // agent's decision reply ("Jaxson", ACTIONED) -- distinct from
+  // support-explore@scopely.com above, which per that same confirmed
+  // example is only where the automated "Thank you for contacting..."
+  // acknowledgment comes from. This is the address actual human agent
+  // replies -- the ones carrying a ticket's real Actioned/Denied/Pending
+  // outcome -- send from under the Scopely+Helpshift setup, i.e. almost
+  // certainly the more consequential of the two to have missing: without
+  // it, Gmail sync could reliably capture that a ticket was opened but
+  // never *what happened to it*, regardless of whether the reporter's
+  // own copy of the opening email survives (see wae.js's own README/
+  // changelog note on why a missing original submission doesn't block
+  // classification or extraction on its own -- Helpshift quotes the full
+  // thread in every reply, so the earlier messages are still recoverable
+  // from a later one's own quoted history, AS LONG AS that later one is
+  // actually being fetched in the first place).
   const SUPPORTED_SENDERS = [
     'support@nianticlabs.com',
     'support-explore@scopely.com',
+    'support@scopelyexplore.mail.helpshift.com',
   ];
   const CLIENT_ID_KEY = 'wei_gmail_client_id';
   const LAST_SYNC_KEY = 'wei_gmail_last_sync_ms';
