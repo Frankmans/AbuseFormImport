@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Report Extractor
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.27.0
+// @version      1.28.0
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -15,6 +15,20 @@
 // ==/UserScript==
 
 /*
+ * v1.28.0 CHANGE FROM v1.27.0: adds a "Last Response" column -- the
+ * ticket's most recent message across every source email that fed into
+ * it (merged.messages[0], since mergeThreads() already re-sorts newest-
+ * first by actual parsed timestamp -- see that function's own comment),
+ * not just whichever single email happened to be scanned. Sortable, same
+ * as Conversation/Status; missing/unparseable timestamps sort last
+ * regardless of direction rather than being treated as oldest. Also in
+ * the CSV export, as an ISO 8601 string (unambiguous regardless of which
+ * spreadsheet app/locale opens the file) rather than the locale-
+ * formatted date the table itself shows. Computed at scan time and
+ * stored per-ticket (lastResponseAt) -- rows extracted before this
+ * version won't have it until re-scanned, and show "-" until then, same
+ * as any other field a row is missing.
+ *
  * v1.27.0 CHANGE FROM v1.26.3: adds a "Close this panel when a row jumps
  * the map to its location" checkbox -- previously this was the one
  * hardcoded behavior, closing the panel was never optional. Off, a row
@@ -1022,17 +1036,18 @@
   let waeSearchQuery = '';
   let waeCurrentPage = 1;
   // null waeSortKey = the original default (newest-scanned first).
-  // 'conversation'/'status' match the two sortable column keys in
-  // buildTableSection() below -- table()'s own onSort(key) callback hands
-  // back exactly one of those. Persisted to localStorage (see
+  // 'conversation'/'status'/'lastResponse' match the sortable column keys
+  // in buildTableSection() below -- table()'s own onSort(key) callback
+  // hands back exactly one of those. Persisted to localStorage (see
   // waeLoadSortState()/waeSaveSortState() below) so the chosen sort
   // survives a full page reload, not just closing/reopening the panel --
   // module-level state alone already covered that part, same as before.
   const WAE_SORT_STORAGE_KEY = 'wae_sort_state';
+  const WAE_SORTABLE_KEYS = ['conversation', 'status', 'lastResponse'];
   function waeLoadSortState() {
     try {
       const saved = JSON.parse(localStorage.getItem(WAE_SORT_STORAGE_KEY) || 'null');
-      if (saved && (saved.key === 'conversation' || saved.key === 'status') && (saved.direction === 'asc' || saved.direction === 'desc')) {
+      if (saved && WAE_SORTABLE_KEYS.includes(saved.key) && (saved.direction === 'asc' || saved.direction === 'desc')) {
         return saved;
       }
     } catch (e) { /* fall through to default below */ }
@@ -1659,6 +1674,21 @@
 
       const ticketStatus = OPREmail.helpshift.classifyAbuseReportStatus(merged.messages) || 'ABUSE_REPORT_UPDATED';
 
+      // Per-ticket, not per-location -- same value on every row for this
+      // ticket, same reasoning as ticketStatus just above. merged.messages
+      // is already newest-first (mergeThreads' own re-sort, by actual
+      // parsed timestamp -- see its comment), so [0] is reliably the
+      // actual most recent message across every source email that fed
+      // into this ticket, not just whichever export happened to be
+      // scanned. An unparseable/missing timestamp (no messages at all,
+      // or a date/time pair Date.parse() can't make sense of) leaves this
+      // null rather than showing a wrong date -- the table/CSV both
+      // already have an established "blank rather than guess" convention
+      // for exactly this (see e.g. wayspotName).
+      const newestMessage = merged.messages[0];
+      const lastResponseAtMs = newestMessage ? Date.parse(`${newestMessage.date} ${newestMessage.time}`) : NaN;
+      const lastResponseAt = Number.isNaN(lastResponseAtMs) ? null : lastResponseAtMs;
+
       // Multiple source emails can contribute to one merged ticket now --
       // list all of them (oldest first, matching the merged message
       // order's intent) rather than picking just one, so every email that
@@ -1694,6 +1724,7 @@
           ticketKey: idBase,
           conversationId: parsed.conversationId || null,
           ticketStatus,
+          lastResponseAt,
           wayspotName: loc ? loc.name : null,
           latitude: loc ? Number(loc.latitude) : null,
           longitude: loc ? Number(loc.longitude) : null,
@@ -1715,6 +1746,7 @@
   const CSV_COLUMNS = [
     ['conversationId', 'Conversation ID'],
     ['ticketStatus', 'Ticket Status'],
+    ['lastResponseAt', 'Last Response (UTC)'],
     ['wayspotName', 'Wayspot Name (best guess)'],
     ['latitude', 'Latitude'],
     ['longitude', 'Longitude'],
@@ -1804,13 +1836,14 @@
        those two rather than every td (lat/lng/status are short fixed-
        format values that were never the problem). */
     .wae-table{ table-layout: fixed; }
-    .wae-table th:nth-child(1), .wae-table td:nth-child(1){ width: 18%; }
-    .wae-table th:nth-child(2), .wae-table td:nth-child(2){ width: 34%; }
-    .wae-table th:nth-child(3), .wae-table td:nth-child(3){ width: 12%; }
-    .wae-table th:nth-child(4), .wae-table td:nth-child(4){ width: 12%; }
+    .wae-table th:nth-child(1), .wae-table td:nth-child(1){ width: 16%; }
+    .wae-table th:nth-child(2), .wae-table td:nth-child(2){ width: 28%; }
+    .wae-table th:nth-child(3), .wae-table td:nth-child(3){ width: 10%; }
+    .wae-table th:nth-child(4), .wae-table td:nth-child(4){ width: 10%; }
     .wae-table th:nth-child(5), .wae-table td:nth-child(5){ width: 6%; }
     .wae-table th:nth-child(6), .wae-table td:nth-child(6){ width: 6%; }
-    .wae-table th:nth-child(7), .wae-table td:nth-child(7){ width: 12%; }
+    .wae-table th:nth-child(7), .wae-table td:nth-child(7){ width: 10%; }
+    .wae-table th:nth-child(8), .wae-table td:nth-child(8){ width: 14%; }
     .wae-table td:nth-child(1), .wae-table td:nth-child(2){
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     }
@@ -1891,6 +1924,20 @@
     });
   }
 
+  // "Last Response" column -- the ticket's lastResponseAt (see
+  // scanImportedEmails()'s own comment on where that comes from), shown
+  // as a locale-formatted date/time. toLocaleDateString() alone for the
+  // cell text (day-level precision is enough to scan a column of these
+  // at a glance) with the full toLocaleString() -- date AND time -- in
+  // the title attribute for whoever wants the exact time on hover, same
+  // "short in the cell, full detail on hover" pattern the Wayspot Name
+  // column already uses.
+  function waeFormatLastResponse(ms) {
+    if (!Number.isFinite(ms)) return null;
+    const d = new Date(ms);
+    return { short: d.toLocaleDateString(), full: d.toLocaleString() };
+  }
+
   // Builds the table (or an empty-state) for the current page, using
   // WFMM.ui.table()/pager()/emptyState() instead of an innerHTML string --
   // see the v1.22.0 changelog note. table()'s own onRowClick fires for
@@ -1957,6 +2004,15 @@
         },
       },
       { key: 'status', label: 'Status', sortable: true, render: (r) => waeStatusBadgeEl(r.ticketStatus) },
+      {
+        key: 'lastResponse', label: 'Last Response', sortable: true,
+        render: (r) => {
+          const f = waeFormatLastResponse(r.lastResponseAt);
+          return f
+            ? waeUiApi.createElement('span', { text: f.short, attrs: { title: f.full } })
+            : waeUiApi.createElement('span', { className: 'wae-missing', text: '-' });
+        },
+      },
     ];
 
     const { wrap, tbody } = waeUiApi.table({
@@ -2066,6 +2122,23 @@
       compare = (a, b) => dir * String(a.conversationId || a.sourceEmailId).localeCompare(String(b.conversationId || b.sourceEmailId), undefined, { numeric: true, sensitivity: 'base' });
     } else if (waeSortKey === 'status') {
       compare = (a, b) => dir * (waeStatusSortRank(a.ticketStatus) - waeStatusSortRank(b.ticketStatus));
+    } else if (waeSortKey === 'lastResponse') {
+      // Missing/unparseable timestamps sort last regardless of direction
+      // -- "no known last-response date" isn't meaningfully "oldest" or
+      // "newest", it's just unknown, so it shouldn't jump to the top on
+      // a descending sort the way treating it as 0/-Infinity would.
+      // Number.isFinite() rather than checking specifically for null --
+      // a record extracted before this column existed has no
+      // lastResponseAt property at all (undefined), not null, and both
+      // need the same "unknown" treatment here.
+      compare = (a, b) => {
+        const af = Number.isFinite(a.lastResponseAt);
+        const bf = Number.isFinite(b.lastResponseAt);
+        if (!af && !bf) return 0;
+        if (!af) return 1;
+        if (!bf) return -1;
+        return dir * (a.lastResponseAt - b.lastResponseAt);
+      };
     } else {
       // Default/original behavior -- newest-scanned first, direction not
       // user-adjustable since there's no header for it to click.
@@ -2359,6 +2432,11 @@
           ...r,
           nearbyTickets: waeFormatNearbyForCsv(nearby.get(r.id)),
           ticketStatus: waeStatusLabel(r.ticketStatus),
+          // ISO 8601 rather than a locale-formatted string (what the
+          // table itself shows) -- unambiguous regardless of which
+          // spreadsheet app/locale opens the file, and sorts correctly
+          // as plain text too, which a "Sep 10, 2026" string wouldn't.
+          lastResponseAt: Number.isFinite(r.lastResponseAt) ? new Date(r.lastResponseAt).toISOString() : '',
         }));
         downloadCsv(withNearby);
         log(logEl, `✓ Exported ${extracted.length} row(s) to CSV.`, 'ok');
