@@ -1,2679 +1,1238 @@
-// ===========================================================================
-// opr-email-lib.js
-//
-// A vanilla-JS port of bilde2910/OPR-Tools' src/email module
-// (https://github.com/bilde2910/OPR-Tools/tree/main/src/email), for use in
-// standalone Tampermonkey userscripts that have no build step / bundler.
-//
-// Ported pieces, each mirroring the upstream file of the same purpose:
-//   - errors.ts    -> error classes
-//   - types.ts     -> EmailType / EmailStyle enums, Header/StoredEmail shape
-//   - parsing.ts   -> parseMIME, extractEmail, decodeBodyUsingCTE (RFC 2047,
-//                      quoted-printable, base64)
-//   - templates.ts -> the full subject-line classification template table,
-//                      byte-for-byte (only TypeScript type annotations were
-//                      stripped -- every regex and disambiguate() function
-//                      body is unmodified)
-//   - index.ts     -> the Email class (headers/body access, multipart
-//                      alternative extraction, classify()) and
-//                      EmailAPI.stripDiacritics()
-//
-// Deliberately NOT ported: EmailAPI's IndexedDB storage/import-listener
-// machinery (index.ts's EmailAPI class) -- that's specific to the full
-// OPR-Tools web app's DB layer. The importer userscript in this repo has
-// its own lightweight IndexedDB store instead, using the same StoredEmail
-// shape so the two are still compatible.
-//
-// Exposed as a single global: window.OPREmail
-// ===========================================================================
-(function (global) {
-  "use strict";
+// ==UserScript==
+// @name         Wayfarer Map Mods - Abuse Email Importer
+// @namespace    https://github.com/Frankmans/AbuseFormImport
+// @version      4.7.4
+// @description  Imports Niantic Support "Reporting Abuse in Wayfarer" tickets from Gmail via OAuth, or from .eml files -- using a port of bilde2910/OPR-Tools' email parser -- and stores them for the Abuse Report Extractor script (and other consumers) to search.
+// @author       Frankmans
+// @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
+// @match        https://wayfarer.scopely.com/*
+// @connect      gmail.googleapis.com
+// @connect      accounts.google.com
+// @require      https://raw.githubusercontent.com/Frankmans/AbuseFormImport/refs/heads/main/opr-email-lib.js
+// @require      https://raw.githubusercontent.com/Frankmans/AbuseFormImport/refs/heads/main/wst-storage.js
+// @run-at       document-start
+// @updateURL    https://raw.githubusercontent.com/Frankmans/AbuseFormImport/refs/heads/main/wayfarer-abuse-email-importer.user.js
+// @downloadURL  https://raw.githubusercontent.com/Frankmans/AbuseFormImport/refs/heads/main/wayfarer-abuse-email-importer.user.js
+// ==/UserScript==
+// NOTE: deliberately NOT adding @inject-into page here, unlike the
+// extractor's matching header -- that directive forces page-context
+// execution, and GM_xmlhttpRequest (this script's whole reason for being
+// sandboxed rather than @grant none like the extractor) is a sandbox-
+// only API; forcing page context would very likely make it disappear
+// out from under this script and break Gmail sync entirely. Every other
+// field here mirrors the extractor's new header (namespace, author,
+// broadened @match, document-start) -- this is the one deliberate
+// exception, not an oversight.
 
-  // -------------------------------------------------------------------------
-  // errors.ts
-  // -------------------------------------------------------------------------
-  class InvalidEmailFormatError extends Error {}
-  class NotImplementedError extends Error {}
-  class InvalidContentTypeError extends Error {}
-  class HeaderNotFoundError extends Error {}
-  class NoMatchingTemplateError extends Error {}
-  class DisambiguationFailedError extends Error {}
+/*
+ * v4.7.4 CHANGE FROM v4.7.3: SUPPORTED_SENDERS now also includes
+ * support-explore@scopely.com (confirmed real ticket reply from that
+ * address, "Scopely Explore Support" as the display name) alongside
+ * support@nianticlabs.com, which stays -- nothing confirms Niantic's own
+ * address has stopped sending, so dropping it would risk missing tickets
+ * still coming from it. Gmail sync now searches both. See that same real
+ * ticket's own companion fix in opr-email-lib.js's extractLocationLines()
+ * -- a third location-naming format ('"Name" at lat,lng') that ticket
+ * happened to use, unrelated to the sender change itself but found while
+ * confirming this one classified and extracted correctly.
+ *
+ * v4.7.3 CHANGE FROM v4.7.2: metadata header overhaul, matching the
+ * extractor's own v1.26.1 change -- @namespace now points at the GitHub
+ * repo, @author is the real name rather than the "you" placeholder,
+ * @match broadened from just /new/mapview* to the whole site, and
+ * @run-at moved from document-idle to document-start. Deliberately NOT
+ * matching the extractor's new @inject-into page -- see this header's
+ * own NOTE comment below for why (GM_xmlhttpRequest, needed for Gmail
+ * sync, is a sandbox-only API that page-context injection would very
+ * likely break). @version itself was briefly dropped in the change this
+ * entry replaces and has been restored -- that was a mistake, not
+ * intentional; Tampermonkey needs it to compare against @updateURL and
+ * decide whether an update is actually available.
+ *
+ * v4.7.2 CHANGE FROM v4.7.1: renamed to "Wayfarer Map Mods - Abuse Email
+ * Importer" (@name, modal title, Plugin Manager listing, console log
+ * prefixes) -- see wae.js's own v1.24.1 changelog note for the fuller
+ * explanation of what did and didn't change and why (same reasoning
+ * applies here: @downloadURL/@updateURL/@require and internal identifiers
+ * are untouched, only user-visible display strings).
+ *
+ * v4.7.0 CHANGE FROM v4.6.1: same underlying change as the Abuse Report
+ * Extractor script's own v1.22.0 -- see that file's changelog note for the
+ * fuller explanation. Short version: buildPanel()'s hand-rolled backdrop/
+ * dialog (an innerHTML string styled by copying the suite's own
+ * .wfmapmods-modal-* class names) is gone, replaced with a real
+ * WFMM.ui.openModal() call, with the body built via WFMM.ui.createElement/
+ * section/button/buttonRow/textInput/checkboxRow/selectInput. openPanel()/
+ * closePanel()/togglePanel() now work through the modalController
+ * openModal() returns instead of toggling a hidden panel's display style
+ * -- since openModal() tears the dialog down on close rather than hiding
+ * it, this panel's live DOM refs are only valid while it's open, tracked
+ * via a single weiUI object set in buildContent() and cleared in the
+ * onClose hook.
+ *
+ * IMPORTANT DIFFERENCE FROM THE EXTRACTOR SCRIPT: this script runs
+ * sandboxed (@grant GM_xmlhttpRequest -- see the v4.6.1 note further down
+ * on why window.WFMM isn't reachable as a bare global from in here), so
+ * every WFMM.ui.* call in this file goes through wfmmWindow.WFMM.ui, never
+ * a bare WFMM/window.WFMM. wfmmWindow itself moved up to the top of the
+ * file (it used to only be declared right before the Plugin Manager
+ * registration code at the bottom) so the same reference covers both that
+ * registration bootstrap AND every UI call in the panel.
+ *
+ * Only the panel-*building* code changed here -- Gmail OAuth/sync, the
+ * .eml import path, auto-sync, and the backup/restore JSON export are all
+ * untouched, since none of that is UI-service surface.
+ *
+ * Companion to wayfarer-abuse-report-extractor.user.js. This script's ONLY
+ * job is getting your raw emails into the shared IndexedDB store
+ * ("wst_email_store", see wst-storage.js) as parsed-but-unclassified
+ * records -- headers + body, nothing more. It does NOT try to figure out
+ * what kind of email something is or extract a Wayspot name/coordinates
+ * from it -- that's the extractor script's job.
+ *
+ * TWO WAYS IN:
+ *   1. Connect Gmail -- OAuth (read-only) + the Gmail API, fetches matching
+ *      messages directly. No manual export step, incremental after the
+ *      first sync. Needs a one-time Google Cloud OAuth Client ID -- see the
+ *      setup steps you were given alongside this script.
+ *   2. Drop .eml files -- unchanged from before, useful as a fallback (a
+ *      work computer where you can't/won't set up OAuth, a handful of
+ *      one-off messages, etc).
+ *
+ * v3 CHANGE FROM v2: @grant went from "none" to "GM_xmlhttpRequest" so the
+ * Gmail API calls run through Tampermonkey's own request machinery instead
+ * of the page's fetch() -- that sidesteps Wayfarer's page CSP, which would
+ * otherwise likely block a page-context request to googleapis.com. This
+ * shouldn't change anything about the .eml/backup features below; @require'd
+ * scripts and this script still share one execution context either way.
+ *
+ * v4.6.1 CHANGE FROM v4.6.0: fixed Plugin Manager registration silently
+ * never happening at all -- reported symptom: the script works completely
+ * normally (settings link, panel, everything) but the suite's own Plugin
+ * Manager screen says "No external plugins have registered with WFMM".
+ * Root cause: this script's @grant GM_xmlhttpRequest (needed for the
+ * Gmail sync calls) puts it in Tampermonkey's sandboxed execution mode,
+ * where this script's own `window` is a SEPARATE object from the real
+ * page window -- so window.WFMM (assigned by the suite onto the real
+ * page window) was always invisible here. registerOrSelfStart()'s 5s
+ * polling loop always timed out and fell back to self-starting, which is
+ * exactly why everything still worked -- just never through the Plugin
+ * Manager. Fixed by reading through unsafeWindow instead of window.
+ * Per Tampermonkey's own docs, unsafeWindow needs its OWN explicit
+ * @grant entry alongside other grants (unlike @grant none, where window
+ * already IS unsafeWindow with nothing extra needed) -- added @grant
+ * unsafeWindow to this script's header, without which the unsafeWindow
+ * fallback would have silently resolved to undefined and fallen straight
+ * back to the same broken sandboxed window.
+ *
+ * Caveat: this is a real userscript-manager sandboxing behavior that
+ * can't be reproduced in a Node/jsdom test harness -- there's no actual
+ * GM sandbox to simulate. This fix is grounded in Tampermonkey's own
+ * documented @grant/unsafeWindow behavior and the specific symptom
+ * reported, not something verified end-to-end the way other fixes in
+ * this file have been. Worth confirming directly against the real Plugin
+ * Manager screen after updating.
+ *
+ * v4.6.0 CHANGE FROM v4.5.1: two changes.
+ *   1. The dialog had no padding at all -- confirmed .wfmapmods-modal-
+ *      dialog itself provides none in the real v4.0.0 suite CSS (its own
+ *      modals add it via a separate inner body wrapper class this script
+ *      never adopted), so content sat flush against the edges. Added
+ *      padding directly on .wei-dialog, plus overflow-y:auto so tall
+ *      content scrolls within the dialog instead of being clipped by the
+ *      base rule's overflow:hidden.
+ *   2. Now registers as a real entry in the suite's own Plugin Manager
+ *      settings screen (#wfmm-plugin-manager-modal) via its external-
+ *      plugin API, window.WFMM.plugins.registerExternal() -- confirmed
+ *      against the real v4.0.0 source (id/name/description/author/
+ *      version/apiVersion required; source:"external", requirement:
+ *      "optional" default to enabled; create() returns {start,stop} and
+ *      WFMM itself calls them based on the user's toggle in that screen,
+ *      not this script). See startPlugin()/stopPlugin()/
+ *      registerOrSelfStart() below. stop() actually tears things down --
+ *      removes the settings link and panel, stops the side-panel
+ *      watcher, clears any running auto-sync timer -- rather than just
+ *      hiding something, so re-enabling from that screen starts clean.
+ *      Falls back to the old unconditional self-start (no Plugin Manager
+ *      entry) if window.WFMM.plugins never appears within 5s, so this
+ *      still works standalone against an older Base version. Verified
+ *      both the registration+start+stop+restart cycle and the fallback
+ *      path through a simulated DOM, not just read against the source.
+ *
+ * v4.5.1 CHANGE FROM v4.5.0: the auto-sync checkbox looked out of place
+ * (bare browser-default appearance) after v4.5.0's .wei-checkbox swap-in
+ * for the removed .wfmapmods-modal-checkbox -- that rule only set size,
+ * nothing else. Added accent-color to actually match the rest of the
+ * panel's blue instead of leaving it unstyled.
+ *
+ * v4.5.0 CHANGE FROM v4.4.0: adapted for Wayfarer's move to
+ * wayfarer.scopely.com and Tntnnbltn's new consolidated
+ * wayfarer-map-mods.user.js suite (v4.0.0, replacing the old separate
+ * wayfarer-map-mods-base.user.js + Report Wayspots scripts this was
+ * previously confirmed against). @namespace/@match updated to the new
+ * domain. Verified the new suite's actual source line by line against
+ * everything this script depends on:
+ *   - #wfmapmods-side-panel, .wfmapmods-settings-links, and all the
+ *     .wfmapmods-modal-* classes this uses for its own panel are
+ *     unchanged.
+ *   - The map-lookup code below (confirmed against Report Wayspots
+ *     v3.15.0) is still accurate -- looksLikeGoogleMap()/
+ *     extractMapFromCtxEntry()'s componentRef.map pattern and the
+ *     "app-submit-wayspot-map nia-map, app-wf-base-map" selectors are
+ *     byte-for-byte what the new suite's own internal map resolution
+ *     uses too.
+ *   - #wfmapmods-poi-bridge/#wfmapmods-submit-bridge, however, are GONE
+ *     -- replaced internally with a private "component bridge"
+ *     abstraction with no stable public DOM contract. isMapModsBaseActive()
+ *     now checks for #wfmapmods-side-panel instead (see that function),
+ *     and publishPoiToMap() is now a documented no-op with a one-time
+ *     console warning rather than silently writing to a throwaway
+ *     element nothing reads -- see that function's own comment. This
+ *     doesn't affect real map-plotting either way; that was always the
+ *     extractor script's own "Show on Map" (native markers), never this
+ *     bridge.
+ *   - .wfmapmods-modal-checkbox is also gone (only context-specific
+ *     .wfmapmods-layers-checkbox/.wfmapmods-filters-checkbox remain,
+ *     neither fitting an unrelated auto-sync toggle) -- swapped for a
+ *     small self-contained .wei-checkbox rule instead.
+ * NOT changed: SUPPORTED_SENDERS still filters on support@nianticlabs.com
+ * -- that's Niantic Support's own email address, a separate concern from
+ * which website domain Wayfarer itself is hosted at, and nothing
+ * indicated it changed too. Worth confirming if abuse-report tickets
+ * start arriving from a different address.
+ *
+ * v4.4.0 CHANGE FROM v4.3.0: SUPPORTED_SENDERS narrowed to just
+ * support@nianticlabs.com. Gmail sync now only screens for Niantic
+ * Support's Helpshift "Reporting Abuse in Wayfarer" ticket threads --
+ * dropped the general nomination/notification senders (notices@recon.
+ * nianticspatial.com, notices@wayfarer.nianticlabs.com, nominations@
+ * portals.ingress.com, hello@pokemongolive.com, ingress-support@
+ * nianticlabs.com, ingress-support@google.com). If you want those back for
+ * a different consumer later, they're in the version history, not gone
+ * from Gmail -- this only changes what this script's own sync pulls in.
+ * The .eml drop path is untouched: it still accepts whatever file you
+ * drop, since that's already a deliberate per-file choice, not a search.
+ *
+ * v4.3.0 CHANGE FROM v4.2.0: the panel is now a real modal, styled with
+ * Base's own .wfmapmods-modal-* classes (backdrop, dialog, title, close
+ * button, buttons) instead of the old custom fixed-position dark/monospace
+ * box. Centered, white, blocks the rest of the page while open (click
+ * outside the dialog, Escape, or the × all close it) -- matching every
+ * other Map Mods - Base panel instead of looking like a standalone widget.
+ *
+ * v4.2.0 CHANGE FROM v4.1.0: dropped the @require for Tntnnbltn's
+ * wayfarer-map-mods-base.user.js that v4.0.0 added. @require doesn't share
+ * a running instance across scripts -- it re-fetches and re-executes the
+ * whole file separately inside *each* userscript that lists it. With both
+ * this script and the Abuse Report Extractor requiring it, that meant two
+ * independent copies of Base running side by side on the same page, each
+ * building its own "#wfmapmods-side-panel" (Base has no re-init guard
+ * against a *second*, separately-required copy). Base's real companion
+ * script, Report Wayspots, never @requires it either -- it's installed
+ * once, standalone, and every other script just assumes exactly one copy
+ * is already running and talks to it purely through the DOM contract
+ * (.wfmapmods-settings-links, the two bridge elements). This script now
+ * does the same: Map Mods - Base needs to be installed separately for the
+ * "Import Abuse Report Emails" link and publishPoiToMap() to have
+ * anywhere to go, but this script no longer bundles a copy of it in.
+ *
+ * v4.1.0 CHANGE FROM v4.0.0: this no longer has its own floating "Import
+ * Emails" button. Same move the Abuse Report Extractor script made in its
+ * own v1.1.0 -- the panel now opens via an "Import Abuse Report Emails"
+ * link injected into Map Mods - Base's side panel settings section
+ * (".wfmapmods-settings-links"), found the same debounced-MutationObserver
+ * way. The panel itself (Gmail connect, .eml dropzone, backup/maintenance)
+ * is unchanged -- only how it's opened changed, plus the existing Close
+ * button is now the only way to dismiss it since there's no toggle button
+ * to click a second time.
+ *
+ * v4 CHANGES FROM v3:
+ *   - support@nianticlabs.com added to SUPPORTED_SENDERS, so Gmail sync now
+ *     also picks up Niantic Support's Helpshift ticket threads (e.g.
+ *     "Reporting Abuse in Wayfarer"), not just the templated per-submission
+ *     notification emails. Requires the updated opr-email-lib.js that knows
+ *     how to classify ABUSE_REPORT_* / Style.SUPPORT emails -- @require
+ *     still points at the same URL, so just make sure that file itself has
+ *     been updated. Records are stored exactly as before (raw headers +
+ *     body, still deliberately unclassified) -- a separate plugin is
+ *     expected to call OPREmail.classify() / OPREmail.helpshift.* on them
+ *     later to pull out the reported name/coordinates. This script only
+ *     uses classify() itself, transiently, to add a per-import count of how
+ *     many abuse-report messages came in -- that count is never stored.
+ *   - @namespace changed to https://wayfarer.nianticlabs.com/new and a
+ *     @require for Tntnnbltn's wayfarer-map-mods-base.user.js was added, at
+ *     your request, to integrate with that base plugin.
+ *     *** INTEGRATION, NOW CONFIRMED AGAINST v3.15.0 ***: there's no formal
+ *     "register your plugin" API -- Base doesn't expose one. What it does
+ *     expose, for any userscript sharing the page, is a pair of DOM "bridge"
+ *     elements it watches with a MutationObserver:
+ *       #wfmapmods-poi-bridge    (attr data-payload)    -- write a POI's
+ *         {guid, title, description, lat, lng, imageUrl, status, source}
+ *         as JSON and Base will show/select it in its own side panel.
+ *       #wfmapmods-submit-bridge (attr data-submission)  -- write
+ *         {mode, source, poi:{...}, images:{...}} as JSON and Base opens
+ *         its resubmission modal for it.
+ *     This script has no POI/coordinate data of its own to push -- that's
+ *     the "different plugin" you're building next. So what's actually wired
+ *     up here (see registerWithMapModsBase() near the bottom) is: presence
+ *     detection (logged, so it's obvious if Base isn't loaded), plus a
+ *     small public API, window.WayfarerAbuseEmailImporter, so that next plugin
+ *     doesn't have to re-derive which stored emails are abuse reports or
+ *     re-implement the POI-bridge JSON contract itself -- it can call
+ *     getAbuseReportRecords() to get the stored {record, email} pairs (each
+ *     email already an OPREmail.Email, ready for
+ *     OPREmail.helpshift.parseAbuseReportEmail(email)), then hand the title
+ *     + coordinates it extracts to publishPoiToMap() to write onto Base's
+ *     real bridge.
+ *     *** CORRECTION, confirmed against Report Wayspots v3.3.0's real
+ *     source ***: publishPoiToMap() does NOT put a pin on the map -- Base
+ *     only shows/selects a bridge-sourced POI in its own side panel (see
+ *     that function's own code comment). The extractor script's actual
+ *     map-plotting (added in its own v1.6.0, "Show on Map") doesn't use
+ *     this bridge at all -- it ports Report Wayspots' real map-lookup code
+ *     and builds its own self-contained pulse-overlay layer instead, the
+ *     only approach actually confirmed to draw a marker. This function and
+ *     getAbuseReportRecords() are left in place as a small convenience API
+ *     regardless -- still useful for a future consumer that only wants
+ *     "the abuse-report emails already parsed" or "hand one POI to Base's
+ *     side panel" -- just not for map-plotting.
+ *
+ * GMAIL OAUTH DESIGN NOTES:
+ * Uses Google Identity Services' token client (a popup-based implicit OAuth
+ * flow) rather than a redirect flow, specifically because it needs no
+ * redirect_uri / backend of any kind -- the token comes back to this page's
+ * JS directly. The access token lives in memory only (a page variable, never
+ * persisted) and is re-requested each time this page is loaded; that's a
+ * deliberate simplicity/security tradeoff for a personal tool, not an
+ * oversight. Your Client ID (not a secret -- it's fine to store) is kept in
+ * localStorage so you don't have to repaste it constantly.
+ */
 
-  // -------------------------------------------------------------------------
-  // types.ts
-  // -------------------------------------------------------------------------
-  const Type = {
-    CHALLENGE_REWARD: "CHALLENGE_REWARD",
-    EDIT_APPEAL_DECIDED: "EDIT_APPEAL_DECIDED",
-    EDIT_APPEAL_RECEIVED: "EDIT_APPEAL_RECEIVED",
-    EDIT_DECIDED: "EDIT_DECIDED",
-    EDIT_RECEIVED: "EDIT_RECEIVED",
-    MISCELLANEOUS: "MISCELLANEOUS",
-    NOMINATION_APPEAL_DECIDED: "NOMINATION_APPEAL_DECIDED",
-    NOMINATION_APPEAL_RECEIVED: "NOMINATION_APPEAL_RECEIVED",
-    NOMINATION_DECIDED: "NOMINATION_DECIDED",
-    NOMINATION_RECEIVED: "NOMINATION_RECEIVED",
-    PHOTO_DECIDED: "PHOTO_DECIDED",
-    PHOTO_RECEIVED: "PHOTO_RECEIVED",
-    REPORT_DECIDED: "REPORT_DECIDED",
-    REPORT_RECEIVED: "REPORT_RECEIVED",
-    SURVEY: "SURVEY",
-    // ---- non-upstream: Niantic Support / Helpshift abuse-report tickets ----
-    // Distinct from REPORT_RECEIVED/REPORT_DECIDED above, which are the
-    // Wayfarer app's own "report a Wayspot" flow (a specific Wayspot is
-    // wrong/doesn't exist). ABUSE_REPORT_* instead covers the "Reporting
-    // Abuse in Wayfarer" Helpshift support ticket -- reporting abusive
-    // *behavior* (e.g. fake nominations to manipulate the gameboard), filed
-    // as a freeform support conversation rather than through a templated
-    // per-submission notification email. See the "helpshift.ts" section
-    // below for why this needs its own thread-parsing logic.
-    //
-    // RECEIVED/PENDING/ACTIONED/DENIED are matched against Niantic
-    // Support's own confirmed canned reply text (see RESOLUTION_TEMPLATES
-    // below) -- UPDATED is the catch-all for anything else (a custom
-    // human reply, the reporter's own follow-up being the newest message,
-    // etc.), not a fourth canned outcome.
-    ABUSE_REPORT_RECEIVED: "ABUSE_REPORT_RECEIVED",
-    ABUSE_REPORT_PENDING: "ABUSE_REPORT_PENDING",
-    ABUSE_REPORT_ACTIONED: "ABUSE_REPORT_ACTIONED",
-    ABUSE_REPORT_DENIED: "ABUSE_REPORT_DENIED",
-    ABUSE_REPORT_UPDATED: "ABUSE_REPORT_UPDATED",
-  };
+(function () {
+  'use strict';
 
-  const Style = {
-    INGRESS: "INGRESS",
-    LIGHTSHIP: "LIGHTSHIP",
-    POKEMON_GO: "POKEMON_GO",
-    REDACTED: "REDACTED",
-    WAYFARER: "WAYFARER",
-    RECON: "RECON",
-    UNKNOWN: "UNKNOWN",
-    // non-upstream: see ABUSE_REPORT_* above
-    SUPPORT: "SUPPORT",
-  };
+  // @grant GM_xmlhttpRequest (needed for the Gmail API calls) sandboxes
+  // this script -- its own `window` is a SEPARATE object from the real
+  // page window, so a bare `WFMM`/`window.WFMM` reference from in here
+  // would resolve to nothing, or to a stale sandboxed copy, never the
+  // real page's window.WFMM the suite actually assigns to. unsafeWindow
+  // reaches through the sandbox to the real page window -- see the
+  // v4.6.1 changelog note further up for the fuller story (and why it
+  // needs its own explicit @grant unsafeWindow entry, unlike @grant none
+  // where window already IS unsafeWindow). Declared once, here, and
+  // reused for every wfmmWindow.WFMM.* call in this file, not just the
+  // Plugin Manager registration bootstrap at the bottom.
+  const wfmmWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
-  // -------------------------------------------------------------------------
-  // diacritics.json
-  // -------------------------------------------------------------------------
-  const DIACRITICS = {"A":"ÀÁÂÃÅÄĀĂĄǍǞǠǺȀȂȦ","C":"ÇĆĈĊČ","D":"Ď","E":"ÈÊËÉĒĔĖĘĚȄȆȨ","G":"ĜĞĠĢǦǴ","H":"ĤȞ","I":"ÌÍÎÏĨĪĬĮİǏȈȊ","J":"Ĵ","K":"ĶǨ","L":"ĹĻĽ","N":"ÑŃŅŇǸ","O":"ÒÔÕÓÖŌŎŐƠǑǪǬȌȎȪȬȮȰ","R":"ŔŖŘȐȒ","S":"ŚŜŞŠȘ","T":"ŢŤȚ","U":"ÙÚÛÜŨŪŬŮŰŲƯǓǕǗǙǛȔȖ","W":"Ŵ","Y":"ÝŶŸȲ","Z":"ŹŻŽ","a":"àáâãåäāăąǎǟǡǻȁȃȧ","c":"çćĉċč","d":"ď","e":"èêëéēĕėęěȅȇȩ","g":"ĝğġģǧǵ","h":"ĥȟ","i":"ìíîïĩīĭįǐȉȋ","j":"ĵǰ","k":"ķǩ","l":"ĺļľ","n":"ñńņňǹ","o":"òôõóöōŏőơǒǫǭȍȏȫȭȯȱ","r":"ŕŗřȑȓ","s":"śŝşšș","t":"ţťț","u":"ùúûüũūŭůűųưǔǖǘǚǜȕȗ","w":"ŵ","y":"ýÿŷȳ","z":"źżž","Æ":"ǢǼ","Ø":"Ǿ","æ":"ǣǽ","ø":"ǿ","Ʒ":"Ǯ","ʒ":"ǯ","'":"\""};
+  const GMAIL_SCOPE = 'https://www.googleapis.com/auth/gmail.readonly';
+  // Niantic Support's Helpshift ticket threads, e.g. "Reporting Abuse in
+  // Wayfarer" (confirmed real From address) -- see opr-email-lib.js's
+  // Style.SUPPORT / Type.ABUSE_REPORT_* for how they're classified once
+  // imported. Nomination-status notification senders (notices@recon.
+  // nianticspatial.com, nominations@portals.ingress.com, etc.) were
+  // dropped from here in v4.4.0 -- this script now only screens for
+  // abuse-report tickets, not general Wayfarer/Spatial/Ingress mail.
+  //
+  // support-explore@scopely.com added in v4.7.4 -- confirmed real ticket
+  // reply from that address, "Scopely Explore Support" as the display
+  // name, otherwise using the exact same Helpshift transcript format
+  // (pipe-separated "Author | Date | Time" header between rule lines) as
+  // support@nianticlabs.com's own tickets, so nothing in opr-email-lib.js
+  // needed to change for it to classify and extract correctly -- this is
+  // purely about widening which senders Gmail sync searches for.
+  // support@nianticlabs.com kept alongside it rather than replaced --
+  // nothing confirms Niantic's own address has stopped sending, and
+  // dropping it outright would risk missing tickets if it's still in use
+  // for some accounts/regions.
+  const SUPPORTED_SENDERS = [
+    'support@nianticlabs.com',
+    'support-explore@scopely.com',
+  ];
+  const CLIENT_ID_KEY = 'wei_gmail_client_id';
+  const LAST_SYNC_KEY = 'wei_gmail_last_sync_ms';
+  const AUTOSYNC_ENABLED_KEY = 'wei_autosync_enabled';
+  const AUTOSYNC_INTERVAL_KEY = 'wei_autosync_interval_min';
+  const CONCURRENCY = 5;
 
-  function stripDiacritics(text) {
-    for (const [k, v] of Object.entries(DIACRITICS)) {
-      text = text.replace(new RegExp(`[${v}]`, "g"), k);
+  // Only what WFMM.ui's own base styles (injected via ui.injectStyle()/
+  // ui.openModal() itself) don't already cover -- the modal shell,
+  // buttons, text inputs, checkboxes, selects, and section headers all
+  // come from the suite's own wfmm-* classes now (WFMM.ui.createElement/
+  // button/textInput/checkboxRow/selectInput/section), so there's much
+  // less left to define here than the old hand-copied .wfmapmods-modal-*
+  // lookalike needed. See wae.js's own v1.22.0 changelog note for the
+  // fuller story -- same change, applied here.
+  const STYLE = `
+    #wei-panel .wfmapmods-modal-dialog{ width:480px; max-width:calc(100vw - 24px); }
+    .wei-sub{ font-size:11px; color:var(--wfmm-muted-text, #667085); margin-bottom:8px; }
+    #wei-dropzone{
+      border:2px dashed #d1d5db; border-radius:6px; padding:20px 10px; text-align:center;
+      color:#6b7280; margin:6px 0; cursor:pointer; font-size:12px;
     }
-    return text.normalize("NFD");
+    #wei-dropzone.drag{ border-color:#2563eb; color:#2563eb; }
+    .wei-autosync-row{ display:flex; align-items:center; gap:6px; font-size:12px; color:#374151; margin:6px 0; cursor:default; }
+    .wei-progress{ font-size:11px; color:#2563eb; margin:4px 0; min-height:14px; }
+    .wei-log{
+      margin-top:8px; max-height:180px; overflow-y:auto; font-size:11px; line-height:1.5;
+    }
+    .wei-log div.ok{ color:#16a34a; }
+    .wei-log div.skip{ color:#6b7280; }
+    .wei-log div.err{ color:#dc2626; }
+  `;
+
+  // ---------------------------------------------------------------------
+  // Gmail OAuth + API helpers
+  // ---------------------------------------------------------------------
+
+  let accessToken = null;
+  let tokenExpiryMs = 0;
+  let tokenClient = null;
+  let autoSyncTimer = null;
+  let autoSyncInProgress = false;
+
+  function loadGis() {
+    return new Promise((resolve, reject) => {
+      if (window.google && window.google.accounts && window.google.accounts.oauth2) { resolve(); return; }
+      const s = document.createElement('script');
+      s.src = 'https://accounts.google.com/gsi/client';
+      s.async = true;
+      s.onload = () => resolve();
+      s.onerror = () => reject(new Error(
+        'Could not load Google\u2019s sign-in script. If this keeps happening, Wayfarer\u2019s ' +
+        'page security policy may be blocking accounts.google.com from loading here.'
+      ));
+      document.head.appendChild(s);
+    });
   }
 
-  // -------------------------------------------------------------------------
-  // parsing.ts
-  // -------------------------------------------------------------------------
-  const ENCODED_WORD_REGEX = /=\?([A-Za-z0-9-]+)\?([QqBb])\?([^?]+)\?=(?:\s+(?==\?[A-Za-z0-9-]+\?[QqBb]\?[^?]+\?=))?/g;
+  function withTimeout(promise, ms, message) {
+    return Promise.race([
+      promise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error(message || 'Timed out')), ms)),
+    ]);
+  }
 
-  const extractEmail = (headerValue) => {
-    // Technically not spec-compliant
-    const sb = headerValue.lastIndexOf("<");
-    const eb = headerValue.lastIndexOf(">");
-    if (sb < 0 && eb < 0) return headerValue;
-    return headerValue.substring(sb + 1, eb);
-  };
+  function requestAccessToken(clientId, interactive) {
+    return new Promise((resolve, reject) => {
+      loadGis().then(() => {
+        tokenClient = google.accounts.oauth2.initTokenClient({
+          client_id: clientId,
+          scope: GMAIL_SCOPE,
+          callback: (resp) => {
+            if (resp.error) { reject(new Error(resp.error)); return; }
+            accessToken = resp.access_token;
+            tokenExpiryMs = Date.now() + (resp.expires_in * 1000) - 60000;
+            resolve(accessToken);
+          },
+        });
+        tokenClient.requestAccessToken({ prompt: interactive ? 'consent' : '' });
+      }).catch(reject);
+    });
+  }
 
-  const parseMIME = (data) => {
-    const bound = data.indexOf("\r\n\r\n");
-    if (bound < 0) throw new InvalidEmailFormatError("Cannot find boundary between headers and body");
-    const headers = data.substring(0, bound).replace(/\r\n\s/g, " ").split(/\r\n/).map((h) => parseHeader(h));
-    const body = data.substring(bound + 4);
-    return new Email(headers, body);
-  };
+  // forceNonInteractive is used by background auto-sync ticks -- a timer
+  // callback is never a "user gesture", so browsers will block any popup
+  // it tries to open. A non-interactive (prompt: '') request either
+  // silently renews via an existing Google session with no visible popup,
+  // or fails -- it never falls back to an interactive popup on its own.
+  async function getValidToken(clientId, opts) {
+    const forceNonInteractive = !!(opts && opts.forceNonInteractive);
+    if (accessToken && Date.now() < tokenExpiryMs) return accessToken;
+    const interactive = forceNonInteractive ? false : !accessToken;
+    const request = requestAccessToken(clientId, interactive);
+    // Silent renewal can hang indefinitely (rather than reject) if
+    // third-party cookies are blocked -- only relevant for the
+    // non-interactive path, since the interactive path legitimately waits
+    // on the user to finish a popup.
+    return forceNonInteractive ? withTimeout(request, 10000, 'Silent token refresh timed out') : request;
+  }
 
-  const parseHeader = (headerLine) => {
-    const b = headerLine.indexOf(":");
-    const token = headerLine.substring(0, b);
-    // Decode RFC 2047 atoms
-    const field = headerLine
-      .substring(b + 1)
-      .trim()
-      .replace(ENCODED_WORD_REGEX, (_, c, e, t) => parseEncodedWord(c, e, t));
-    return {
-      name: token,
-      value: field.trim(),
-    };
-  };
-
-  const parseEncodedWord = (charset, encoding, text) => {
-    switch (encoding) {
-      case "Q":
-      case "q":
-        return new TextDecoder(charset).decode(qpStringToU8A(text.split("_").join(" ")));
-      case "B":
-      case "b":
-        return charset.toLowerCase() == "utf-8" ? atobUTF8(text) : atob(text);
-      default:
-        throw new InvalidEmailFormatError(`Invalid RFC 2047 encoding format: ${encoding}`);
-    }
-  };
-
-  const qpStringToU8A = (str) => {
-    const u8a = new Uint8Array(str.length - (2 * (str.split("=").length - 1)));
-    for (let i = 0, j = 0; i < str.length; i++, j++) {
-      if (str[i] !== "=") {
-        u8a[j] = str.codePointAt(i);
-      } else {
-        u8a[j] = parseInt(str.substring(i + 1, i + 3), 16);
-        i += 2;
-      }
-    }
-    return u8a;
-  };
-
-  // https://stackoverflow.com/a/30106551/1955334
-  const atobUTF8 = (text) => decodeURIComponent(atob(text)
-    .split("")
-    .map(c => "%" + ("00" + c.charCodeAt(0).toString(16)).slice(-2))
-    .join(""));
-
-  const decodeBodyUsingCTE = (body, cte, charset) => {
-    switch (cte) {
-      case null:
-      // BUGFIX (not upstream -- confirmed against a real ticket-reply
-      // export that used this exact CTE, which is why it wasn't caught
-      // sooner): 7bit/8bit/binary are legal Content-Transfer-Encoding
-      // values per RFC 2045 \u00a76 -- they mean "no transfer encoding was
-      // applied", not "unencoded/absent" specifically, which is a
-      // distinct case from CTE being missing entirely (the `null` this
-      // switch already handled). Both cases need the exact same
-      // treatment though: the body is already usable text as read off
-      // the wire, nothing to decode. Falling through to `case null`'s
-      // `return body` for these was missing entirely before -- any
-      // abuse-report (or other) email using one of these instead of
-      // quoted-printable/base64 hit the `default` branch below and threw
-      // NotImplementedError, which classify()'s caller (isAbuseReportRecord()/
-      // scanImportedEmails() in the extractor script) treats as "not an
-      // abuse report" and silently drops -- so the whole ticket just
-      // never showed up in a scan, with nothing in the log to say why.
-      case "7bit":
-      case "8bit":
-      case "binary":
-        return body;
-      case "quoted-printable":
-        return unfoldQuotedPrintable(body, charset);
-      case "base64":
-        return charset.toLowerCase() === "utf-8" ? atobUTF8(body) : atob(body);
-      default:
-        throw new NotImplementedError(`Unknown Content-Transfer-Encoding ${cte}`);
-    }
-  };
-
-  const unfoldQuotedPrintable = (body, charset) => {
-    // Unfold QP CTE
-    const td = new TextDecoder(charset);
-    return body
-      .split(/=\r?\n/).join("")
-      .split(/\r?\n/).map((line) => td.decode(qpStringToU8A(line)))
-      .join("\n");
-  };
-
-  // -------------------------------------------------------------------------
-  // index.ts -- Email class
-  // -------------------------------------------------------------------------
-  class Email {
-    constructor(headers, body) {
-      this.headers = headers;
-      this.body = body;
-      this._cache = {};
-    }
-
-    getHeaderValues(name) {
-      return this.headers
-        .filter((h) => h.name.toLowerCase() === name.toLowerCase())
-        .map((h) => h.value);
-    }
-
-    getFirstHeaderValue(name, defaultValue) {
-      const hvs = this.getHeaderValues(name);
-      if (hvs.length) return hvs[0];
-      if (typeof defaultValue !== "undefined") return defaultValue;
-      throw new HeaderNotFoundError(`Could not find any headers with name ${name}`);
-    }
-
-    getBody(contentType) {
-      const alts = this.getMultipartAlternatives();
-      return alts[contentType.toLowerCase()] ?? null;
-    }
-
-    getMultipartAlternatives() {
-      const alts = {};
-      const ct = this._parseContentType(this.getFirstHeaderValue("Content-Type"));
-      if (ct.type === "multipart/alternative") {
-        const parts = this.body.split(`--${ct.params.boundary}`).filter(part => part !== "");
-        for (const part of parts) {
-          if (!part.startsWith("\r\n") || !part.endsWith("\r\n")) continue;
-          const partMime = parseMIME(part.substring(2, part.length - 2));
-          if (partMime.body.trim().length === 0) continue;
-          const partCTHdr = partMime.getFirstHeaderValue("Content-Type", null);
-          if (partCTHdr === null) continue;
-          const partCT = this._parseContentType(partCTHdr);
-          const partCTE = partMime.getFirstHeaderValue("Content-Transfer-Encoding", null);
-          const partCharset = (partCT.params.charset ?? "utf-8").toLowerCase();
-          alts[partCT.type] = decodeBodyUsingCTE(partMime.body, partCTE, partCharset);
-        }
-      } else {
-        const cte = this.getFirstHeaderValue("Content-Transfer-Encoding", null);
-        const charset = (ct.params.charset ?? "utf-8").toLowerCase();
-        alts[ct.type] = decodeBodyUsingCTE(this.body, cte, charset);
-      }
-      return alts;
-    }
-
-    getDocument() {
-      if (typeof this._cache.document !== "undefined") {
-        return this._cache.document;
-      } else {
-        const html = this.getBody("text/html");
-        if (!html) return null;
-        const dp = new DOMParser();
-        this._cache.document = dp.parseFromString(html, "text/html");
-        return this._cache.document;
-      }
-    }
-
-    classify() {
-      if (typeof this._cache.classification !== "undefined") {
-        if (this._cache.classification === null) {
-          throw new DisambiguationFailedError("Disambiguation of ambiguous email template failed");
-        }
-        return this._cache.classification;
-      } else {
-        const subject = this.getFirstHeaderValue("Subject");
-        for (const template of TEMPLATES) {
-          if (subject.match(template.subject)) {
-            if ("disambiguate" in template && typeof template.disambiguate !== "undefined") {
-              this._cache.classification = template.disambiguate(this);
-            } else if ("type" in template) {
-              this._cache.classification = {
-                type: template.type,
-                style: template.style,
-                language: template.language,
-              };
-            } else {
-              this._cache.classification = null;
-            }
-            return this.classify();
+  function gmApiGet(url, token) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url,
+        headers: { Authorization: `Bearer ${token}` },
+        onload: (res) => {
+          if (res.status >= 200 && res.status < 300) {
+            try { resolve(JSON.parse(res.responseText)); }
+            catch (e) { reject(new Error('Gmail API returned something that wasn\u2019t valid JSON')); }
+          } else if (res.status === 401) {
+            reject(Object.assign(new Error('Gmail token expired or was revoked'), { authExpired: true }));
+          } else {
+            reject(new Error(`Gmail API error ${res.status}: ${res.responseText.slice(0, 300)}`));
           }
-        }
-      }
-      throw new NoMatchingTemplateError("This email does not appear to match any styles of Niantic emails currently known to Email API.");
-    }
+        },
+        onerror: () => reject(new Error('Network error calling the Gmail API')),
+      });
+    });
+  }
 
-    _parseContentType(ctHeader) {
-      const m = ctHeader.match(/^([^/]+\/[^/;\s]+)(?=($|((?:;[^;]*)*)))/);
-      if (m === null) throw new InvalidContentTypeError(`Unrecognized Content-Type ${ctHeader}`);
-      const type = m[1];
-      const params = m[2];
-      const paramMap = {};
-      if (params) {
-        const paramList = params.substring(1).split(";");
-        for (const param of paramList) {
-          const [attr, value] = param.trim().split("=");
-          if (!attr || typeof value === "undefined") continue;
-          paramMap[attr.toLowerCase()] = (
-            value.startsWith("\"") && value.endsWith("\"")
-              ? value.substring(1, value.length - 1)
-              : value
-          );
+  function buildGmailQuery(lastSyncMs) {
+    const senderClause = '(' + SUPPORTED_SENDERS.map((s) => `from:${s}`).join(' OR ') + ')';
+    if (!lastSyncMs) return senderClause;
+    // 1-day safety buffer -- same as gmail_wayspot_export.py's incremental
+    // sync, since Gmail's after: operator only has day granularity.
+    const buffered = new Date(lastSyncMs - 24 * 60 * 60 * 1000);
+    const y = buffered.getUTCFullYear();
+    const m = String(buffered.getUTCMonth() + 1).padStart(2, '0');
+    const d = String(buffered.getUTCDate()).padStart(2, '0');
+    return `${senderClause} after:${y}/${m}/${d}`;
+  }
+
+  function base64UrlToText(b64url) {
+    const b64 = b64url.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = b64 + '='.repeat((4 - (b64.length % 4)) % 4);
+    const binary = atob(padded);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new TextDecoder('utf-8').decode(bytes);
+  }
+
+  async function listAllMessageIds(query, token, onProgress) {
+    const ids = [];
+    let pageToken = null;
+    do {
+      const url = new URL('https://gmail.googleapis.com/gmail/v1/users/me/messages');
+      url.searchParams.set('q', query);
+      url.searchParams.set('maxResults', '100');
+      if (pageToken) url.searchParams.set('pageToken', pageToken);
+      const page = await gmApiGet(url.toString(), token);
+      for (const m of (page.messages || [])) ids.push(m.id);
+      pageToken = page.nextPageToken || null;
+      if (onProgress) onProgress(ids.length);
+    } while (pageToken);
+    return ids;
+  }
+
+  // Bounded-concurrency fetch of each message's raw RFC822 content.
+  async function fetchMessagesRaw(ids, token, onProgress) {
+    const results = new Array(ids.length);
+    let cursor = 0, done = 0;
+    async function worker() {
+      while (cursor < ids.length) {
+        const i = cursor++;
+        const url = `https://gmail.googleapis.com/gmail/v1/users/me/messages/${ids[i]}?format=raw`;
+        try {
+          const msg = await gmApiGet(url, token);
+          results[i] = { id: ids[i], raw: msg.raw, error: null };
+        } catch (e) {
+          results[i] = { id: ids[i], raw: null, error: e };
         }
+        done++;
+        if (onProgress) onProgress(done, ids.length);
       }
-      return {
-        type: type.toLowerCase(),
-        params: paramMap,
-      };
+    }
+    const workers = Array.from({ length: Math.min(CONCURRENCY, ids.length) }, worker);
+    await Promise.all(workers);
+    return results;
+  }
+
+  // ---------------------------------------------------------------------
+  // UI
+  // ---------------------------------------------------------------------
+
+  function loadAutoSyncSettings() {
+    return {
+      enabled: localStorage.getItem(AUTOSYNC_ENABLED_KEY) === 'true',
+      intervalMin: Number(localStorage.getItem(AUTOSYNC_INTERVAL_KEY)) || 15,
+    };
+  }
+  function saveAutoSyncSettings(enabled, intervalMin) {
+    localStorage.setItem(AUTOSYNC_ENABLED_KEY, String(enabled));
+    localStorage.setItem(AUTOSYNC_INTERVAL_KEY, String(intervalMin));
+  }
+
+  // WFMM.ui, set while the panel is open, and the currently-open panel's
+  // live DOM refs -- same pattern as the extractor script's own waeUiApi/
+  // waeUI (see its v1.22.0 changelog note). Both null while the panel is
+  // closed, since WFMM.ui.openModal() tears the dialog down on close
+  // instead of just hiding it, the way the old backdrop did.
+  let weiUiApi = null;
+  let weiUI = null;
+  let weiPanelController = null;
+
+  // Auto-sync keeps running in the background whether or not the panel is
+  // open (that was already true before this refactor -- the old backdrop
+  // just stayed in the DOM hidden). Logging and progress text now have to
+  // tolerate the panel being closed: weiLog() below buffers into
+  // weiPendingLog (oldest-first, capped) when there's no logEl to write
+  // into, and flushes it into the fresh logEl next time the panel opens,
+  // so nothing a background tick logged gets silently lost.
+  let weiPendingLog = [];
+
+  function weiLog(msg, cls) {
+    if (weiUI) {
+      weiUI.logEl.prepend(weiUiApi.createElement('div', { className: cls || '', text: msg }));
+      while (weiUI.logEl.children.length > 200) weiUI.logEl.removeChild(weiUI.logEl.lastChild);
+      return;
+    }
+    weiPendingLog.push({ msg, cls });
+    if (weiPendingLog.length > 50) weiPendingLog.shift();
+  }
+
+  function weiSetProgress(text) {
+    if (weiUI) weiUI.progressEl.textContent = text;
+  }
+
+  async function refreshCount() {
+    if (!weiUI) return;
+    try {
+      const n = await WSTStorage.countEmails();
+      weiUI.countEl.textContent = `${n} email(s) stored. Open the Abuse Report Extractor to scan them.`;
+    } catch (e) {
+      weiUI.countEl.textContent = 'Could not read the email store.';
     }
   }
 
-  // -------------------------------------------------------------------------
-  // helpshift.ts -- NON-UPSTREAM. bilde2910/OPR-Tools has no equivalent of
-  // this: every upstream template matches a single templated notification
-  // email for one submission. Niantic's "Reporting Abuse in Wayfarer" flow
-  // is different -- it opens a Helpshift support ticket, and Niantic mails
-  // you the *whole conversation thread so far* on every reply, using the
-  // same subject line throughout (only a leading "Re: " distinguishes a
-  // reply from -- presumably -- the original). The thread body isn't one of
-  // the styled per-language templates above; it's a plain delimited
-  // transcript ("----...----" rules bracketing "Author | Date | Time"
-  // headers), with the user's original form submission embedded as
-  // literal, unescaped HTML (<strong>/<br> tags and all) inside what's
-  // nominally the text/plain part. This section parses that transcript
-  // structure and the abuse-report form fields inside it; only confirmed
-  // against a single real "ticket just opened" auto-acknowledgement email,
-  // so treat anything not explicitly flagged confirmed below with caution.
-  // -------------------------------------------------------------------------
+  function updateGmailStatus() {
+    if (!weiUI) return;
+    const lastSync = localStorage.getItem(LAST_SYNC_KEY);
+    const auto = loadAutoSyncSettings();
+    const autoSuffix = auto.enabled ? ` Auto-sync: every ${auto.intervalMin} min.` : '';
+    if (accessToken) {
+      weiUI.gmailStatusEl.textContent = (lastSync
+        ? `Connected. Last synced ${new Date(Number(lastSync)).toLocaleString()}.`
+        : 'Connected. Never synced yet.') + autoSuffix;
+    } else {
+      weiUI.gmailStatusEl.textContent = (lastSync
+        ? `Not connected this session. Last synced ${new Date(Number(lastSync)).toLocaleString()}.`
+        : 'Not connected.') + autoSuffix;
+    }
+  }
 
-  // Splits a Helpshift transcript body into its per-message blocks, plus
-  // the trailing "Conversation ID: #NNNN" footer if present. Each block is
-  // delimited by a pair of "----...----" rule lines around an
-  // "Author | Month Day, Year | HH:MM +ZZZZ" header line.
-  const HELPSHIFT_RULE_RE = /^-{3,}$/;
-  // Author is (.*?), not (.+?): Helpshift renders the *reporter's own*
-  // messages in the thread with a blank author (just a leading space
-  // before the first "|", e.g. " | August 13, 2026 | 12:02 +0200") --
-  // confirmed against a real ticket where the original report submission
-  // itself (the message carrying the form fields we actually want) has a
-  // blank author. Requiring 1+ chars here silently dropped every message
-  // from the reporter, including that one -- which is why extraction was
-  // coming back empty for tickets where the report/reply text lives in a
-  // blank-author block rather than a named one.
-  const HELPSHIFT_HEADER_RE = /^(.*?)\s*\|\s*(.+?)\s*\|\s*([\d:]{3,5}\s*[+-]\d{2}:?\d{2})$/;
-  const HELPSHIFT_CONVERSATION_ID_RE = /^Conversation ID:\s*#?(\d+)/;
+  // ---- .eml import (unchanged from v2) ----
 
-  // A second, structurally different transcript shape -- confirmed via a
-  // real reply the reporter sent from their own Gmail account (see the
-  // GMAIL_QUOTE_ATTRIBUTION_RE block below for the full story). Instead of
-  // a PAIR of rule lines bracketing one pipe-separated "Author | Date |
-  // Time" header line, each message here is separated by a SINGLE rule
-  // line, followed by an optional author line, then a date/time line ON
-  // ITS OWN ("August 27, 2026, 08:17 +0200" -- comma-separated, no pipes)
-  // -- e.g. "------------------------------\nNiantic Support\nAugust 27,
-  // 2026, 08:17 +0200\n<body>". Most likely explained by Gmail generating
-  // the quoted plaintext from the ORIGINAL email's rendered HTML rather
-  // than reusing Helpshift's own text/plain MIME part verbatim -- Gmail's
-  // own HTML-to-text conversion doesn't preserve the paired-rule/pipe-
-  // header convention, so replies sent this way carry a different
-  // "plaintext" shape for the exact same underlying thread than an export
-  // of the original notification would.
-  const HELPSHIFT_DATE_LINE_RE = /^([A-Za-z]+ \d{1,2}, \d{4}),\s*(\d{1,2}:\d{2}\s*[+-]\d{2}:?\d{2})$/;
-  // Not anchored to line-start ("^") like HELPSHIFT_CONVERSATION_ID_RE
-  // above -- this variant's footer line is "From Niantic Support.
-  // Conversation ID: #12345678", not a bare "Conversation ID: #12345678"
-  // starting the line.
-  const HELPSHIFT_CONVERSATION_ID_ANYWHERE_RE = /Conversation ID:\s*#?(\d+)/;
+  function normalizeEml(text) {
+    return text.replace(/\r\n/g, '\n').replace(/\n/g, '\r\n');
+  }
 
-  // Fallback for the single-rule/two-line-header shape described above --
-  // tried only when the primary paired-rule parse below finds zero
-  // messages, so the well-tested primary path is completely unaffected
-  // for every previously-working export.
-  const parseHelpshiftThreadSingleRuleVariant = (lines, ruleIdx) => {
-    const messages = [];
-    let conversationId = null;
-    for (let idx = 0; idx < ruleIdx.length; idx++) {
-      const start = ruleIdx[idx];
-      const blockEnd = idx + 1 < ruleIdx.length ? ruleIdx[idx + 1] : lines.length;
-      let cursor = start + 1;
-      while (cursor < blockEnd && lines[cursor].trim() === "") cursor++;
-      if (cursor >= blockEnd) continue;
+  function emlToRecord(text, fallbackName) {
+    const email = OPREmail.parseMIME(normalizeEml(text));
+    const messageId = email.getFirstHeaderValue('Message-ID', null);
+    const id = messageId || `synthetic:${fallbackName}:${text.length}`;
+    return { id, filename: fallbackName, ts: Date.now(), headers: email.headers, body: email.body };
+  }
 
-      const convMatch = HELPSHIFT_CONVERSATION_ID_ANYWHERE_RE.exec(lines[cursor]);
-      if (convMatch) {
-        conversationId = convMatch[1];
+  // Transient-only: used to add an "N abuse report ticket(s)" count to the
+  // import log line. Never persisted -- stored records stay the
+  // deliberately-unclassified {headers, body} shape described up top, so
+  // the extractor script re-classifies from the raw email itself, the
+  // same way this helper does.
+  function isAbuseReportRecord(record) {
+    try {
+      // record.headers/body are already the decoded {name, value} pairs
+      // and raw body that emlToRecord() stored, in exactly the shape
+      // OPREmail.Email's constructor expects -- no need to re-serialize
+      // and re-parse the whole MIME message just to classify it.
+      const email = new OPREmail.Email(record.headers, record.body);
+      const { type } = email.classify();
+      return typeof type === 'string' && type.startsWith('ABUSE_REPORT_');
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function countAbuseReports(records) {
+    return records.reduce((n, r) => n + (isAbuseReportRecord(r) ? 1 : 0), 0);
+  }
+
+  async function importFiles(files) {
+    const records = [];
+    let parseErrors = 0;
+    for (const file of files) {
+      let text;
+      try {
+        text = await file.text();
+      } catch (e) {
+        weiLog(`✗ ${file.name}: could not read file`, 'err');
+        parseErrors++;
         continue;
       }
+      try {
+        records.push(emlToRecord(text, file.name));
+      } catch (e) {
+        weiLog(`✗ ${file.name}: ${e.message || e}`, 'err');
+        parseErrors++;
+      }
+    }
 
-      let author = "";
-      let dateMatch = HELPSHIFT_DATE_LINE_RE.exec(lines[cursor].trim());
-      if (!dateMatch && cursor + 1 < blockEnd) {
-        // This line wasn't a date line -- try treating it as an author
-        // name, with the date on the line right after it.
-        const nextDateMatch = HELPSHIFT_DATE_LINE_RE.exec((lines[cursor + 1] || "").trim());
-        if (nextDateMatch) {
-          author = lines[cursor].trim();
-          dateMatch = nextDateMatch;
-          cursor += 1;
+    if (records.length) {
+      const { inserted, updated } = await WSTStorage.putEmails(records);
+      const abuseCount = countAbuseReports(records);
+      const abuseSuffix = abuseCount ? `, ${abuseCount} abuse report ticket${abuseCount === 1 ? '' : 's'}` : '';
+      weiLog(`✓ Imported ${records.length} file(s): ${inserted} new, ${updated} updated${abuseSuffix}`, 'ok');
+    }
+    if (parseErrors) weiLog(`${parseErrors} file(s) could not be parsed as MIME email`, 'err');
+    await refreshCount();
+  }
+
+  // ---- Gmail sync ----
+  //
+  // Moved to module scope (used to live inside buildPanel(), closed over
+  // that one persistent panel's elements). Now reads the OAuth Client ID
+  // from localStorage directly rather than a live input -- this needs to
+  // keep working from a background auto-sync tick even while the panel is
+  // closed and no such input exists. weiSetProgress()/weiUI-guarded button
+  // toggling below are no-ops in that case; see weiLog()'s comment above
+  // for the same reasoning applied to logging.
+  async function runSync(forceFull, opts) {
+    const auto = !!(opts && opts.auto);
+    const clientId = (localStorage.getItem(CLIENT_ID_KEY) || '').trim();
+    if (!clientId) {
+      if (!auto) weiLog('Paste your OAuth Client ID first', 'err');
+      return;
+    }
+
+    if (weiUI) { weiUI.syncBtn.disabled = true; weiUI.fullResyncBtn.disabled = true; }
+    weiSetProgress(auto ? 'Auto-sync: connecting to Gmail\u2026' : 'Connecting to Gmail\u2026');
+
+    const lastSyncMs = forceFull ? null : Number(localStorage.getItem(LAST_SYNC_KEY)) || null;
+    const syncStartedAt = Date.now();
+
+    try {
+      let token;
+      try {
+        token = await getValidToken(clientId, { forceNonInteractive: auto });
+      } catch (e) {
+        if (auto) {
+          weiLog('Auto-sync skipped this round: Gmail sign-in needed -- click "Sync new emails" once to reconnect', 'skip');
+          return;
+        }
+        throw e;
+      }
+      updateGmailStatus();
+
+      const query = buildGmailQuery(lastSyncMs);
+      weiSetProgress('Listing matching messages\u2026');
+      const ids = await listAllMessageIds(query, token, (n) => {
+        weiSetProgress(`Found ${n} matching message(s) so far\u2026`);
+      });
+
+      if (ids.length === 0) {
+        weiLog(auto ? 'Auto-sync: no new messages found' : 'No new messages found', 'skip');
+        localStorage.setItem(LAST_SYNC_KEY, String(syncStartedAt));
+        updateGmailStatus();
+        return;
+      }
+
+      weiSetProgress(`Fetching ${ids.length} message(s)\u2026`);
+      const raws = await fetchMessagesRaw(ids, token, (done, total) => {
+        weiSetProgress(`Fetching messages\u2026 ${done}/${total}`);
+      });
+
+      const records = [];
+      let fetchErrors = 0, parseErrors = 0;
+      for (const r of raws) {
+        if (r.error) {
+          fetchErrors++;
+          if (r.error.authExpired) weiLog('Gmail token expired mid-sync -- run Sync again to resume', 'err');
+          continue;
+        }
+        try {
+          const text = base64UrlToText(r.raw);
+          records.push(emlToRecord(text, `gmail:${r.id}`));
+        } catch (e) {
+          parseErrors++;
         }
       }
-      if (!dateMatch) continue; // unrecognized block -- skip just this one, same as the primary parser above
 
-      const bodyLines = lines.slice(cursor + 1, blockEnd);
-      while (bodyLines.length && bodyLines[0].trim() === "") bodyLines.shift();
-      while (bodyLines.length && bodyLines[bodyLines.length - 1].trim() === "") bodyLines.pop();
-      messages.push({ author, date: dateMatch[1], time: dateMatch[2], raw: bodyLines.join("\n") });
-    }
-    return { conversationId, messages };
-  };
-
-  // Matches the "On <date>, <name> <<email>> wrote:" attribution line
-  // Gmail (and most other mail clients, with only minor wording
-  // variance) inserts above a quoted reply -- confirmed real example
-  // (support agent's own name and address genericized here):
-  // "On Fri, Aug 28, 2026, 11:02 Alex <support@nianticlabs.com> wrote:".
-  // Deliberately loose (".+ wrote:" rather than trying to fully parse the
-  // name/date/email out of it) since the exact wording/punctuation varies
-  // by client and locale and none of those pieces are actually needed --
-  // parseHelpshiftThread only needs to know WHERE the quote starts, not
-  // what this line says.
-  const GMAIL_QUOTE_ATTRIBUTION_RE = /^>?\s*On .{0,160}wrote:\s*$/m;
-
-  // BUGFIX (not upstream -- found via a real ticket reply the reporter
-  // sent from their own Gmail account, replying directly rather than
-  // through Helpshift's own web reply link): when someone replies using
-  // their mail client's normal reply feature instead of Helpshift's own
-  // "reply to this email" flow, the client wraps the ENTIRE quoted
-  // Helpshift thread in ITS OWN quoting convention -- every line
-  // (including Helpshift's own "---" rule separators) gets a leading
-  // "> ", which broke every regex below that anchors on line-start ("^"),
-  // most consequentially HELPSHIFT_RULE_RE never matching a single
-  // separator line, so `messages` came back completely empty and
-  // classify() threw DisambiguationFailedError -- a perfectly ordinary,
-  // valid abuse-report ticket that happened to receive one Gmail-native
-  // reply became entirely unclassifiable, not just missing that one
-  // reply's own content.
-  //
-  // Fixed by detecting the attribution line, splitting off whatever new
-  // text came before it (the reporter's own new reply, not part of
-  // Helpshift's own thread format at all) as its own synthetic message,
-  // then stripping the leading ">" quote markers from every remaining
-  // line and re-parsing THAT recursively -- once de-quoted, it's
-  // byte-identical in shape to a normal non-wrapped Helpshift export, so
-  // the exact same parsing logic below just works on it unmodified.
-  //
-  // fallbackDateHeader (the outer email's own raw "Date:" header, e.g.
-  // "Thu, 3 Sep 2026 14:27:28 +0200") times the synthetic new-reply
-  // message -- there's no Helpshift-style timestamp for it anywhere in
-  // the plaintext itself (only the ATTRIBUTION line has a date, and
-  // that's the date of the message being replied TO, not this new one).
-  // Passed through by every caller below; not required (classification
-  // of a single thread's own newest message only cares about array
-  // order, not a real parsed date -- see classifyAbuseReportStatus) but
-  // needed for mergeThreads() to correctly rank this reply against other
-  // separately-exported emails of the same ticket.
-  const parseHelpshiftThread = (plaintext, fallbackDateHeader = null) => {
-    const normalized = (plaintext || "").replace(/\r\n?/g, "\n");
-    const attributionMatch = GMAIL_QUOTE_ATTRIBUTION_RE.exec(normalized);
-    if (attributionMatch) {
-      const newReplyText = normalized.slice(0, attributionMatch.index).trim();
-      const quotedRemainder = normalized
-        .slice(attributionMatch.index + attributionMatch[0].length)
-        .replace(/^>+ ?/gm, "");
-      const inner = parseHelpshiftThread(quotedRemainder, fallbackDateHeader);
-      if (newReplyText) {
-        inner.messages.unshift({
-          author: "", // reporter's own message -- see classifyAbuseReportStatus's own author-blank convention
-          date: fallbackDateHeader || "",
-          time: "",
-          raw: newReplyText,
-        });
+      if (records.length) {
+        const { inserted, updated } = await WSTStorage.putEmails(records);
+        const abuseCount = countAbuseReports(records);
+        const abuseSuffix = abuseCount ? `, ${abuseCount} abuse report ticket${abuseCount === 1 ? '' : 's'}` : '';
+        weiLog(`✓ ${auto ? 'Auto-sync: synced' : 'Synced'} ${records.length} message(s) from Gmail: ${inserted} new, ${updated} updated${abuseSuffix}`, 'ok');
       }
-      return inner;
-    }
+      if (fetchErrors) weiLog(`${fetchErrors} message(s) failed to fetch (see above)`, 'err');
+      if (parseErrors) weiLog(`${parseErrors} message(s) could not be parsed as MIME email`, 'err');
 
-    // BUGFIX (not upstream -- found via the same real ticket-reply export
-    // as the CTE fix above): splitting on "\n" alone, when the decoded
-    // body is still CRLF (which it always is here -- parseMIME normalizes
-    // the whole raw message to CRLF up front, and nothing decodes it away
-    // in between), leaves every line's trailing "\r" attached to the
-    // *start* of the next split, i.e. embedded at each line boundary
-    // inside `raw` once bodyLines.join("\n") reassembles them. Harmless
-    // for most of this file's regexes ([\s\S]*? swallows it fine), but
-    // HELPSHIFT_FORM_FIELD_RE's *last* field in a message has to end at
-    // "<br><br>" or the true end of string ($) -- and the real end of
-    // string here was "...</strong>\r", one character past where $ could
-    // match. That silently dropped the LAST field in any Helpshift form
-    // submission from `fields` -- which for Niantic's abuse-report form
-    // is "Provide details of the location(s)", i.e. the one field this
-    // whole plugin most needs. Normalizing to bare "\n" before splitting,
-    // rather than leaving it to whoever consumes `raw` later to notice
-    // and strip it themselves, fixes this at the source for every
-    // consumer at once.
-    const lines = normalized.split("\n");
-    const ruleIdx = [];
-    lines.forEach((l, i) => {
-      if (HELPSHIFT_RULE_RE.test(l.trim())) ruleIdx.push(i);
+      localStorage.setItem(LAST_SYNC_KEY, String(syncStartedAt));
+    } catch (e) {
+      weiLog(`${auto ? 'Auto-sync failed: ' : 'Gmail sync failed: '}${e.message || e}`, 'err');
+    } finally {
+      weiSetProgress('');
+      if (weiUI) { weiUI.syncBtn.disabled = false; weiUI.fullResyncBtn.disabled = false; }
+      updateGmailStatus();
+      await refreshCount();
+    }
+  }
+
+  // ---- Auto-sync ----
+  // Also moved to module scope -- this has to keep ticking for the page's
+  // lifetime regardless of whether the panel is currently mounted.
+
+  function stopAutoSync() {
+    if (autoSyncTimer) { clearInterval(autoSyncTimer); autoSyncTimer = null; }
+  }
+
+  async function runAutoSyncTick() {
+    if (autoSyncInProgress) return; // don't overlap with an in-flight sync
+    autoSyncInProgress = true;
+    try {
+      await runSync(false, { auto: true });
+    } finally {
+      autoSyncInProgress = false;
+    }
+  }
+
+  function startAutoSync(intervalMin) {
+    stopAutoSync();
+    autoSyncTimer = setInterval(runAutoSyncTick, intervalMin * 60 * 1000);
+  }
+
+  // Builds the panel's BODY content into an already-open WFMM.ui modal --
+  // called as openModal()'s buildContent(modalController). See wae.js's
+  // own buildPanelContent() for the fuller explanation of this pattern;
+  // same shape here.
+  function buildPanelContent(modal) {
+    const ui = modal.ui;
+    weiUiApi = ui;
+
+    const countEl = ui.createElement('div', { className: 'wei-sub', text: 'Loading...' });
+
+    // -- Connect Gmail --
+    const clientIdInput = ui.textInput({
+      className: 'wfmm-input wfmm-input-large',
+      placeholder: 'OAuth Client ID (ends in .apps.googleusercontent.com)',
+      value: localStorage.getItem(CLIENT_ID_KEY) || '',
+    });
+    clientIdInput.addEventListener('change', () => {
+      localStorage.setItem(CLIENT_ID_KEY, clientIdInput.value.trim());
     });
 
-    const messages = [];
-    let conversationId = null;
-    let i = 0;
-    while (i < ruleIdx.length) {
-      const start = ruleIdx[i];
-      const headerLine = (lines[start + 1] || "").trim();
+    const gmailStatusEl = ui.createElement('div', { className: 'wei-sub', text: 'Not connected.' });
+    const progressEl = ui.createElement('div', { className: 'wei-progress' });
 
-      const convMatch = HELPSHIFT_CONVERSATION_ID_RE.exec(headerLine);
-      if (convMatch) {
-        conversationId = convMatch[1];
-        i += 1;
-        continue;
-      }
-
-      const hm = HELPSHIFT_HEADER_RE.exec(headerLine);
-      if (hm && ruleIdx[i + 1] === start + 2) {
-        const bodyStart = start + 3;
-        const bodyEnd = typeof ruleIdx[i + 2] !== "undefined" ? ruleIdx[i + 2] : lines.length;
-        const bodyLines = lines.slice(bodyStart, bodyEnd);
-        while (bodyLines.length && bodyLines[0].trim() === "") bodyLines.shift();
-        while (bodyLines.length && bodyLines[bodyLines.length - 1].trim() === "") bodyLines.pop();
-        messages.push({
-          author: hm[1].trim(),
-          date: hm[2].trim(),
-          time: hm[3].trim(),
-          raw: bodyLines.join("\n"),
-        });
-        i += 2;
-      } else {
-        // Unrecognized header between a rule pair -- skip just this one
-        // rule rather than getting stuck, so one odd block doesn't prevent
-        // parsing the rest of the thread.
-        i += 1;
-      }
-    }
-
-    if (messages.length === 0 && ruleIdx.length > 0) {
-      // Primary (paired-rule/pipe-header) parse found rule lines but no
-      // actual messages between them -- try the single-rule variant
-      // before giving up. Only reached when the primary parse yields
-      // NOTHING, so this never overrides a thread that already parsed
-      // correctly the normal way.
-      const fallback = parseHelpshiftThreadSingleRuleVariant(lines, ruleIdx);
-      if (fallback.messages.length > 0) return fallback;
-    }
-
-    return { conversationId, messages };
-  };
-
-  // Strips the literal <strong>/<br>/<a> markup embedded in a Helpshift
-  // form-submission message down to plain text, for keyword matching.
-  const stripHelpshiftMarkup = (html) =>
-    (html || "")
-      .replace(/<br\s*\/?>/gi, "\n")
-      .replace(/<\/?a[^>]*>/gi, "")
-      .replace(/<\/?strong>/gi, "")
-      .trim();
-
-  // Niantic's Wayfarer abuse-report form dumps as
-  // "<strong>{form title}</strong><br><br>{label}<br><strong>{value}</strong><br><br>{label2}<br><strong>{value2}</strong>..."
-  // -- extract the title and each label/value pair.
-  const HELPSHIFT_FORM_TITLE_RE = /^<strong>(.*?)<\/strong><br\s*\/?><br\s*\/?>/i;
-  const HELPSHIFT_FORM_FIELD_RE = /([^<]+?)<br\s*\/?><strong>([\s\S]*?)<\/strong>(?:<br\s*\/?><br\s*\/?>|$)/gi;
-
-  // Markdown-ish fallback for the same form, tried only when the format
-  // above finds nothing -- confirmed via the same Gmail-native-reply
-  // export as the thread-parsing fixes above. Same form, same fields,
-  // but rendered as "*{form title}*\n\n{label}\n\n?*{value}*\n\n..." (a
-  // blank line between label and value is sometimes present, sometimes
-  // not -- both seen in the one confirmed sample) rather than literal
-  // <strong>/<br> tags -- consistent with the working theory that this
-  // whole shape comes from Gmail converting the original HTML rather than
-  // reusing Helpshift's own plaintext part, which doesn't preserve the
-  // HTML tags literally the way Helpshift's own plaintext MIME part does.
-  //
-  // *** UNCONFIRMED beyond that one sample *** -- only known real example
-  // is a report with 4 fields (issue/details/location(s)/abuser(s)) and
-  // none of the fields spanning a genuine multi-paragraph value, so
-  // soft-wrap-collapsing every internal single newline (not a real "\n\n"
-  // break) to a space is a reasonable guess at undoing Gmail's own
-  // word-wrap, not something actually verified
-  // against a field long enough to contain its own intentional paragraph
-  // break.
-  const HELPSHIFT_FORM_TITLE_MARKDOWN_RE = /^\*(.+?)\*\s*\n+/;
-  const HELPSHIFT_FORM_FIELD_MARKDOWN_RE = /^([^\n*][^\n]*)\n+\*([\s\S]*?)\*(?:\n+|$)/gm;
-  const collapseSoftWraps = (text) => (text || "").replace(/([^\n])\n(?!\n)/g, "$1 ");
-
-  const extractHelpshiftFormFields = (rawMessage) => {
-    const text = rawMessage || "";
-    const titleMatch = HELPSHIFT_FORM_TITLE_RE.exec(text);
-    const title = titleMatch ? titleMatch[1].trim() : null;
-    const rest = titleMatch ? text.slice(titleMatch[0].length) : text;
-
-    const fields = {};
-    let m;
-    HELPSHIFT_FORM_FIELD_RE.lastIndex = 0;
-    while ((m = HELPSHIFT_FORM_FIELD_RE.exec(rest)) !== null) {
-      const label = m[1].trim();
-      const value = stripHelpshiftMarkup(m[2]).trim();
-      if (label) fields[label] = value;
-    }
-    if (title !== null || Object.keys(fields).length > 0) {
-      return { title, fields };
-    }
-
-    const titleMatchMd = HELPSHIFT_FORM_TITLE_MARKDOWN_RE.exec(text);
-    const titleMd = titleMatchMd ? titleMatchMd[1].trim() : null;
-    const restMd = titleMatchMd ? text.slice(titleMatchMd[0].length) : text;
-    const fieldsMd = {};
-    HELPSHIFT_FORM_FIELD_MARKDOWN_RE.lastIndex = 0;
-    while ((m = HELPSHIFT_FORM_FIELD_MARKDOWN_RE.exec(restMd)) !== null) {
-      const label = m[1].trim();
-      const value = collapseSoftWraps(m[2]).trim();
-      if (label) fieldsMd[label] = value;
-    }
-    return { title: titleMd, fields: fieldsMd };
-  };
-
-  // Finds bare "lat,lon" pairs (no surrounding parentheses, unlike the
-  // "(lat, lon)" format used elsewhere) -- the format Niantic's abuse-report
-  // form uses both for the reporter-supplied coordinates and for whatever
-  // Street View / map link they pasted in.
-  const HELPSHIFT_COORD_RE = /(-?\d{1,3}\.\d+)\s*,\s*(-?\d{1,3}\.\d+)/g;
-
-  const extractHelpshiftCoordinates = (text) => {
-    const out = [];
-    let m;
-    HELPSHIFT_COORD_RE.lastIndex = 0;
-    while ((m = HELPSHIFT_COORD_RE.exec(text || "")) !== null) {
-      out.push({ latitude: m[1], longitude: m[2] });
-    }
-    return out;
-  };
-
-  // Best-effort: "Provide details of the location(s)" reads as
-  // "<name>, <lat>,<lon>" in one confirmed sample ("Bulskampveldroute
-  // Lattenkliever, 51.127125,3.368427"), and as "<name> (<lat>, <lon>)"
-  // -- one Wayspot per line -- in another. Splits off whatever precedes
-  // the first coordinate match on a single line and treats it as that
-  // location's name. *** UNCONFIRMED beyond those samples *** -- can't
-  // distinguish "a portal/Wayspot name" from e.g. a plain street address
-  // with no name attached, so treat this as a starting point for manual
-  // review in the exported CSV, not ground truth.
-  const extractHelpshiftLocationName = (text) => {
-    if (!text) return null;
-    HELPSHIFT_COORD_RE.lastIndex = 0;
-    const m = HELPSHIFT_COORD_RE.exec(text);
-    if (!m) return text.trim() || null;
-    const before = text.slice(0, m.index).replace(/[,\s(]+$/, "").trim();
-    return before || null;
-  };
-
-  // Splits a block of text into individual "location list" lines, one
-  // entry per line that contains a coordinate: "<name>, <lat>,<lng>" or
-  // "<name> (<lat>, <lng>)" -- the two formats confirmed in real tickets
-  // (single-location reports use the first; multi-location reports, and
-  // reply messages that list further Wayspots, have used either). A line
-  // with a coordinate but nothing recognizable before it still counts,
-  // with name left null, rather than being dropped -- the coordinate
-  // alone is still useful. A line with NO coordinate at all (a subheading
-  // like "street signs:", ordinary prose in a reply) is skipped.
-  //
-  // Map/street-view links (a https://www.google.com/maps/place/.../@
-  // <lat>,<lng>,... URL) are common in real replies as supplementary
-  // evidence for a location just named a line or two above -- not a new
-  // location by itself, but also not nothing: rather than drop it, it's
-  // folded into that entry's `comment` field. Only a NAMED line becomes
-  // the attachment target for a following link, so an unnamed bare
-  // coordinate (usually itself a wrapped correction split onto its own
-  // line, e.g. "Name, lat,lng (is actually here:\n<lat,lng>)") doesn't
-  // steal a comment meant for the location actually named above it.
-  //
-  // BUGFIX (not upstream -- found via a real ticket export, in a location
-  // list with an entry like "Public Art Sculpture (51.65..., 5.02...)
-  // (https://example.com/news-article-about-it)" -- a coordinate AND a
-  // URL on the SAME line, both belonging to that one entry): the original version checked for a URL first and, if found,
-  // treated the ENTIRE line as a comment-for-the-previous-entry, never
-  // even checking whether that same line also carried its own coordinate
-  // -- silently dropping a real reported Wayspot and misattributing its
-  // URL to an unrelated earlier one instead. Checking for a coordinate
-  // FIRST (regardless of whether a URL is also present) fixes that: a
-  // line's own coordinate always wins it a real entry, and any URL
-  // trailing that SAME coordinate on the line becomes THIS entry's
-  // comment rather than falling through to the "attach to `current`"
-  // branch at all. The comment-on-a-later/prior line case this docblock
-  // originally described (an unnamed follow-up line that's pure URL, no
-  // coordinate of its own) still works exactly as before.
-  // BUGFIX (not upstream -- found via a real reply sent through Gmail's
-  // own reply UI rather than Helpshift's, see the GMAIL_QUOTE_ATTRIBUTION_RE
-  // block earlier in this file): that same email's quoted original
-  // submission renders its location list as "NameA (latA,lngA)NameB
-  // (latB,lngB)" -- two full entries run together on one line with NO
-  // separator at all between the first ")" and the second name, not even
-  // a space. Most likely explained the same way as everything else about
-  // that email's format: Gmail generated this text from the original
-  // HTML, and a <br> that should have separated the two entries got
-  // silently dropped rather than turned into a newline. Previously this
-  // function only ever looked for ONE coordinate match per line (`exec()`
-  // called once, then `continue`s to the next line no matter what),
-  // so a second entry sharing a line with an already-matched one was
-  // invisible to it entirely -- a real reported Wayspot just silently
-  // never became a row. Looping with the coordinate regex's own
-  // lastIndex until a line is exhausted, and treating the text between
-  // consecutive matches (not just before the first one) as each entry's
-  // name, fixes this while leaving single-match lines (everything tested
-  // before this) working exactly as before.
-  const extractLocationLines = (text) => {
-    const out = [];
-    const lines = (text || "").split("\n");
-    let current = null;
-    for (const rawLine of lines) {
-      const line = rawLine.trim();
-      if (!line) continue;
-      HELPSHIFT_COORD_RE.lastIndex = 0;
-      let m = HELPSHIFT_COORD_RE.exec(line);
-      if (!m) {
-        if (/https?:\/\//i.test(line) && current) {
-          current.comment = current.comment ? `${current.comment} ${line}` : line;
+    const syncBtn = ui.button({
+      text: 'Sync new emails',
+      variant: 'primary',
+      onClick: () => runSync(false),
+    });
+    const fullResyncBtn = ui.button({
+      text: 'Force full re-sync',
+      onClick: () => {
+        if (confirm('Re-fetch your entire matching mailbox history from Gmail, not just what\u2019s new since last sync?')) {
+          runSync(true);
         }
-        continue;
-      }
-      let sliceStart = 0;
-      while (m) {
-        const nextM = HELPSHIFT_COORD_RE.exec(line);
-        const matchEnd = m.index + m[0].length;
-        // Trailing text for THIS entry stops at the next entry's own
-        // coordinate match (if there is one on the same line), not just
-        // at the end of the whole line -- otherwise entry A would swallow
-        // entry B's name as if it were A's trailing comment.
-        const segmentEnd = nextM ? nextM.index : line.length;
-        // BUGFIX (not upstream): the text before the coordinate match was
-        // used verbatim as `name`, with nothing filtering out a URL if
-        // one happened to sit there instead of an actual name -- e.g. a
-        // "corrected location" line that's just a pasted map link
-        // followed by the real coordinates, with no name of its own
-        // ("https://maps.app.goo.gl/xyz 52.123, 4.456"). That produced a
-        // location entry whose "name" was a raw URL rather than the null
-        // that should mean "no name found" -- stripping any URL
-        // substring out of the pre-coordinate text before using what's
-        // left as the name fixes it (and still preserves a real name
-        // that happens to have a link elsewhere on the same line, unlike
-        // just discarding the whole name whenever a URL is present
-        // anywhere in it).
-        // BUGFIX (not upstream -- found via a real ticket from the new
-        // support-explore@scopely.com sender, see wei.js's own
-        // SUPPORTED_SENDERS comment): that ticket's location list uses a
-        // THIRD naming convention neither of the other two formats this
-        // function already handled cover -- '"Name" at lat,lng' (the
-        // name quoted, then the literal word "at" before the
-        // coordinate) -- leaving a stray trailing `" at` attached to the
-        // name instead of a clean "Name". Stripping a trailing "at" (at
-        // a word boundary, so it can't accidentally eat the last few
-        // letters of a name that genuinely ends in "...at" as part of a
-        // longer word, e.g. "Habitat") before the existing punctuation
-        // trim, and adding straight/curly quote characters to what that
-        // trim strips, handles it without touching either of the
-        // existing formats -- neither of which use quotes or the word
-        // "at" around the name at all.
-        const namePart = line.slice(sliceStart, m.index)
-          .replace(/https?:\/\/\S+/gi, "")
-          .replace(/\bat\s*$/i, "")
-          .replace(/^[,\s()"'\u201c\u201d]+|[,\s("'\u201c\u201d]+$/g, "")
-          .trim();
-        const name = namePart || null;
-        const trailing = line.slice(matchEnd, segmentEnd).replace(/^[\s),]+/, "").trim();
-        const entry = { name, latitude: m[1], longitude: m[2], comment: /https?:\/\//i.test(trailing) ? trailing : null };
-        out.push(entry);
-        if (name) current = entry;
-        // NOT segmentEnd (= the START of the next match, if any) -- that
-        // would make the next iteration's own namePart a zero-length
-        // slice(segmentEnd, segmentEnd), always producing name: null for
-        // every entry after the first on a multi-match line (caught via
-        // the isolated test above; segmentEnd is only right for bounding
-        // THIS entry's own trailing/comment text, not for where the NEXT
-        // entry's name text starts).
-        sliceStart = matchEnd;
-        m = nextM;
-      }
-    }
-    return out;
-  };
+      },
+    });
+    const syncBtnRow = ui.buttonRow([syncBtn, fullResyncBtn]);
 
+    const savedAutoSync = loadAutoSyncSettings();
+    const autoSyncInterval = ui.selectInput({
+      options: [
+        { value: '5', label: '5 min' },
+        { value: '15', label: '15 min' },
+        { value: '30', label: '30 min' },
+        { value: '60', label: '60 min' },
+      ],
+      value: String(savedAutoSync.intervalMin),
+      onChange: (value) => {
+        const intervalMin = Number(value);
+        saveAutoSyncSettings(autoSyncToggle.input.checked, intervalMin);
+        if (autoSyncToggle.input.checked) startAutoSync(intervalMin);
+      },
+    });
+    const autoSyncToggle = ui.checkboxRow({
+      label: 'Auto-sync every',
+      checked: savedAutoSync.enabled,
+      onChange: (checked) => {
+        const intervalMin = Number(autoSyncInterval.value);
+        saveAutoSyncSettings(checked, intervalMin);
+        if (checked) {
+          // This click IS a direct user gesture, so an interactive consent
+          // popup is allowed here if needed -- establishes the session that
+          // subsequent silent background ticks can then reuse.
+          runSync(false, { auto: false });
+          startAutoSync(intervalMin);
+          weiLog(`Auto-sync enabled -- syncing every ${intervalMin} minute(s)`, 'ok');
+        } else {
+          stopAutoSync();
+          weiLog('Auto-sync disabled', 'skip');
+        }
+      },
+    });
+    // checkboxRow()'s own label only covers "Auto-sync every" -- the
+    // interval select belongs in the same row, after it.
+    autoSyncToggle.row.appendChild(autoSyncInterval);
 
-  // High-level convenience: given a classified ABUSE_REPORT_* email, pull
-  // out the transcript, the reporter's original form fields, and every
-  // Wayspot reported anywhere in the thread in one call. Thin wrapper --
-  // see parseAbuseReportThread below for the actual extraction logic,
-  // which operates on an already-parsed {conversationId, messages} rather
-  // than a single raw email, specifically so a caller with messages
-  // merged from SEVERAL emails (a long-running ticket that outgrew what
-  // any one email export contains -- see mergeAbuseReportThreads) can run
-  // the same logic on the complete picture.
-  const parseAbuseReportEmail = (email) => {
-    const plaintext = email.getBody("text/plain") || "";
-    return parseAbuseReportThread(parseHelpshiftThread(plaintext, email.getFirstHeaderValue("Date", null)));
-  };
-
-  const parseAbuseReportThread = ({ conversationId, messages }) => {
-    // The reporter's form submission isn't necessarily message[1] -- longer
-    // threads (support asking follow-up questions, the reporter replying
-    // again) can push it further down, so find it by content instead of
-    // position.
-    const reportMsg = messages.find((msg) => /Reporting Abuse in (Wayfarer|Niantic Wayspot)/i.test(msg.raw));
-    const { title, fields } = reportMsg ? extractHelpshiftFormFields(reportMsg.raw) : { title: null, fields: {} };
-
-    const issueType = fields["What issue are you reporting?"] ?? null;
-    const reportDetails = fields["Abuse report details"] ?? null;
-    const locationDetails = fields["Provide details of the location(s)"] ?? null;
-
-    // Every coordinate pair found across both fields, unfiltered/unnamed,
-    // for anyone who wants to see everything the reporter mentioned
-    // (a "corrected" location is sometimes buried in reportDetails prose --
-    // see the note on `locations` below).
-    const coordinates = extractHelpshiftCoordinates(
-      [locationDetails, reportDetails].filter(Boolean).join("\n")
-    );
-
-    // One entry per reported Wayspot, deduped by coordinate (rounded to
-    // 5dp -- ~1m -- so the same location quoted twice with slightly
-    // different trailing digits still collapses to one row). Sourced
-    // from:
-    //   1. the original form's structured locationDetails field, split
-    //      per line -- handles reports that list several Wayspots at
-    //      once, not just one.
-    //   2. every OTHER message in the thread (replies), so a Wayspot the
-    //      reporter mentions later ("I see I missed some: ...", or a
-    //      follow-up reply flagging one more) is picked up too, not just
-    //      whatever was in the original submission.
-    // Deliberately NOT scanning reportDetails/"Abuse report details" --
-    // that field is free prose, and can contain a *corrected* coordinate
-    // for the same Wayspot already listed in locationDetails rather than
-    // a distinct additional one (seen in a real ticket: "It is actually
-    // located here: <lat,lng>" a few lines after the location(s) field).
-    // Treating every number pair in there as a new location would
-    // silently invent a duplicate row with a garbage name.
-    const seen = new Set();
-    const locations = [];
-    const addLocation = (loc) => {
-      const key = `${Number(loc.latitude).toFixed(5)},${Number(loc.longitude).toFixed(5)}`;
-      if (seen.has(key)) return;
-      seen.add(key);
-      locations.push(loc);
-    };
-    extractLocationLines(locationDetails || "").forEach(addLocation);
-    // Confirmed via a real reply sent as ordinary prose (not a structured
-    // list like the original submission uses), coordinates and wording
-    // genericized here: "Thanks for taking action, but Example Park
-    // North Gate (40.316961,-74.625185) of the same type has now been
-    // added by the same user." -- word-wrapped across several lines by
-    // the mail client, same as the original submission's own soft-wrap
-    // issue (see collapseSoftWraps' own comment) but for a name+
-    // coordinate pair instead of a form field, so it needs the same
-    // treatment here before extractLocationLines gets a chance to see
-    // name and coordinate on the same line. Without it, the coordinate
-    // and the name text right before it can land on different physical
-    // lines purely because of where the mail client happened to wrap,
-    // and extractLocationLines (a per-line parser) would only ever see
-    // the coordinate's own line, with nothing before it on that line to
-    // use as a name.
-    //
-    // MAX_REPLY_LOCATION_NAME_LENGTH: unlike the original submission's
-    // structured location(s) field (short labels by construction) or a
-    // reply written as a clean "NewName (lat,lng)" list line, ordinary
-    // prose puts a whole clause or sentence before the coordinate --
-    // "Thanks for taking action, but Example Park North Gate" in the
-    // confirmed example above, once the line above reunites it with its
-    // coordinate. There's no reliable way to isolate just "Example Park
-    // North Gate" out of that without real NLP, so rather than show the
-    // whole run-on clause as if it were a clean Wayspot name, anything
-    // implausibly long for one gets treated as unnamed instead -- the
-    // coordinate itself is still real and worth keeping (same reasoning
-    // the "list" format already applies to a bare coordinate with
-    // nothing recognizable before it -- see that format's own comment
-    // above), it's specifically the NAME that's unreliable here, not the
-    // location. This is also why the name-required filter that used to
-    // gate this whole block is gone: an
-    // unnamed-but-real coordinate from a reply is exactly what this
-    // feature is for, not something to discard.
-    const MAX_REPLY_LOCATION_NAME_LENGTH = 60;
-    messages.forEach((msg) => {
-      if (msg === reportMsg) return;
-      extractLocationLines(collapseSoftWraps(stripHelpshiftMarkup(msg.raw)))
-        .map((loc) => (loc.name && loc.name.length > MAX_REPLY_LOCATION_NAME_LENGTH ? { ...loc, name: null } : loc))
-        .forEach(addLocation);
+    const gmailSection = ui.section({
+      title: 'Connect Gmail',
+      children: [clientIdInput, gmailStatusEl, progressEl, syncBtnRow, autoSyncToggle.row],
     });
 
-    // Fallback for tickets that don't match either per-line format at
-    // all: reuse the old single-best-guess logic (structured field first,
-    // then whatever coordinate turns up in reportDetails prose) so this
-    // doesn't regress on tickets the previous version already handled.
-    if (locations.length === 0) {
-      const fallbackName = extractHelpshiftLocationName(locationDetails);
-      const locationCoords = extractHelpshiftCoordinates(locationDetails || "");
-      const reportCoords = extractHelpshiftCoordinates(reportDetails || "");
-      const fallbackCoord = locationCoords[0] || reportCoords[0] || null;
-      if (fallbackCoord) locations.push({ name: fallbackName, latitude: fallbackCoord.latitude, longitude: fallbackCoord.longitude, comment: null });
-    }
+    // -- Or drop .eml files --
+    const dropzone = ui.createElement('div', { id: 'wei-dropzone', text: 'Drop .eml files here, or click to choose' });
+    const fileInput = ui.createElement('input', {
+      attrs: { type: 'file', accept: '.eml', multiple: true },
+      style: { display: 'none' },
+    });
+    dropzone.addEventListener('click', () => fileInput.click());
+    dropzone.addEventListener('dragover', (e) => { e.preventDefault(); dropzone.classList.add('drag'); });
+    dropzone.addEventListener('dragleave', () => dropzone.classList.remove('drag'));
+    dropzone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      dropzone.classList.remove('drag');
+      const files = Array.from(e.dataTransfer.files).filter((f) => f.name.toLowerCase().endsWith('.eml'));
+      if (files.length) importFiles(files);
+      else weiLog('No .eml files found in the drop', 'skip');
+    });
+    fileInput.addEventListener('change', () => {
+      const files = Array.from(fileInput.files);
+      fileInput.value = '';
+      if (files.length) importFiles(files);
+    });
+    const emlSection = ui.section({
+      title: 'Or drop .eml files',
+      children: [dropzone, fileInput],
+    });
 
-    // Back-compat single-value fields -- same meaning as before this
-    // function returned a list, kept for any existing caller that only
-    // wants "the" name/coordinate rather than all of them.
-    const locationName = locations[0] ? locations[0].name : null;
-    const primaryCoordinate = locations[0] ? { latitude: locations[0].latitude, longitude: locations[0].longitude } : null;
+    // -- Backup / maintenance --
+    const exportBtn = ui.button({
+      text: 'Export backup JSON',
+      onClick: async () => {
+        const all = await WSTStorage.getAllEmails();
+        const blob = new Blob([JSON.stringify({ exported_at: new Date().toISOString(), emails: all })], { type: 'application/json' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = `wst-email-backup-${new Date().toISOString().slice(0, 10)}.json`;
+        a.click();
+        weiLog(`Exported ${all.length} email(s) to a backup file`, 'ok');
+      },
+    });
+    const backupInput = ui.createElement('input', {
+      attrs: { type: 'file', accept: '.json,application/json' },
+      style: { display: 'none' },
+    });
+    const importBackupBtn = ui.button({ text: 'Import backup JSON', onClick: () => backupInput.click() });
+    backupInput.addEventListener('change', async () => {
+      const file = backupInput.files[0];
+      backupInput.value = '';
+      if (!file) return;
+      try {
+        const parsed = JSON.parse(await file.text());
+        const emails = Array.isArray(parsed) ? parsed : parsed.emails;
+        if (!Array.isArray(emails)) { weiLog('That file doesn\u2019t look like a valid backup', 'err'); return; }
+        const { inserted, updated } = await WSTStorage.putEmails(emails);
+        weiLog(`✓ Restored backup: ${inserted} new, ${updated} updated`, 'ok');
+        await refreshCount();
+      } catch (e) {
+        weiLog(`Could not read that backup file: ${e.message || e}`, 'err');
+      }
+    });
+    const clearBtn = ui.button({
+      text: 'Clear all stored emails',
+      variant: 'danger',
+      onClick: async () => {
+        if (!confirm('Delete every stored email from this browser? This cannot be undone (export a backup first if unsure).')) return;
+        await WSTStorage.clearAll();
+        weiLog('All stored emails cleared', 'skip');
+        await refreshCount();
+      },
+    });
+    const backupBtnRow = ui.buttonRow([exportBtn, importBackupBtn, clearBtn]);
+    const logEl = ui.createElement('div', { className: 'wei-log' });
+    const backupSection = ui.section({
+      title: 'Backup / maintenance',
+      noBorder: true,
+      children: [backupBtnRow, backupInput, logEl],
+    });
+
+    modal.body.append(countEl, gmailSection, emlSection, backupSection);
+
+    weiUI = { countEl, gmailStatusEl, progressEl, syncBtn, fullResyncBtn, logEl };
+
+    // Flush anything logged while the panel was closed (a background
+    // auto-sync tick, most likely) -- see weiLog()'s comment above.
+    for (const entry of weiPendingLog) {
+      logEl.prepend(ui.createElement('div', { className: entry.cls || '', text: entry.msg }));
+    }
+    weiPendingLog = [];
+
+    refreshCount();
+    updateGmailStatus();
 
     return {
-      conversationId,
-      title,
-      issueType,
-      reportDetails,
-      locationDetails,
-      coordinates,
-      locations,
-      locationName,
-      primaryCoordinate,
-      messages,
+      onClose() {
+        weiUI = null;
+        weiPanelController = null;
+      },
     };
-  };
+  }
 
-const TEMPLATES = [
-//  ---------------------------------------- MISCELLANEOUS ----------------------------------------
-  {
-    subject: /^Ingress Mission/,
-    type: Type.MISCELLANEOUS,
-    style: Style.INGRESS,
-    language: "en",
-  },
-  {
-    subject: /^Ingress Damage Report:/,
-    type: Type.MISCELLANEOUS,
-    style: Style.INGRESS,
-    language: "en",
-  },
-  {
-    subject: /^Help us improve Wayfarer$/,
-    type: Type.SURVEY,
-    style: Style.WAYFARER,
-    language: "en",
-  },
-  {
-    subject: /^Help us tackle Wayfarer Abuse$/,
-    type: Type.SURVEY,
-    style: Style.WAYFARER,
-    language: "en",
-  },
-  {
-    subject: /^Global Challenge Rewards$/,
-    type: Type.CHALLENGE_REWARD,
-    style: Style.WAYFARER,
-    language: "en",
-  },
-  {
-    subject: /^Your Wayspot submission for/,
-    type: Type.NOMINATION_DECIDED,
-    style: Style.LIGHTSHIP,
-    language: "en",
-  },
-  {
-    subject: /Activated on VPS$/,
-    type: Type.MISCELLANEOUS,
-    style: Style.LIGHTSHIP,
-    language: "en",
-  },
-  {
-    subject: /^Re: \[\d+\] /,
-    type: Type.MISCELLANEOUS,
-    style: Style.UNKNOWN,
-    language: "en",
-  },
-  //  ---------------------------------------- ENGLISH [en] ----------------------------------------
-  {
-    subject: /^Thanks! Niantic Spatial Wayspot nomination received for/,
-    type: Type.NOMINATION_RECEIVED,
-    style: Style.RECON,
-    language: "en",
-  },
-  {
-    subject: /^Thanks! Niantic Spatial Wayspot edit suggestion received for/,
-    type: Type.EDIT_RECEIVED,
-    style: Style.RECON,
-    language: "en",
-  },
-  {
-    subject: /^Niantic Spatial Wayspot edit suggestion decided for/,
-    type: Type.EDIT_DECIDED,
-    style: Style.RECON,
-    language: "en",
-  },
-  {
-    subject: /^Thanks! Niantic Spatial Wayspot Photo received for/,
-    type: Type.PHOTO_RECEIVED,
-    style: Style.RECON,
-    language: "en",
-  },
-  {
-    subject: /^Thanks! Niantic Spatial Wayspot location edit appeal received for/,
-    type: Type.EDIT_APPEAL_RECEIVED,
-    style: Style.RECON,
-    language: "en",
-  },
-  {
-    subject: /^Thanks! Niantic Spatial location report received for/,
-    type: Type.REPORT_RECEIVED,
-    style: Style.RECON,
-    language: "en",
-  },
-  {
-    subject: /^Niantic Spatial location report decided for/,
-    type: Type.REPORT_DECIDED,
-    style: Style.RECON,
-    language: "en",
-  },
-  {
-    subject: /^Thanks! Niantic Wayspot nomination received for/,
-    type: Type.NOMINATION_RECEIVED,
-    style: Style.WAYFARER,
-    language: "en",
-  },
-  {
-    subject: /^Niantic Wayspot nomination decided for/,
-    type: Type.NOMINATION_DECIDED,
-    style: Style.WAYFARER,
-    language: "en",
-  },
-  {
-    subject: /^Decision on your? Wayfarer Nomination,/,
-    type: Type.NOMINATION_DECIDED,
-    style: Style.WAYFARER,
-    language: "en",
-  },
-  {
-    subject: /^Thanks! Niantic Wayspot appeal received for/,
-    type: Type.NOMINATION_APPEAL_RECEIVED,
-    style: Style.WAYFARER,
-    language: "en",
-  },
-  {
-    subject: /^Your Niantic Wayspot appeal has been decided for/,
-    type: Type.NOMINATION_APPEAL_DECIDED,
-    style: Style.WAYFARER,
-    language: "en",
-  },
-  {
-    subject: /^Thanks! Niantic Wayspot (location|title|description) edit {2}appeal received for/,
-    type: Type.EDIT_APPEAL_RECEIVED,
-    style: Style.WAYFARER,
-    language: "en",
-  },
-  {
-    subject: /^Your Niantic Wayspot (location|title|description) edit appeal has been decided for/,
-    type: Type.EDIT_APPEAL_DECIDED,
-    style: Style.WAYFARER,
-    language: "en",
-  },
-  {
-    subject: /^Portal submission confirmation:/,
-    type: Type.NOMINATION_RECEIVED,
-    style: Style.INGRESS,
-    language: "en",
-  },
-  {
-    subject: /^Portal review complete:/,
-    type: Type.NOMINATION_DECIDED,
-    style: Style.INGRESS,
-    language: "en",
-  },
-  {
-    subject: /^Ingress Portal Submitted:/,
-    type: Type.NOMINATION_RECEIVED,
-    style: Style.REDACTED,
-    language: "en",
-  },
-  {
-    subject: /^Ingress Portal Duplicate:/,
-    type: Type.NOMINATION_DECIDED,
-    style: Style.REDACTED,
-    language: "en",
-  },
-  {
-    subject: /^Ingress Portal Live:/,
-    type: Type.NOMINATION_DECIDED,
-    style: Style.REDACTED,
-    language: "en",
-  },
-  {
-    subject: /^Ingress Portal Rejected:/,
-    type: Type.NOMINATION_DECIDED,
-    style: Style.REDACTED,
-    language: "en",
-  },
-  {
-    subject: /^Trainer [^:]+: Thank You for Nominating a PokéStop for Review.$/,
-    type: Type.NOMINATION_RECEIVED,
-    style: Style.POKEMON_GO,
-    language: "en",
-  },
-  {
-    subject: /^Trainer [^:]+: Your PokéStop Nomination Is Eligible!$/,
-    type: Type.NOMINATION_DECIDED,
-    style: Style.POKEMON_GO,
-    language: "en",
-  },
-  {
-    subject: /^Trainer [^:]+: Your PokéStop Nomination Is Ineligible$/,
-    type: Type.NOMINATION_DECIDED,
-    style: Style.POKEMON_GO,
-    language: "en",
-  },
-  {
-    subject: /^Trainer [^:]+: Your PokéStop Nomination Review Is Complete:/,
-    type: Type.NOMINATION_DECIDED,
-    style: Style.POKEMON_GO,
-    language: "en",
-  },
-  {
-    subject: /^Photo Submission Received$/,
-    type: Type.PHOTO_RECEIVED,
-    style: Style.POKEMON_GO,
-    language: "en",
-  },
-  {
-    subject: /^Photo Submission (Accepted|Rejected)$/,
-    type: Type.PHOTO_DECIDED,
-    style: Style.POKEMON_GO,
-    language: "en",
-  },
-  {
-    subject: /^Edit Suggestion Received$/,
-    type: Type.EDIT_RECEIVED,
-    style: Style.POKEMON_GO,
-    language: "en",
-  },
-  {
-    subject: /^Edit Suggestion (Accepted|Rejected)$/,
-    type: Type.EDIT_DECIDED,
-    style: Style.POKEMON_GO,
-    language: "en",
-  },
-  {
-    subject: /^Invalid Pokéstop\/Gym Report Received$/,
-    type: Type.REPORT_RECEIVED,
-    style: Style.POKEMON_GO,
-    language: "en",
-  },
-  {
-    subject: /^Invalid Pokéstop\/Gym Report (Accepted|Rejected)$/,
-    type: Type.REPORT_DECIDED,
-    style: Style.POKEMON_GO,
-    language: "en",
-  },
-  {
-    subject: /^Thanks! Niantic Wayspot Photo received for/,
-    type: Type.PHOTO_RECEIVED,
-    style: Style.WAYFARER,
-    language: "en",
-  },
-  {
-    subject: /^Niantic Wayspot media submission decided for/,
-    type: Type.PHOTO_DECIDED,
-    style: Style.WAYFARER,
-    language: "en",
-  },
-  {
-    subject: /^Thanks! Niantic Wayspot edit suggestion received for/,
-    type: Type.EDIT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "en",
-  },
-  {
-    subject: /^Niantic Wayspot edit suggestion decided for/,
-    type: Type.EDIT_DECIDED,
-    style: Style.WAYFARER,
-    language: "en",
-  },
-  {
-    subject: /^Thanks! Niantic (Wayspot|location) report received for/,
-    type: Type.REPORT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "en",
-  },
-  {
-    subject: /^Niantic (Wayspot|location) report decided for/,
-    type: Type.REPORT_DECIDED,
-    style: Style.WAYFARER,
-    language: "en",
-  },
-  {
-    subject: /^Portal photo submission confirmation/,
-    type: Type.PHOTO_RECEIVED,
-    style: Style.INGRESS,
-    language: "en",
-  },
-  {
-    subject: /^Portal photo review complete/,
-    type: Type.PHOTO_DECIDED,
-    style: Style.INGRESS,
-    language: "en",
-  },
-  {
-    subject: /^Portal Edit Suggestion Received$/,
-    type: Type.EDIT_RECEIVED,
-    style: Style.INGRESS,
-    language: "en",
-  },
-  {
-    subject: /^Portal edit submission confirmation/,
-    type: Type.EDIT_RECEIVED,
-    style: Style.REDACTED,
-    language: "en",
-  },
-  {
-    subject: /^Portal edit review complete/,
-    type: Type.EDIT_DECIDED,
-    style: Style.INGRESS,
-    language: "en",
-  },
-  {
-    subject: /^Invalid Ingress Portal report received$/,
-    type: Type.REPORT_RECEIVED,
-    style: Style.INGRESS,
-    language: "en",
-  },
-  {
-    subject: /^Invalid Ingress Portal report reviewed$/,
-    type: Type.REPORT_DECIDED,
-    style: Style.INGRESS,
-    language: "en",
-  },
-  //  ---------------------------------------- BENGALI [bn] ----------------------------------------
-  {
-    subject: /^ধন্যবাদ! .*-এর জন্য Niantic Wayspot মনোনয়ন পাওয়া গেছে!/,
-    type: Type.NOMINATION_RECEIVED,
-    style: Style.WAYFARER,
-    language: "bn",
-  },
-  {
-    subject: /-এর জন্য Niantic Wayspot মনোনয়নের সিদ্ধান্ত নেওয়া হয়েছে/,
-    type: Type.NOMINATION_DECIDED,
-    style: Style.WAYFARER,
-    language: "bn",
-  },
-  {
-    subject: /^ধন্যবাদ! .*( |-)এর জন্য Niantic Wayspot Photo পাওয়া গিয়েছে!$/,
-    type: Type.PHOTO_RECEIVED,
-    style: Style.WAYFARER,
-    language: "bn",
-  },
-  {
-    subject: /-এর জন্য Niantic Wayspot মিডিয়া জমা দেওয়ার সিদ্ধান্ত নেওয়া হয়েছে$/,
-    type: Type.PHOTO_DECIDED,
-    style: Style.WAYFARER,
-    language: "bn",
-  },
-  {
-    subject: /^ধন্যবাদ! .*( |-)এর জন্য Niantic Wayspot সম্পাদনা করার পরামর্শ পাওয়া গেছে!$/,
-    type: Type.EDIT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "bn",
-  },
-  {
-    subject: /-এর জন্য Niantic Wayspot সম্পাদনায় পরামর্শের সিদ্ধান্ত নেওয়া হয়েছে$/,
-    type: Type.EDIT_DECIDED,
-    style: Style.WAYFARER,
-    language: "bn",
-  },
-  {
-    subject: /^ধন্যবাদ! .*( |-)এর জন্য Niantic Wayspot রিপোর্ট পাওয়া গেছে!$/,
-    type: Type.REPORT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "bn",
-  },
-  {
-    subject: /^Niantic Wayspot রিপোর্ট .*-এর জন্য সিদ্ধান্ত নেওয়া হয়েছে$/,
-    type: Type.REPORT_DECIDED,
-    style: Style.WAYFARER,
-    language: "bn",
-  },
-  //  ---------------------------------------- CZECH [cs] ----------------------------------------
-  {
-    subject: /^Děkujeme! Přijali jsme nominaci na Niantic Wayspot pro/,
-    type: Type.NOMINATION_RECEIVED,
-    style: Style.WAYFARER,
-    language: "cs",
-  },
-  {
-    subject: /^Rozhodnutí o nominaci na Niantic Wayspot pro/,
-    type: Type.NOMINATION_DECIDED,
-    style: Style.WAYFARER,
-    language: "cs",
-  },
-  {
-    subject: /^Děkujeme! Přijali jsme odvolání proti odmítnutí Niantic Wayspotu/,
-    type: Type.NOMINATION_APPEAL_RECEIVED,
-    style: Style.WAYFARER,
-    language: "cs",
-  },
-  {
-    subject: /^Rozhodnutí o odvolání proti nominaci na Niantic Wayspot pro/,
-    type: Type.NOMINATION_APPEAL_DECIDED,
-    style: Style.WAYFARER,
-    language: "cs",
-  },
-  {
-    subject: /^Děkujeme! Přijali jsme Photo pro Niantic Wayspot/,
-    type: Type.PHOTO_RECEIVED,
-    style: Style.WAYFARER,
-    language: "cs",
-  },
-  {
-    subject: /^Rozhodnutí o odeslání obrázku Niantic Wayspotu/,
-    type: Type.PHOTO_DECIDED,
-    style: Style.WAYFARER,
-    language: "cs",
-  },
-  {
-    subject: /^Děkujeme! Přijali jsme návrh na úpravu Niantic Wayspotu pro/,
-    type: Type.EDIT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "cs",
-  },
-  {
-    subject: /^Rozhodnutí o návrhu úpravy Niantic Wayspotu pro/,
-    type: Type.EDIT_DECIDED,
-    style: Style.WAYFARER,
-    language: "cs",
-  },
-  {
-    subject: /^Děkujeme! Přijali jsme hlášení ohledně Niantic Wayspotu/,
-    type: Type.REPORT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "cs",
-  },
-  {
-    subject: /^Rozhodnutí o hlášení v souvislosti s Niantic Wayspotem/,
-    type: Type.REPORT_DECIDED,
-    style: Style.WAYFARER,
-    language: "cs",
-  },
-  //  ---------------------------------------- GERMAN [de] ----------------------------------------
-  {
-    subject: /^Danke! Wir haben deinen Vorschlag für den Wayspot/,
-    type: Type.NOMINATION_RECEIVED,
-    style: Style.WAYFARER,
-    language: "de",
-  },
-  {
-    subject: /^Entscheidung zum Wayspot-Vorschlag/,
-    type: Type.NOMINATION_DECIDED,
-    style: Style.WAYFARER,
-    language: "de",
-  },
-  {
-    subject: /^Danke! Wir haben deinen Einspruch für den Wayspot/,
-    type: Type.NOMINATION_APPEAL_RECEIVED,
-    style: Style.WAYFARER,
-    language: "de",
-  },
-  {
-    subject: /^Entscheidung zum Einspruch für den Wayspot/,
-    type: Type.NOMINATION_APPEAL_DECIDED,
-    style: Style.WAYFARER,
-    language: "de",
-  },
-  {
-    subject: /^Empfangsbestätigung deines eingereichten Portalvorschlags:/,
-    type: Type.NOMINATION_RECEIVED,
-    style: Style.INGRESS,
-    language: "de",
-  },
-  {
-    subject: /^Überprüfung des Portals abgeschlossen:/,
-    type: Type.NOMINATION_DECIDED,
-    style: Style.INGRESS,
-    language: "de",
-  },
-  {
-    subject: /^Trainer [^:]+: Danke, dass du einen PokéStop zur Überprüfung vorgeschlagen hast$/,
-    type: Type.NOMINATION_RECEIVED,
-    style: Style.POKEMON_GO,
-    language: "de",
-  },
-  {
-    subject: /^Trainer [^:]+: Dein vorgeschlagener PokéStop ist (zulässig!|nicht zulässig)$/,
-    type: Type.NOMINATION_DECIDED,
-    style: Style.POKEMON_GO,
-    language: "de",
-  },
-  {
-    subject: /^Trainer [^:]+: Die Prüfung deines PokéStop-Vorschlags wurde abgeschlossen:/,
-    type: Type.NOMINATION_DECIDED,
-    style: Style.POKEMON_GO,
-    language: "de",
-  },
-  {
-    subject: /^Fotovorschlag erhalten$/,
-    type: Type.PHOTO_RECEIVED,
-    style: Style.POKEMON_GO,
-    language: "de",
-  },
-  {
-    subject: /^Fotovorschlag (akzeptiert|abgelehnt)$/,
-    type: Type.PHOTO_DECIDED,
-    style: Style.POKEMON_GO,
-    language: "de",
-  },
-  {
-    subject: /^Vorschlag für Bearbeitung erhalten$/,
-    type: Type.EDIT_RECEIVED,
-    style: Style.POKEMON_GO,
-    language: "de",
-  },
-  {
-    subject: /^Vorschlag für Bearbeitung (akzeptiert|abgelehnt)$/,
-    type: Type.EDIT_DECIDED,
-    style: Style.POKEMON_GO,
-    language: "de",
-  },
-  {
-    subject: /^Meldung zu unzulässigen PokéStop\/Arena erhalten$/,
-    type: Type.REPORT_RECEIVED,
-    style: Style.POKEMON_GO,
-    language: "de",
-  },
-  {
-    subject: /^Meldung zu unzulässigen PokéStop\/Arena (akzeptiert|abgelehnt)$/,
-    type: Type.REPORT_DECIDED,
-    style: Style.POKEMON_GO,
-    language: "de",
-  },
-  {
-    subject: /^Danke! Wir haben den Upload Photo für den Wayspot/,
-    type: Type.PHOTO_RECEIVED,
-    style: Style.WAYFARER,
-    language: "de",
-  },
-  {
-    subject: /^Entscheidung zu deinem Upload für den Wayspot/,
-    type: Type.PHOTO_DECIDED,
-    style: Style.WAYFARER,
-    language: "de",
-  },
-  {
-    subject: /^Danke! Wir haben deinen Änderungsvorschlag für den Wayspot/,
-    type: Type.EDIT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "de",
-  },
-  {
-    subject: /^Entscheidung zu deinem Änderungsvorschlag für den Wayspot/,
-    type: Type.EDIT_DECIDED,
-    style: Style.WAYFARER,
-    language: "de",
-  },
-  {
-    subject: /^Danke! Wir haben deine Meldung für den Wayspot/,
-    type: Type.REPORT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "de",
-  },
-  {
-    subject: /^Entscheidung zu deiner Meldung für den Wayspot/,
-    type: Type.REPORT_DECIDED,
-    style: Style.WAYFARER,
-    language: "de",
-  },
-  {
-    subject: /^Portalfotovorschlag erhalten/,
-    type: Type.PHOTO_RECEIVED,
-    style: Style.INGRESS,
-    language: "de",
-  },
-  {
-    subject: /^Überprüfung des Portalfotos abgeschlossen/,
-    type: Type.PHOTO_DECIDED,
-    style: Style.INGRESS,
-    language: "de",
-  },
-  {
-    subject: /^Vorschlag für die Änderung eines Portals erhalten/,
-    type: Type.EDIT_RECEIVED,
-    style: Style.INGRESS,
-    language: "de",
-  },
-  {
-    subject: /^Überprüfung des Vorschlags zur Änderung eines Portals abgeschlossen/,
-    type: Type.EDIT_DECIDED,
-    style: Style.INGRESS,
-    language: "de",
-  },
-  {
-    subject: /^Meldung zu ungültigem Ingress-Portal erhalten$/,
-    type: Type.REPORT_RECEIVED,
-    style: Style.INGRESS,
-    language: "de",
-  },
-  {
-    subject: /^Meldung zu ungültigem Ingress-Portal geprüft$/,
-    type: Type.REPORT_DECIDED,
-    style: Style.INGRESS,
-    language: "de",
-  },
-  //  ---------------------------------------- SPANISH [es] ----------------------------------------
-  {
-    subject: /^¡Gracias! ¡Hemos recibido la propuesta de Wayspot de Niantic/,
-    type: Type.NOMINATION_RECEIVED,
-    style: Style.WAYFARER,
-    language: "es",
-  },
-  {
-    subject: /^Decisión tomada sobre la propuesta de Wayspot de Niantic/,
-    type: Type.NOMINATION_DECIDED,
-    style: Style.WAYFARER,
-    language: "es",
-  },
-  {
-    subject: /^¡Gracias! ¡Recurso de Wayspot de Niantic recibido para/,
-    type: Type.NOMINATION_APPEAL_RECEIVED,
-    style: Style.WAYFARER,
-    language: "es",
-  },
-  {
-    subject: /^¡Gracias! ¡Hemos recibido el Photo del Wayspot de Niantic para/,
-    type: Type.PHOTO_RECEIVED,
-    style: Style.WAYFARER,
-    language: "es",
-  },
-  {
-    subject: /^Decisión tomada sobre el envío de archivo de Wayspot de Niantic para/,
-    type: Type.PHOTO_DECIDED,
-    style: Style.WAYFARER,
-    language: "es",
-  },
-  {
-    subject: /^¡Gracias! ¡Propuesta de modificación de Wayspot de Niantic recibida para/,
-    type: Type.EDIT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "es",
-  },
-  {
-    subject: /^Decisión tomada sobre la propuesta de modificación del Wayspot de Niantic/,
-    type: Type.EDIT_DECIDED,
-    style: Style.WAYFARER,
-    language: "es",
-  },
-  {
-    subject: /^¡Gracias! ¡Hemos recibido el informe sobre el Wayspot de Niantic/,
-    type: Type.REPORT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "es",
-  },
-  {
-    subject: /^Decisión tomada sobre el Wayspot de Niantic/,
-    type: Type.REPORT_DECIDED,
-    style: Style.WAYFARER,
-    language: "es",
-  },
-  //  ---------------------------------------- FRENCH [fr] ----------------------------------------
-  {
-    subject: /^Remerciements ! Proposition d’un Wayspot Niantic reçue pour/,
-    type: Type.NOMINATION_RECEIVED,
-    style: Style.WAYFARER,
-    language: "fr",
-  },
-  {
-    subject: /^Résultat concernant la proposition du Wayspot Niantic/,
-    type: Type.NOMINATION_DECIDED,
-    style: Style.WAYFARER,
-    language: "fr",
-  },
-  {
-    subject: /^Remerciements ! Contribution de Wayspot Niantic Photo reçue pour/,
-    type: Type.PHOTO_RECEIVED,
-    style: Style.WAYFARER,
-    language: "fr",
-  },
-  {
-    subject: /^Résultat concernant le Wayspot Niantic/,
-    type: Type.PHOTO_DECIDED,
-    style: Style.WAYFARER,
-    language: "fr",
-  },
-  {
-    subject: /^Remerciements ! Proposition de modification de Wayspot Niantic reçue pour/,
-    type: Type.EDIT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "fr",
-  },
-  {
-    subject: /^Résultat concernant la modification du Wayspot Niantic/,
-    type: Type.EDIT_DECIDED,
-    style: Style.WAYFARER,
-    language: "fr",
-  },
-  {
-    subject: /^Remerciements ! Signalement reçu pour le Wayspot/,
-    type: Type.REPORT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "fr",
-  },
-  {
-    subject: /^Résultat concernant le signalement du Wayspot Niantic/,
-    type: Type.REPORT_DECIDED,
-    style: Style.WAYFARER,
-    language: "fr",
-  },
-  //  ---------------------------------------- HINDI [hi] ----------------------------------------
-  {
-    subject: /^धन्यवाद! .* के लिए Niantic Wayspot नामांकन प्राप्त हुआ!$/,
-    type: Type.NOMINATION_RECEIVED,
-    style: Style.WAYFARER,
-    language: "hi",
-  },
-  {
-    subject: /^Niantic Wayspot का नामांकन .* के लिए तय किया गया$/,
-    type: Type.NOMINATION_DECIDED,
-    style: Style.WAYFARER,
-    language: "hi",
-  },
-  {
-    subject: /के लिए तह Niantic Wayspot मीडिया सबमिशन$/,
-    type: Type.PHOTO_DECIDED,
-    style: Style.WAYFARER,
-    language: "hi",
-  },
-  {
-    subject: /^धन्यवाद! .* के लिए Niantic Wayspot Photo प्राप्त हुआ!$/,
-    type: Type.PHOTO_RECEIVED,
-    style: Style.WAYFARER,
-    language: "hi",
-  },
-  {
-    subject: /^धन्यवाद! .* के लिए Niantic Wayspot संपादन सुझाव प्राप्त हुआ!$/,
-    disambiguate: (email) => {
-      const doc = email.getDocument();
-      const title = doc?.querySelector("td.em_pbottom.em_blue.em_font_20")?.textContent.trim();
-      if (title == "बढ़िया खोज की! आपके वेस्पॉट Photo सबमिशन के लिए धन्यवाद!") {
-        return {
-          type: Type.PHOTO_RECEIVED,
-          style: Style.WAYFARER,
-          language: "hi",
-        };
-      } else if (title?.includes("आपके संपादन हमारे खोजकर्ताओं के समुदाय के लिए सर्वोत्तम संभव अनुभव बनाए रखने में मदद करते हैं।")) {
-        return {
-          type: Type.EDIT_RECEIVED,
-          style: Style.WAYFARER,
-          language: "hi",
-        };
-      } else {
-        return null;
-      }
-    },
-  },
-  {
-    subject: /के लिए Niantic Wayspot संपादन सुझाव प्राप्त हुआ$/,
-    type: Type.EDIT_DECIDED,
-    style: Style.WAYFARER,
-    language: "hi",
-  },
-  {
-    subject: /^धन्यवाद! .* के लिए प्राप्त Niantic Wayspot रिपोर्ट!$/,
-    type: Type.REPORT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "hi",
-  },
-  {
-    subject: /के लिए तय Niantic Wayspot रिपोर्ट$/,
-    type: Type.REPORT_DECIDED,
-    style: Style.WAYFARER,
-    language: "hi",
-  },
-  //  ---------------------------------------- ITALIAN [it] ----------------------------------------
-  {
-    subject: /^Grazie! Abbiamo ricevuto una candidatura di Niantic Wayspot per/,
-    type: Type.NOMINATION_RECEIVED,
-    style: Style.WAYFARER,
-    language: "it",
-  },
-  {
-    subject: /^Proposta di Niantic Wayspot decisa per/,
-    type: Type.NOMINATION_DECIDED,
-    style: Style.WAYFARER,
-    language: "it",
-  },
-  {
-    subject: /^Grazie! Abbiamo ricevuto Photo di Niantic Wayspot per/,
-    type: Type.PHOTO_RECEIVED,
-    style: Style.WAYFARER,
-    language: "it",
-  },
-  {
-    subject: /^Proposta di contenuti multimediali di Niantic Wayspot decisa per/,
-    type: Type.PHOTO_DECIDED,
-    style: Style.WAYFARER,
-    language: "it",
-  },
-  {
-    subject: /^Grazie! Abbiamo ricevuto il suggerimento di modifica di Niantic Wayspot per/,
-    type: Type.EDIT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "it",
-  },
-  {
-    subject: /^Suggerimento di modifica di Niantic Wayspot deciso per/,
-    type: Type.EDIT_DECIDED,
-    style: Style.WAYFARER,
-    language: "it",
-  },
-  {
-    subject: /^Grazie! Abbiamo ricevuto la segnalazione di Niantic Wayspot per/,
-    type: Type.REPORT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "it",
-  },
-  {
-    subject: /^Segnalazione di Niantic Wayspot decisa per/,
-    type: Type.REPORT_DECIDED,
-    style: Style.WAYFARER,
-    language: "it",
-  },
-  //  ---------------------------------------- JAPANESE [ja] ----------------------------------------
-  {
-    subject: /^ありがとうございます。 Niantic Wayspotの申請「.*」が受領されました。$/,
-    type: Type.NOMINATION_RECEIVED,
-    style: Style.WAYFARER,
-    language: "ja",
-  },
-  {
-    subject: /^Niantic Wayspotの申請「.*」が決定しました。$/,
-    type: Type.NOMINATION_DECIDED,
-    style: Style.WAYFARER,
-    language: "ja",
-  },
-  {
-    subject: /^ありがとうございます。 Niantic Wayspotに関する申し立て「.*」が受領されました。$/,
-    type: Type.NOMINATION_APPEAL_RECEIVED,
-    style: Style.WAYFARER,
-    language: "ja",
-  },
-  {
-    subject: /^Niantic Wayspot「.*」に関する申し立てが決定しました。$/,
-    type: Type.NOMINATION_APPEAL_DECIDED,
-    style: Style.WAYFARER,
-    language: "ja",
-  },
-  {
-    subject: /^ありがとうございます。 Niantic Wayspot Photo「.*」が受領されました。$/,
-    type: Type.PHOTO_RECEIVED,
-    style: Style.WAYFARER,
-    language: "ja",
-  },
-  {
-    subject: /^Niantic Wayspotのメディア申請「.*」が決定しました。$/,
-    type: Type.PHOTO_DECIDED,
-    style: Style.WAYFARER,
-    language: "ja",
-  },
-  {
-    subject: /^ありがとうございます。 Niantic Wayspot「.*」の編集提案が受領されました。$/,
-    type: Type.EDIT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "ja",
-  },
-  {
-    subject: /^Niantic Wayspotの編集提案「.*」が決定しました。$/,
-    type: Type.EDIT_DECIDED,
-    style: Style.WAYFARER,
-    language: "ja",
-  },
-  {
-    subject: /^ありがとうございます。 Niantic Wayspotに関する報告「.*」が受領されました。$/,
-    type: Type.REPORT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "ja",
-  },
-  {
-    subject: /^Niantic Wayspotの報告「.*」が決定しました$/,
-    type: Type.REPORT_DECIDED,
-    style: Style.WAYFARER,
-    language: "ja",
-  },
-  //  ---------------------------------------- KOREAN [ko] ----------------------------------------
-  {
-    subject: /^감사합니다! .*에 대한 Niantic Wayspot 후보 신청이 완료되었습니다!$/,
-    type: Type.NOMINATION_RECEIVED,
-    style: Style.WAYFARER,
-    language: "ko",
-  },
-  {
-    subject: /에 대한 Niantic Wayspot 후보 결정이 완료됨$/,
-    type: Type.NOMINATION_DECIDED,
-    style: Style.WAYFARER,
-    language: "ko",
-  },
-  {
-    subject: /^감사합니다! .*에 대한 Niantic Wayspot Photo 제출 완료$/,
-    type: Type.PHOTO_RECEIVED,
-    style: Style.WAYFARER,
-    language: "ko",
-  },
-  {
-    subject: /에 대한 Niantic Wayspot 미디어 제안 결정 완료$/,
-    type: Type.PHOTO_DECIDED,
-    style: Style.WAYFARER,
-    language: "ko",
-  },
-  {
-    subject: /^감사합니다! .*에 대한 Niantic Wayspot 수정이 제안되었습니다!$/,
-    type: Type.EDIT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "ko",
-  },
-  {
-    subject: /에 대한 Niantic Wayspot 수정 제안 결정 완료$/,
-    type: Type.EDIT_DECIDED,
-    style: Style.WAYFARER,
-    language: "ko",
-  },
-  {
-    subject: /^감사합니다! .*에 대한 Niantic Wayspot 보고 접수$/,
-    type: Type.REPORT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "ko",
-  },
-  {
-    subject: /에 대한 Niantic Wayspot 보고 결정 완료$/,
-    type: Type.REPORT_DECIDED,
-    style: Style.WAYFARER,
-    language: "ko",
-  },
-  //  ---------------------------------------- MARATHI [mr] ----------------------------------------
-  {
-    subject: /^धन्यवाद! Niantic वेस्पॉट नामांकन .* साठी प्राप्त झाले!$/,
-    type: Type.NOMINATION_RECEIVED,
-    style: Style.WAYFARER,
-    language: "mr",
-  },
-  {
-    subject: /^Niantic वेस्पॉट नामांकन .* साठी निश्चित केले$/,
-    type: Type.NOMINATION_DECIDED,
-    style: Style.WAYFARER,
-    language: "mr",
-  },
-  {
-    subject: /^धन्यवाद! Niantic वेस्पॉट आवाहन .* साठी प्राप्त झाले!$/,
-    type: Type.NOMINATION_APPEAL_RECEIVED,
-    style: Style.WAYFARER,
-    language: "mr",
-  },
-  {
-    subject: /^तुमचे Niantic वेस्पॉट आवाहन .* साठी निश्चित करण्यात आले आहे$/,
-    type: Type.NOMINATION_APPEAL_DECIDED,
-    style: Style.WAYFARER,
-    language: "mr",
-  },
-  {
-    subject: /^धन्यवाद! .* साठी Niantic वेस्पॉट Photo प्राप्त झाले!$/,
-    type: Type.PHOTO_RECEIVED,
-    style: Style.WAYFARER,
-    language: "mr",
-  },
-  {
-    subject: /साठी Niantic वेस्पॉट मीडिया सबमिशनचा निर्णय घेतला$/,
-    type: Type.PHOTO_DECIDED,
-    style: Style.WAYFARER,
-    language: "mr",
-  },
-  {
-    subject: /^धन्यवाद! Niantic वेस्पॉट संपादन सूचना .* साठी प्राप्त झाली!$/,
-    type: Type.EDIT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "mr",
-  },
-  {
-    subject: /^Niantic वेस्पॉट संपादन सूचना .* साठी निश्चित केली$/,
-    type: Type.EDIT_DECIDED,
-    style: Style.WAYFARER,
-    language: "mr",
-  },
-  {
-    subject: /^धन्यवाद! .* साठी Niantic वेस्पॉट अहवाल प्राप्त झाला!$/,
-    type: Type.REPORT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "mr",
-  },
-  {
-    subject: /साठी Niantic वेस्पॉट अहवाल निश्चित केला$/,
-    type: Type.REPORT_DECIDED,
-    style: Style.WAYFARER,
-    language: "mr",
-  },
-  //  ---------------------------------------- DUTCH [nl] ----------------------------------------
-  {
-    subject: /^Bedankt! Niantic Wayspot-nominatie ontvangen voor/,
-    type: Type.NOMINATION_RECEIVED,
-    style: Style.WAYFARER,
-    language: "nl",
-  },
-  {
-    subject: /^Besluit over Niantic Wayspot-nominatie voor/,
-    type: Type.NOMINATION_DECIDED,
-    style: Style.WAYFARER,
-    language: "nl",
-  },
-  {
-    subject: /^Bedankt! Niantic Wayspot-Photo ontvangen voor/,
-    type: Type.PHOTO_RECEIVED,
-    style: Style.WAYFARER,
-    language: "nl",
-  },
-  {
-    subject: /^Besluit over Niantic Wayspot-media-inzending voor/,
-    type: Type.PHOTO_DECIDED,
-    style: Style.WAYFARER,
-    language: "nl",
-  },
-  {
-    subject: /^Bedankt! Niantic Wayspot-bewerksuggestie ontvangen voor/,
-    type: Type.EDIT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "nl",
-  },
-  {
-    subject: /^Besluit over Niantic Wayspot-bewerksuggestie voor/,
-    type: Type.EDIT_DECIDED,
-    style: Style.WAYFARER,
-    language: "nl",
-  },
-  {
-    subject: /^Bedankt! Melding van Niantic Wayspot .* ontvangen!$/,
-    type: Type.REPORT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "nl",
-  },
-  {
-    subject: /^Besluit over Niantic Wayspot-melding voor/,
-    type: Type.REPORT_DECIDED,
-    style: Style.WAYFARER,
-    language: "nl",
-  },
-  //  ---------------------------------------- NORWEGIAN [no] ----------------------------------------
-  {
-    subject: /^Takk! Vi har mottatt Niantic Wayspot-nominasjonen for/,
-    type: Type.NOMINATION_RECEIVED,
-    style: Style.WAYFARER,
-    language: "no",
-  },
-  {
-    subject: /^En avgjørelse er tatt for Niantic Wayspot-nominasjonen for/,
-    type: Type.NOMINATION_DECIDED,
-    style: Style.WAYFARER,
-    language: "no",
-  },
-  {
-    subject: /^Takk! Vi har mottatt Niantic Wayspot-klagen for/,
-    type: Type.NOMINATION_APPEAL_RECEIVED,
-    style: Style.WAYFARER,
-    language: "no",
-  },
-  {
-    subject: /^En avgjørelse er tatt for Niantic Wayspot-klagen for/,
-    type: Type.NOMINATION_APPEAL_DECIDED,
-    style: Style.WAYFARER,
-    language: "no",
-  },
-  {
-    subject: /^Takk! Vi har mottatt Photo for Niantic-Wayspot-en/,
-    type: Type.PHOTO_RECEIVED,
-    style: Style.WAYFARER,
-    language: "no",
-  },
-  {
-    subject: /^Takk! Vi har mottatt endringsforslaget for Niantic Wayspot-en/,
-    type: Type.EDIT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "no",
-  },
-  {
-    subject: /^Takk! Vi har mottatt Niantic Wayspot-rapporten for/,
-    type: Type.REPORT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "no",
-  },
-  {
-    subject: /^En avgjørelse er tatt for Niantic Wayspot-medieinnholdet som er sendt inn for/,
-    type: Type.PHOTO_DECIDED,
-    style: Style.WAYFARER,
-    language: "no",
-  },
-  {
-    subject: /^En avgjørelse er tatt for endringsforslaget for Niantic Wayspot-en/,
-    type: Type.EDIT_DECIDED,
-    style: Style.WAYFARER,
-    language: "no",
-  },
-  {
-    subject: /^En avgjørelse er tatt for Niantic Wayspot-rapporten for/,
-    type: Type.REPORT_DECIDED,
-    style: Style.WAYFARER,
-    language: "no",
-  },
-  //  ---------------------------------------- POLISH [pl] ----------------------------------------
-  {
-    subject: /^Dziękujemy! Odebrano nominację Wayspotu/,
-    type: Type.NOMINATION_RECEIVED,
-    style: Style.WAYFARER,
-    language: "pl",
-  },
-  {
-    subject: /^Podjęto decyzję na temat nominacji Wayspotu/,
-    type: Type.NOMINATION_DECIDED,
-    style: Style.WAYFARER,
-    language: "pl",
-  },
-  {
-    subject: /^Dziękujemy! Odebrano materiały Photo Wayspotu Niantic/,
-    type: Type.PHOTO_RECEIVED,
-    style: Style.WAYFARER,
-    language: "pl",
-  },
-  {
-    subject: /^Decyzja na temat zgłoszenia materiałów do Wayspotu Niantic/,
-    type: Type.PHOTO_DECIDED,
-    style: Style.WAYFARER,
-    language: "pl",
-  },
-  {
-    subject: /^Dziękujemy! Odebrano sugestię zmiany Wayspotu Niantic/,
-    type: Type.EDIT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "pl",
-  },
-  {
-    subject: /^Podjęto decyzję na temat sugestii edycji Wayspotu Niantic/,
-    type: Type.EDIT_DECIDED,
-    style: Style.WAYFARER,
-    language: "pl",
-  },
-  {
-    subject: /^Dziękujemy! Odebrano raport dotyczący Wayspotu Niantic/,
-    type: Type.REPORT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "pl",
-  },
-  {
-    subject: /^Podjęto decyzję odnośnie raportu dotyczącego Wayspotu Niantic/,
-    type: Type.REPORT_DECIDED,
-    style: Style.WAYFARER,
-    language: "pl",
-  },
-  //  ---------------------------------------- PORTUGUESE [pt] ----------------------------------------
-  {
-    subject: /^Agradecemos a sua indicação para o Niantic Wayspot/,
-    type: Type.NOMINATION_RECEIVED,
-    style: Style.WAYFARER,
-    language: "pt",
-  },
-  {
-    subject: /^Decisão sobre a indicação do Niantic Wayspot/,
-    type: Type.NOMINATION_DECIDED,
-    style: Style.WAYFARER,
-    language: "pt",
-  },
-  {
-    subject: /^Agradecemos o envio de Photo para o Niantic Wayspot/,
-    type: Type.PHOTO_RECEIVED,
-    style: Style.WAYFARER,
-    language: "pt",
-  },
-  {
-    subject: /^Decisão sobre o envio de mídia para o Niantic Wayspot/,
-    type: Type.PHOTO_DECIDED,
-    style: Style.WAYFARER,
-    language: "pt",
-  },
-  {
-    subject: /^Agradecemos a sua sugestão de edição para o Niantic Wayspot/,
-    type: Type.EDIT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "pt",
-  },
-  {
-    subject: /^Decisão sobre a sugestão de edição do Niantic Wayspot/,
-    type: Type.EDIT_DECIDED,
-    style: Style.WAYFARER,
-    language: "pt",
-  },
-  {
-    subject: /^Agradecemos o envio da denúncia referente ao Niantic Wayspot/,
-    type: Type.REPORT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "pt",
-  },
-  {
-    subject: /^Decisão sobre a denúncia referente ao Niantic Wayspot/,
-    type: Type.REPORT_DECIDED,
-    style: Style.WAYFARER,
-    language: "pt",
-  },
-  //  ---------------------------------------- RUSSIAN [ru] ----------------------------------------
-  {
-    subject: /^Спасибо! Номинация Niantic Wayspot для .* получена!$/,
-    type: Type.NOMINATION_RECEIVED,
-    style: Style.WAYFARER,
-    language: "ru",
-  },
-  {
-    subject: /^Вынесено решение по номинации Niantic Wayspot для/,
-    type: Type.NOMINATION_DECIDED,
-    style: Style.WAYFARER,
-    language: "ru",
-  },
-  {
-    subject: /^Спасибо! Получено: Photo Niantic Wayspot для/,
-    type: Type.PHOTO_RECEIVED,
-    style: Style.WAYFARER,
-    language: "ru",
-  },
-  {
-    subject: /^Вынесено решение по предложению по файлу для/,
-    type: Type.PHOTO_DECIDED,
-    style: Style.WAYFARER,
-    language: "ru",
-  },
-  {
-    subject: /^Спасибо! Предложение по изменению Niantic Wayspot для/,
-    type: Type.EDIT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "ru",
-  },
-  {
-    subject: /^Вынесено решение по предложению по изменению Niantic Wayspot для/,
-    type: Type.EDIT_DECIDED,
-    style: Style.WAYFARER,
-    language: "ru",
-  },
-  {
-    subject: /^Спасибо! Жалоба на Niantic Wayspot для/,
-    type: Type.REPORT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "ru",
-  },
-  {
-    subject: /^Вынесено решение по жалобе на Niantic Wayspot для/,
-    type: Type.REPORT_DECIDED,
-    style: Style.WAYFARER,
-    language: "ru",
-  },
-  //  ---------------------------------------- SWEDISH [sv] ----------------------------------------
-  {
-    subject: /^Tack! Niantic Wayspot-nominering har tagits emot för/,
-    type: Type.NOMINATION_RECEIVED,
-    style: Style.WAYFARER,
-    language: "sv",
-  },
-  {
-    subject: /^Niantic Wayspot-nominering har beslutats om för/,
-    type: Type.NOMINATION_DECIDED,
-    style: Style.WAYFARER,
-    language: "sv",
-  },
-  {
-    subject: /^Din Niantic Wayspot-överklagan har beslutats om för/,
-    type: Type.NOMINATION_APPEAL_DECIDED,
-    style: Style.WAYFARER,
-    language: "sv",
-  },
-  {
-    subject: /^Tack! Niantic Wayspot Photo togs emot för/,
-    type: Type.PHOTO_RECEIVED,
-    style: Style.WAYFARER,
-    language: "sv",
-  },
-  {
-    subject: /^Niantic Wayspot-medieinlämning har beslutats om för/,
-    type: Type.PHOTO_DECIDED,
-    style: Style.WAYFARER,
-    language: "sv",
-  },
-  {
-    subject: /^Tack! Niantic Wayspot-redigeringsförslag har tagits emot för/,
-    type: Type.EDIT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "sv",
-  },
-  {
-    subject: /^Niantic Wayspot-redigeringsförslag har beslutats om för/,
-    type: Type.EDIT_DECIDED,
-    style: Style.WAYFARER,
-    language: "sv",
-  },
-  {
-    subject: /^Tack! Niantic Wayspot-rapport har tagits emot för/,
-    type: Type.REPORT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "sv",
-  },
-  {
-    subject: /^Niantic Wayspot-rapport har beslutats om för/,
-    type: Type.REPORT_DECIDED,
-    style: Style.WAYFARER,
-    language: "sv",
-  },
-  //  ---------------------------------------- TAMIL [ta] ----------------------------------------
-  {
-    subject: /^நன்றி! .* -க்கான Niantic Wayspot பரிந்துரை பெறப்பட்டது!!$/,
-    type: Type.NOMINATION_RECEIVED,
-    style: Style.WAYFARER,
-    language: "ta",
-  },
-  {
-    subject: /-க்கான Niantic Wayspot பணிந்துரை பரிசீலிக்கப்பட்டது.$/,
-    type: Type.NOMINATION_DECIDED,
-    style: Style.WAYFARER,
-    language: "ta",
-  },
-  {
-    subject: /^நன்றி! .* -க்கான Niantic Wayspot Photo பெறப்பட்டது!$/,
-    type: Type.PHOTO_RECEIVED,
-    style: Style.WAYFARER,
-    language: "ta",
-  },
-  {
-    subject: /-க்கான Niantic Wayspot மீடியா சமர்ப்பிப்பு பரிசீலிக்கப்பட்டது.$/,
-    type: Type.PHOTO_DECIDED,
-    style: Style.WAYFARER,
-    language: "ta",
-  },
-  {
-    subject: /^நன்றி! .* -க்கான Niantic Wayspot திருத்த பரிந்துரை பெறப்பட்டது!$/,
-    type: Type.EDIT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "ta",
-  },
-  {
-    subject: /-க்கான Niantic Wayspot திருத்த பரிந்துரை பரிசீலிக்கப்பட்டது$/,
-    type: Type.EDIT_DECIDED,
-    style: Style.WAYFARER,
-    language: "ta",
-  },
-  {
-    subject: /^நன்றி! .* -க்கான Niantic Wayspot புகார் பெறப்பட்டது!$/,
-    type: Type.REPORT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "ta",
-  },
-  {
-    subject: /-க்கான Niantic Wayspot புகார் பரிசீலிக்கப்பட்டது!$/,
-    type: Type.REPORT_DECIDED,
-    style: Style.WAYFARER,
-    language: "ta",
-  },
-  //  ---------------------------------------- TELUGU [te] ----------------------------------------
-  {
-    subject: /^ధన్యవాదాలు! .* కు Niantic Wayspot నామినేషన్ అందుకున్నాము!$/,
-    type: Type.NOMINATION_RECEIVED,
-    style: Style.WAYFARER,
-    language: "te",
-  },
-  {
-    subject: /కొరకు Niantic వేస్పాట్ నామినేషన్‌‌పై నిర్ణయం$/,
-    type: Type.NOMINATION_DECIDED,
-    style: Style.WAYFARER,
-    language: "te",
-  },
-  {
-    subject: /^ధన్యవాదాలు! .* కొరకు Niantic Wayspot Photo అందుకున్నాము!$/,
-    type: Type.PHOTO_RECEIVED,
-    style: Style.WAYFARER,
-    language: "te",
-  },
-  {
-    subject: /కొరకు Niantic వేస్పాట్ మీడియా సమర్పణపై నిర్ణయం$/,
-    type: Type.PHOTO_DECIDED,
-    style: Style.WAYFARER,
-    language: "te",
-  },
-  {
-    subject: /^ధన్యవాదాలు! మీ వేస్పాట్ .* ఎడిట్ సూచనకై ధన్యవాదాలు!$/,
-    type: Type.EDIT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "te",
-  },
-  {
-    subject: /కొరకు నిర్ణయించబడిన Niantic వేస్పాట్ సూచన$/,
-    type: Type.EDIT_DECIDED,
-    style: Style.WAYFARER,
-    language: "te",
-  },
-  {
-    subject: /^ధన్యవాదాలు! .* కొరకు Niantic వేస్పాట్ నామినేషన్ అందుకున్నాము!$/,
-    type: Type.REPORT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "te",
-  },
-  {
-    subject: /కొరకు నిర్ణయించబడిన Niantic వేస్పాట్ రిపోర్ట్$/,
-    type: Type.REPORT_DECIDED,
-    style: Style.WAYFARER,
-    language: "te",
-  },
-  //  ---------------------------------------- THAI [th] ----------------------------------------
-  {
-    subject: /^ขอบคุณ! เราได้รับการเสนอสถานที่ Niantic Wayspot สำหรับ/,
-    type: Type.NOMINATION_RECEIVED,
-    style: Style.WAYFARER,
-    language: "th",
-  },
-  {
-    subject: /^ผลการตัดสินการเสนอสถานที่ Niantic Wayspot สำหรับ/,
-    type: Type.NOMINATION_DECIDED,
-    style: Style.WAYFARER,
-    language: "th",
-  },
-  {
-    subject: /^ขอบคุณ! ได้รับ Niantic Wayspot Photo สำหรับ/,
-    type: Type.PHOTO_RECEIVED,
-    style: Style.WAYFARER,
-    language: "th",
-  },
-  {
-    subject: /^ผลการตัดสินการส่งมีเดีย Niantic Wayspot สำหรับ/,
-    type: Type.PHOTO_DECIDED,
-    style: Style.WAYFARER,
-    language: "th",
-  },
-  {
-    subject: /^ขอบคุณ! เราได้รับคำแนะนำการแก้ไข Niantic Wayspot สำหรับ/,
-    type: Type.EDIT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "th",
-  },
-  {
-    subject: /^ผลการตัดสินคำแนะนำการแก้ไข Niantic Wayspot สำหรับ/,
-    type: Type.EDIT_DECIDED,
-    style: Style.WAYFARER,
-    language: "th",
-  },
-  {
-    subject: /^ขอบคุณ! เราได้รับการรายงาน Niantic Wayspot สำหรับ/,
-    type: Type.REPORT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "th",
-  },
-  {
-    subject: /^ผลตัดสินการรายงาน Niantic Wayspot สำหรับ/,
-    type: Type.REPORT_DECIDED,
-    style: Style.WAYFARER,
-    language: "th",
-  },
-  //  ---------------------------------------- CHINESE [zh] ----------------------------------------
-  {
-    subject: /^感謝你！ 我們已收到 Niantic Wayspot 候選/,
-    type: Type.NOMINATION_RECEIVED,
-    style: Style.WAYFARER,
-    language: "zh",
-  },
-  {
-    subject: /^社群已對 Niantic Wayspot 候選 .* 做出決定$/,
-    type: Type.NOMINATION_DECIDED,
-    style: Style.WAYFARER,
-    language: "zh",
-  },
-  {
-    subject: /^感謝你！ 我們已收到 .* 的 Niantic Wayspot Photo！$/,
-    type: Type.PHOTO_RECEIVED,
-    style: Style.WAYFARER,
-    language: "zh",
-  },
-  {
-    subject: /^社群已對你為 .* 提交的 Niantic Wayspot 媒體做出決定$/,
-    type: Type.PHOTO_DECIDED,
-    style: Style.WAYFARER,
-    language: "zh",
-  },
-  {
-    subject: /^感謝你！ 我們已收到 .* 的 Niantic Wayspot 編輯建議！$/,
-    type: Type.EDIT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "zh",
-  },
-  {
-    subject: /^社群已對 .* 的 Niantic Wayspot 編輯建議做出決定$/,
-    type: Type.EDIT_DECIDED,
-    style: Style.WAYFARER,
-    language: "zh",
-  },
-  {
-    subject: /^感謝你！ 我們已收到 .* 的 Niantic Wayspot 報告！$/,
-    type: Type.REPORT_RECEIVED,
-    style: Style.WAYFARER,
-    language: "zh",
-  },
-  {
-    subject: /^Niantic 已對 .* 的 Wayspot 報告做出決定$/,
-    type: Type.REPORT_DECIDED,
-    style: Style.WAYFARER,
-    language: "zh",
-  },
-];
+  function openPanel() {
+    if (weiPanelController) return; // already open
+    weiPanelController = wfmmWindow.WFMM.ui.openModal({
+      id: 'wei-panel',
+      title: 'Wayfarer Map Mods - Abuse Email Importer',
+      className: 'wei-dialog',
+      showFooterButtons: false,
+      ownerPluginId: PLUGIN_ID,
+      // See wae.js's own openPanel() comment -- same story here.
+      // Draggable/resizable already work automatically through
+      // openModal() once the user turns on "Make modals draggable"/"Make
+      // modals resizeable" in Base's Side Panel settings; a plugin can't
+      // force it on for just its own modal. minWidth/minHeight only
+      // matter once resizing is on.
+      desktopInteractions: { minWidth: 360, minHeight: 280 },
+      buildContent: buildPanelContent,
+    });
+  }
 
-  // -------------------------------------------------------------------------
-  // SUPPLEMENTAL TEMPLATES -- not from upstream OPR-Tools.
-  //
-  // The upstream templates.ts (ported above, unmodified) has no RECON-style
-  // (current "Spatial" era) templates for: nomination decisions, photo
-  // decisions, or Spatial-branded appeal emails. Your gmail_wayspot_export.py
-  // had already reverse-engineered these from real inbox testing, so they're
-  // carried over here rather than silently losing decision-matching for
-  // every current-era submission. Each entry below is commented with where
-  // it came from.
-  // -------------------------------------------------------------------------
-  const SUPPLEMENTAL_TEMPLATES = [
-    // Confirmed real subject (gmail_wayspot_export.py NOMINATION_DECIDED_QUERY)
-    {
-      subject: /^Niantic Spatial Wayspot nomination decided for/,
-      type: Type.NOMINATION_DECIDED,
-      style: Style.RECON,
-      language: "en",
-    },
-    // Confirmed real subject (gmail_wayspot_export.py NOMINATION_DECIDED_QUERY,
-    // note: "Decision on you Recon Nomination" -- "you" not "your", as observed)
-    {
-      subject: /^Decision on you Recon Nomination,/,
-      type: Type.NOMINATION_DECIDED,
-      style: Style.RECON,
-      language: "en",
-    },
-    // Confirmed real subject (gmail_wayspot_export.py PHOTO_DECIDED_QUERY)
-    {
-      subject: /media submission decided for/i,
-      type: Type.PHOTO_DECIDED,
-      style: Style.RECON,
-      language: "en",
-    },
-    // Confirmed real subject (gmail_wayspot_export.py APPEAL_RECEIVED_QUERY).
-    // Spatial-branded nomination/photo appeal -- which of the two it targets
-    // is only knowable from the body, so classification alone can't tell;
-    // wst-business-logic.js resolves the real target via parseAppealReceived().
-    {
-      subject: /^Thanks! Niantic Spatial Wayspot appeal received/,
-      type: Type.NOMINATION_APPEAL_RECEIVED,
-      style: Style.RECON,
-      language: "en",
-    },
-    // Confirmed real subject (gmail_wayspot_export.py APPEAL_EDIT_RECEIVED_QUERY)
-    {
-      subject: /^Thanks! Niantic Spatial Wayspot title edit appeal received for/,
-      type: Type.EDIT_APPEAL_RECEIVED,
-      style: Style.RECON,
-      language: "en",
-    },
-    // *** BEST-EFFORT / UNCONFIRMED ***
-    // gmail_wayspot_export.py's own docstring flags this as a guessed subject
-    // line -- no real example existed when it was written. Carried over
-    // as-is, same caveat applies here.
-    {
-      subject: /^Your Niantic Spatial Wayspot appeal has been decided/,
-      type: Type.NOMINATION_APPEAL_DECIDED,
-      style: Style.RECON,
-      language: "en",
-    },
-    // Confirmed real subjects (Dutch legacy Wayfarer) -- found via a real
-    // user inbox. Upstream's Dutch templates cover received/decided for
-    // nominations/photos/edits/reports, but have no appeal templates at
-    // all, and the one Dutch NOMINATION_DECIDED template upstream does have
-    // ("Besluit over Niantic Wayspot-nominatie voor...") doesn't match this
-    // wording -- these appear to be a different/older subject-line
-    // generation than what upstream's template was modeled on.
-    {
-      subject: /^Beslissing over je Wayfarer-nominatie,/,
-      type: Type.NOMINATION_DECIDED,
-      style: Style.WAYFARER,
-      language: "nl",
-    },
-    {
-      subject: /^Bedankt! Niantic Wayspot-bezwaar ontvangen voor/,
-      type: Type.NOMINATION_APPEAL_RECEIVED,
-      style: Style.WAYFARER,
-      language: "nl",
-    },
-    {
-      subject: /^Niantic heeft een besluit genomen over je bezwaar voor/,
-      type: Type.NOMINATION_APPEAL_DECIDED,
-      style: Style.WAYFARER,
-      language: "nl",
-    },
-  ];
+  function closePanel() {
+    weiPanelController?.close();
+  }
 
-  TEMPLATES.push(...SUPPLEMENTAL_TEMPLATES);
+  function togglePanel() {
+    if (weiPanelController) closePanel();
+    else openPanel();
+  }
 
-  // -------------------------------------------------------------------------
-  // HELPSHIFT TEMPLATES -- non-upstream, see the "helpshift.ts" section
-  // above. Confirmed real subject: "Re: [43118150] Reporting Abuse in
-  // Wayfarer" (Niantic Support's auto-acknowledgement reply). The
-  // no-"Re:"-prefix case (presumably the original ticket-opened email) is
-  // *** UNCONFIRMED *** -- included on the assumption Helpshift reuses the
-  // same subject minus "Re: " for the first message, but no real example
-  // was available to check this against.
-  //
-  // This must be checked *before* the upstream catch-all
-  // /^Re: \[\d+\] / -> MISCELLANEOUS/UNKNOWN rule a few hundred lines up,
-  // which would otherwise swallow every reply in this thread first (array
-  // order is match-priority order in classify()). Prepending via unshift
-  // -- rather than TEMPLATES.push(), like SUPPLEMENTAL_TEMPLATES above --
-  // guarantees that regardless of where in the upstream-ported array a
-  // future addition might slot in.
-  // -------------------------------------------------------------------------
-  // Niantic Support closes an abuse-report ticket with one of three
-  // canned replies -- confirmed real text for all three:
-  //   ACTIONED: "We have reviewed the report and have taken action
-  //     on the Wayspots in accordance with our policies."
-  //   PENDING: "Thank you for your patience as your report is being
-  //     looked into. We will follow up once we have reviewed the
-  //     reported Wayspots."
-  //   DENIED: "We took another look at the Wayspot in question and
-  //     decided that it does not meet our criteria for removal at
-  //     this time."
-  // Matched against whitespace-normalized text (a canned phrase can
-  // be word-wrapped across lines in the raw email) so wrapping
-  // doesn't break the match. This replaces an earlier *** BEST-
-  // EFFORT / UNCONFIRMED *** version that guessed generic support-
-  // ticket vocabulary ("resolved", "closing this ticket", etc.)
-  // because no real resolved/closed example was available when it
-  // was written -- keep that history in mind if a *fourth* canned
-  // reply ever turns up that doesn't match any of these three.
-  //
-  // Takes a `messages` array directly (newest-first -- see
-  // parseHelpshiftThread) rather than an Email, so it works the same way
-  // whether `messages` came from a single email's own thread or several
-  // emails merged together (see mergeAbuseReportThreads) -- a
-  // long-running ticket's true newest message might live in a LATER
-  // email export than whichever one happens to be classified, so status
-  // needs to be computed from the merged view too, not just one email.
-  const classifyAbuseReportStatus = (messages) => {
-    if (!messages.length) return null;
+  // ---------------------------------------------------------------------
+  // Map Mods - Base integration -- confirmed against the real base script
+  // (v3.15.0) you shared. See the v4 CHANGES note at the top for the full
+  // explanation; short version: Base has no formal plugin-registration
+  // hook, just two DOM "bridge" elements it watches with a
+  // MutationObserver. This script doesn't have POI/coordinate data of its
+  // own to push, so it exposes a small public API for the future
+  // extraction plugin to use instead of re-deriving/reimplementing this.
+  // ---------------------------------------------------------------------
+  function isMapModsBaseActive() {
+    // v4.0.0 of the consolidated wayfarer-map-mods.user.js suite removed
+    // the #wfmapmods-poi-bridge/#wfmapmods-submit-bridge DOM elements this
+    // used to check for entirely (confirmed against its real source --
+    // zero matches for either id; replaced internally with a private
+    // "component bridge" abstraction that isn't exposed via any stable
+    // public DOM contract). #wfmapmods-side-panel is still created the
+    // same way, so that's the reliable "is Base loaded and running here"
+    // signal now -- the same element this script's own settings-link
+    // watcher already depends on.
+    return !!document.getElementById('wfmapmods-side-panel');
+  }
 
-    // Confirmed real example: the transcript lists the newest message
-    // FIRST (standard quoted-reply convention -- newest on top, older
-    // context quoted below), not chronologically. In the one confirmed
-    // sample this is "Niantic Support"'s immediate auto-acknowledgement,
-    // with the reporter's own original form submission quoted below it
-    // at the same timestamp.
-    const newest = messages[0];
-    const newestText = stripHelpshiftMarkup(newest.raw).toLowerCase();
-    // NOT author.includes("niantic support") -- that only matches the
-    // automated acknowledgement. A real human agent's reply (including
-    // the actual decision messages this exists to classify) is
-    // authored under their own name ("Jaxson", "Graham", ...), never
-    // the literal "Niantic Support" string. The reliable signal
-    // (confirmed against real tickets while tracking down the
-    // blank-author header-parsing bug elsewhere in this file) is that
-    // the REPORTER's own messages have a blank author -- Helpshift
-    // doesn't render a name for the ticket owner -- while every
-    // Niantic-side reply, bot or named human, has a non-blank one.
-    const newestIsSupport = newest.author.trim() !== "";
+  let poiBridgeWarned = false;
 
-    const isAutoAck = newestIsSupport
-      && /thank you for contacting/.test(newestText)
-      && /back to you shortly/.test(newestText);
+  // Writes a POI onto Map Mods - Base's POI bridge -- the exact payload
+  // shape its old handleBridgePoiPayload() read (confirmed against
+  // v3.15.0). That bridge no longer exists as of v4.0.0 of the
+  // consolidated suite (see isMapModsBaseActive() above) -- this is now a
+  // documented no-op rather than silently writing to a throwaway element
+  // nothing reads, which would give false confidence that something
+  // happened. Kept in place (not removed, not throwing) since it's part
+  // of window.WayfarerAbuseEmailImporter's public API and some external
+  // caller may still invoke it; warns once, not on every call. Base
+  // shows/selects a bridge-sourced POI in its own side panel when the
+  // bridge existed -- it never dropped a map marker for one regardless.
+  // The extractor script's own "Show on Map" (native google.maps.Marker,
+  // not this bridge) is the actual working map-plotting mechanism.
+  function publishPoiToMap({ guid, title, description, lat, lng, imageUrl, status, source } = {}) {
+    if (typeof lat !== 'number' || typeof lng !== 'number' || !Number.isFinite(lat) || !Number.isFinite(lng)) {
+      throw new Error('publishPoiToMap: lat/lng must be finite numbers');
+    }
+    if (!poiBridgeWarned) {
+      poiBridgeWarned = true;
+      console.warn('[Wayfarer Map Mods - Abuse Email Importer] publishPoiToMap() is a no-op: Map Mods - Base v4.0.0 removed the POI bridge this used to write to. Use the Abuse Report Extractor\'s own "Show on Map" instead.');
+    }
+  }
 
-    const newestNormalized = newestText.replace(/\s+/g, " ").trim();
-    const looksActioned = newestIsSupport && /we have reviewed the report and have taken action on the wayspots? in accordance with our policies/.test(newestNormalized);
-    const looksPending = newestIsSupport && /thank you for your patience as your report is being looked into\.? we will follow up once we have reviewed the reported wayspots?/.test(newestNormalized);
-    const looksDenied = newestIsSupport && /we took another look at the wayspot in question and decided that it does not meet our criteria for removal at this time/.test(newestNormalized);
-
-    if (isAutoAck) return Type.ABUSE_REPORT_RECEIVED;
-    if (looksActioned) return Type.ABUSE_REPORT_ACTIONED;
-    if (looksPending) return Type.ABUSE_REPORT_PENDING;
-    if (looksDenied) return Type.ABUSE_REPORT_DENIED;
-    return Type.ABUSE_REPORT_UPDATED;
-  };
-
-  // Merges the message lists from several parsed threads that share the
-  // same conversationId -- needed because a long-running ticket generates
-  // a new email notification on every reply, and each individual email
-  // export only contains THAT email's own quoted-history window, not
-  // necessarily every message that's ever been part of the conversation
-  // (confirmed against two real exports of the same ticket, a week apart:
-  // the earlier one's original form-submission message, with its
-  // structured fields, wasn't present at all in the later one's quoted
-  // history -- scanning either alone misses real data the other has).
-  // Dedupes by (author, date, time, raw) -- the exact same message
-  // appears byte-for-byte identical across every export that happens to
-  // include it, via standard email quoting -- and re-sorts the union
-  // newest-first by actual parsed timestamp, since simple concatenation
-  // can't be trusted to preserve a correct global order across messages
-  // that originally came from different emails' own (locally newest-
-  // first) orderings.
-  const mergeThreads = (threads) => {
-    const conversationId = threads.map((t) => t.conversationId).find(Boolean) || null;
-    const seen = new Set();
-    const merged = [];
-    for (const { messages } of threads) {
-      for (const msg of messages) {
-        const key = `${msg.author}|${msg.date}|${msg.time}|${msg.raw}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        merged.push(msg);
+  // For the future extraction plugin: every currently-stored email that
+  // classifies as an abuse-report ticket, already reconstructed as an
+  // OPREmail.Email (so classify()/getBody()/etc. are all available without
+  // re-fetching from storage or re-parsing headers by hand).
+  async function getAbuseReportRecords() {
+    const all = await WSTStorage.getAllEmails();
+    const out = [];
+    for (const record of all) {
+      try {
+        const email = new OPREmail.Email(record.headers, record.body);
+        const { type } = email.classify();
+        if (typeof type === 'string' && type.startsWith('ABUSE_REPORT_')) {
+          out.push({ record, email });
+        }
+      } catch (e) {
+        // Skip anything that doesn't parse/classify; not this function's
+        // job to surface parse errors, callers can inspect the record
+        // directly if they need to know why one was skipped.
       }
     }
-    merged.sort((a, b) => {
-      const ta = Date.parse(`${a.date} ${a.time}`);
-      const tb = Date.parse(`${b.date} ${b.time}`);
-      // Newest first, matching a single thread's own convention. An
-      // unparseable timestamp sorts last rather than crashing the sort
-      // or silently reshuffling everything around it.
-      if (Number.isNaN(ta) && Number.isNaN(tb)) return 0;
-      if (Number.isNaN(ta)) return 1;
-      if (Number.isNaN(tb)) return -1;
-      return tb - ta;
+    return out;
+  }
+
+  window.WayfarerAbuseEmailImporter = {
+    getAbuseReportRecords,
+    publishPoiToMap,
+    isMapModsBaseActive,
+  };
+
+  function registerWithMapModsBase() {
+    if (isMapModsBaseActive()) {
+      console.info('[Wayfarer Map Mods - Abuse Email Importer] Map Mods - Base detected -- window.WayfarerAbuseEmailImporter is available.');
+    } else {
+      // Not necessarily an error -- Base uses @run-at document-start and
+      // we're document-idle, so this is usually just "hasn't run yet".
+      // Re-check once after a beat rather than only logging a possibly-
+      // stale negative result.
+      setTimeout(() => {
+        console.info(
+          isMapModsBaseActive()
+            ? '[Wayfarer Map Mods - Abuse Email Importer] Map Mods - Base detected -- window.WayfarerAbuseEmailImporter is available.'
+            : '[Wayfarer Map Mods - Abuse Email Importer] Map Mods - Base not detected on this page. window.WayfarerAbuseEmailImporter is still available, but publishPoiToMap() will have nothing to show until Base loads.'
+        );
+      }, 2000);
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Map Mods - Base side panel integration -- same pattern as the Abuse
+  // Report Extractor script (and Report Wayspots' real
+  // insertReportingHistoryLinkIfReady()/insertReportingSettingsLinkIfReady()):
+  // appendChild a plain <a> into ".wfmapmods-settings-links" the first time
+  // it exists, found via a debounced MutationObserver gated on
+  // "#wfmapmods-side-panel". Replaces the old standalone floating button --
+  // the panel now opens from this link instead.
+  // ---------------------------------------------------------------------
+
+  const SETTINGS_LINK_ID = 'wei-settings-link';
+  let sidePanelObserver = null;
+  let sidePanelMutationScheduled = false;
+
+  function insertSettingsLinkIfReady() {
+    const settingsBody = document.querySelector('.wfmapmods-settings-links');
+    if (!settingsBody) return false;
+    if (document.getElementById(SETTINGS_LINK_ID)) return true;
+
+    const link = document.createElement('a');
+    link.id = SETTINGS_LINK_ID;
+    link.textContent = 'Import Abuse Report Emails';
+    link.style.cursor = 'pointer';
+
+    settingsBody.appendChild(link);
+
+    link.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      togglePanel();
     });
-    return { conversationId, messages: merged };
+
+    return true;
+  }
+
+  function sidePanelMutationHandler() {
+    if (!document.querySelector('#wfmapmods-side-panel')) return;
+    if (insertSettingsLinkIfReady()) stopSidePanelWatcher();
+  }
+
+  function startSidePanelWatcher() {
+    if (sidePanelObserver) return;
+
+    sidePanelMutationHandler(); // covers the case it's already there
+
+    sidePanelObserver = new MutationObserver(() => {
+      if (sidePanelMutationScheduled) return;
+      sidePanelMutationScheduled = true;
+      setTimeout(() => {
+        sidePanelMutationScheduled = false;
+        sidePanelMutationHandler();
+      }, 50);
+    });
+
+    sidePanelObserver.observe(document.documentElement || document.body, {
+      childList: true,
+      subtree: true,
+    });
+  }
+
+  function stopSidePanelWatcher() {
+    if (sidePanelObserver) {
+      sidePanelObserver.disconnect();
+      sidePanelObserver = null;
+    }
+  }
+
+  function startPlugin() {
+    registerWithMapModsBase();
+    // Registering as an external plugin already implies WFMM.ui exists --
+    // see wae.js's own startPlugin() comment for why. injectStyle() is
+    // idempotent (replaces by id), safe to call on every startPlugin().
+    wfmmWindow.WFMM.ui.injectStyle('wei-extra-styles', STYLE);
+    startSidePanelWatcher();
+    // Auto-sync used to only start the first time buildPanel() ever ran
+    // (which happened here too, since startPlugin() called it eagerly).
+    // Now that the panel's DOM is only built on open, this has moved out
+    // on its own -- auto-sync should begin as soon as the plugin starts,
+    // whether or not anyone ever opens the panel.
+    const savedAutoSync = loadAutoSyncSettings();
+    if (savedAutoSync.enabled) startAutoSync(savedAutoSync.intervalMin);
+  }
+
+  function stopPlugin() {
+    stopSidePanelWatcher();
+    document.getElementById('wei-settings-link')?.remove();
+    closePanel(); // no-op if the panel isn't open; openModal's own close() tears its DOM down
+    stopAutoSync();
+  }
+
+  // ---------------------------------------------------------------------
+  // Map Mods plugin manager registration -- v4.0.0 of the consolidated
+  // suite added a real external-plugin API (confirmed against its source:
+  // window.WFMM.plugins.registerExternal()), which makes this show up as
+  // a normal entry in the suite's own Plugin Manager settings screen
+  // (#wfmm-plugin-manager-modal) with a name/description/enable-toggle,
+  // same as any of its own bundled features. WFMM calls create().start()
+  // for us once registered (as part of its own startup sequence, or
+  // immediately if the suite already finished starting) -- we must NOT
+  // also call startPlugin() ourselves after a successful registration, or
+  // it would start twice. stop() runs if the user disables it from that
+  // screen.
+  //
+  // Falls back to the old self-starting behavior (no Plugin Manager
+  // entry, just the settings-link-in-side-panel approach from earlier
+  // versions) if window.WFMM.plugins never becomes available within 5s --
+  // covers an older Base version, or this script's own document-idle
+  // timing landing before the suite has run at all.
+  // ---------------------------------------------------------------------
+
+  const PLUGIN_ID = 'wayfarer-abuse-email-importer';
+  const PLUGIN_DEFINITION = {
+    id: PLUGIN_ID,
+    name: (typeof GM_info !== 'undefined' && GM_info.script?.name) || 'Wayfarer Map Mods - Abuse Email Importer',
+    description: 'Imports Niantic Support "Reporting Abuse in Wayfarer" tickets from Gmail or .eml files, for the Abuse Report Extractor to scan.',
+    source: 'external',
+    requirement: 'optional',
+    author: (typeof GM_info !== 'undefined' && GM_info.script?.author) || 'unknown',
+    version: (typeof GM_info !== 'undefined' && GM_info.script?.version) || '0.0.0',
+    namespace: (typeof GM_info !== 'undefined' && GM_info.script?.namespace) || undefined,
+    apiVersion: 1,
+    create() {
+      return { start: startPlugin, stop: stopPlugin };
+    },
   };
 
-  const HELPSHIFT_TEMPLATES = [
-    {
-      subject: /^(?:Re: )?\[\d+\]\s*Reporting Abuse in (?:Wayfarer|Niantic Wayspot)/i,
-      disambiguate: (email) => {
-        const plaintext = email.getBody("text/plain") || "";
-        const { messages } = parseHelpshiftThread(plaintext, email.getFirstHeaderValue("Date", null));
-        const type = classifyAbuseReportStatus(messages);
-        if (type === null) return null;
-        return { type, style: Style.SUPPORT, language: "en" };
-      },
-    },
-  ];
-  TEMPLATES.unshift(...HELPSHIFT_TEMPLATES);
+  // wfmmWindow is declared once, near the top of this file (see that
+  // comment for why) -- reused here unchanged from earlier versions. This
+  // is the confirmed cause of "script works standalone, but the suite's
+  // Plugin Manager shows nothing under External plugins" if it's ever
+  // missing: registration silently never happens, the 5s timeout below
+  // always elapses, and self-start quietly takes over every time.
+  function registerOrSelfStart(attemptsLeft) {
+    const plugins = wfmmWindow.WFMM && wfmmWindow.WFMM.plugins;
+    if (plugins && typeof plugins.registerExternal === 'function') {
+      try {
+        plugins.registerExternal(PLUGIN_DEFINITION);
+        return; // registered -- WFMM owns calling start()/stop() from here
+      } catch (e) {
+        console.warn('[Wayfarer Map Mods - Abuse Email Importer] Plugin Manager registration failed, self-starting instead:', e);
+        startPlugin();
+        return;
+      }
+    }
+    if (attemptsLeft > 0) {
+      setTimeout(() => registerOrSelfStart(attemptsLeft - 1), 250);
+      return;
+    }
+    console.warn('[Wayfarer Map Mods - Abuse Email Importer] Map Mods plugin manager not detected after 5s -- self-starting instead.');
+    startPlugin();
+  }
 
-  // -------------------------------------------------------------------------
-  // Public API
-  // -------------------------------------------------------------------------
-  global.OPREmail = {
-    Type,
-    Style,
-    Email,
-    parseMIME,
-    extractEmail,
-    decodeBodyUsingCTE,
-    stripDiacritics,
-    TEMPLATES,
-    // non-upstream: see the "helpshift.ts" section
-    helpshift: {
-      parseThread: parseHelpshiftThread,
-      stripMarkup: stripHelpshiftMarkup,
-      extractFormFields: extractHelpshiftFormFields,
-      extractCoordinates: extractHelpshiftCoordinates,
-      parseAbuseReportEmail,
-      parseAbuseReportThread,
-      classifyAbuseReportStatus,
-      mergeThreads,
-    },
-    errors: {
-      InvalidEmailFormatError,
-      NotImplementedError,
-      InvalidContentTypeError,
-      HeaderNotFoundError,
-      NoMatchingTemplateError,
-      DisambiguationFailedError,
-    },
-  };
-})(window);
+  registerOrSelfStart(20); // 20 * 250ms = 5s
+})();
