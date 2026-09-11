@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Report Extractor
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.26.3
+// @version      1.27.0
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -15,6 +15,64 @@
 // ==/UserScript==
 
 /*
+ * v1.27.0 CHANGE FROM v1.26.3: adds a "Close this panel when a row jumps
+ * the map to its location" checkbox -- previously this was the one
+ * hardcoded behavior, closing the panel was never optional. Off, a row
+ * click still centers/zooms the map and opens the same info popup as
+ * before, it just leaves the panel itself open too (which, since it's a
+ * full-screen backdrop, means the map you just jumped to stays hidden
+ * behind it until closed manually) -- useful for clicking through
+ * several rows in a row without the panel closing out from under you
+ * each time. Defaults to on, matching every prior version's only
+ * behavior. Setting lives in localStorage
+ * (WAE_AUTOCLOSE_ON_NAVIGATE_KEY), not tied to any one panel session.
+ *
+ * v1.26.3 CHANGE FROM v1.26.2: fixes "abuse crosses don't show on the
+ * submit map AT ALL" for real this time -- v1.26.0's WFMM.map switch got
+ * the map-LOOKUP half of that working, but waeShouldShowPulses()'s
+ * "hide below zoom 8" check (added long before the submit map was ever
+ * supported, to keep a fully-zoomed-out mapview from trying to render
+ * hundreds of markers at once) was being applied there too, completely
+ * unconditionally -- and the submit-Wayspot page commonly lands on a
+ * wide default view, well below zoom 8, before the user has picked a
+ * location. Every marker was getting silently hidden by that check on
+ * every single visit, not just occasionally. Now skipped entirely when
+ * WFMM.map's own context says surface === "submit" (context.surface,
+ * confirmed against the real source -- resolveSubmitMapContext() sets it
+ * explicitly, and the fallback resolver derives the same value from the
+ * route name either way) -- tracked alongside WAE_PULSES.map now,
+ * populated via WFMM.map.getContext() after refresh() (which only ever
+ * returns the bare map, not its surrounding context) and via the
+ * context onReady() already hands over directly.
+ *
+ * v1.26.2 CHANGE FROM v1.26.1: fixes "Show on Map" left toggled on from a
+ * previous session not showing its markers on a fresh page load until
+ * toggled off and back on -- see the WAE_MAP_RETRY_LIMIT block (right
+ * above waeStartMapTracking()) for the full root-cause explanation.
+ * Short version: @run-at document-start (v1.26.1) means the initial
+ * resync's WFMM.map.refresh() call can race ahead of Angular/Google Maps
+ * actually finishing initialization; that single attempt's own internal
+ * ~20s search could exhaust itself before the map ever appeared, with
+ * nothing making it try again afterward. Now subscribes to WFMM's own
+ * "map:not-found" event and retries (up to 3 times, 3s apart) for the
+ * two background/silent triggers that can hit this -- the initial
+ * bootstrap resync and a route change -- without touching the "Show on
+ * Map" button's own click handler, which keeps its existing immediate
+ * error message on failure rather than gaining a delayed silent retry
+ * underneath it too.
+ *
+ * v1.26.1 CHANGE FROM v1.26.0: metadata header overhaul -- @namespace now
+ * points at the GitHub repo rather than a Wayfarer URL, @author is the
+ * real name rather than the "you" placeholder, @match broadened from
+ * just /new/mapview* to the whole site (the submit-Wayspot page this
+ * plugin now supports, see v1.26.0's own WFMM.map fix, lives at a
+ * different path -- the old narrow match would have kept this script
+ * from even loading there, independent of that fix), and @run-at moved
+ * from document-idle to document-start. @version itself was briefly
+ * dropped in the change this entry replaces and has been restored --
+ * that was a mistake, not intentional; Tampermonkey needs it to compare
+ * against @updateURL and decide whether an update is actually available.
+ *
  * v1.26.0 CHANGE FROM v1.25.1: fixes "abuse crosses don't show on the
  * submit map" -- switched the whole map-attachment layer over to
  * WFMM.map, the suite's own shared map-lookup service, in place of this
@@ -944,7 +1002,20 @@
   // ---------------------------------------------------------------------
 
   const WAE_MAP_VISIBLE_KEY = 'wae_map_pulses_visible';
-  const WAE_PULSES = { map: null, markersById: new Map(), infoWindow: null };
+  // Whether clicking a table row (waeGoToLocation()) closes this panel as
+  // part of jumping the map to that location. Defaults to on (matches
+  // every version before this setting existed) -- since the panel is a
+  // full-screen backdrop, leaving it open would mean the map you just
+  // navigated to stays hidden behind it, which is why that was the only
+  // behavior originally. Some people would rather keep the panel open
+  // (e.g. clicking through several rows in a row to compare locations)
+  // and re-open it themselves when they're done looking, hence this
+  // being a real setting rather than the one hardcoded behavior.
+  const WAE_AUTOCLOSE_ON_NAVIGATE_KEY = 'wae_autoclose_on_navigate';
+  function waeAutoCloseOnNavigateEnabled() {
+    return localStorage.getItem(WAE_AUTOCLOSE_ON_NAVIGATE_KEY) !== 'false';
+  }
+  const WAE_PULSES = { map: null, surface: null, markersById: new Map(), infoWindow: null };
   let waeAllRecords = [];
   let waeRecordsById = new Map();
   let waeNearbyMap = new Map();
@@ -1248,8 +1319,24 @@
   }
 
   // Hide below this zoom level so a fully zoomed-out view of the
-  // Netherlands doesn't try to show every marker/cluster at once.
-  function waeShouldShowPulses(map) {
+  // Netherlands doesn't try to show every marker/cluster at once -- but
+  // ONLY on the general mapview. BUGFIX (not upstream): this was applied
+  // unconditionally, including on the submit-Wayspot map (see v1.26.0's
+  // WFMM.map integration), which reported as "crosses don't show on the
+  // submit map AT ALL" -- that page commonly lands on a wide default
+  // view (below zoom 8) before the user has picked a location, and this
+  // check silently hid every marker there too, for exactly the same
+  // "avoid overwhelming a world-zoomed-out view" reason that makes sense
+  // on the country/region-wide mapview but not on a page whose whole
+  // point is narrowing in on one precise spot -- abuse-report context is
+  // arguably MORE useful there at a wide zoom, not less, since that's
+  // exactly when a user hasn't yet zoomed in enough to notice a cluster
+  // of prior reports near where they're about to submit. `surface` comes
+  // from WFMM.map's own context (`context.surface`, "mapview" or
+  // "submit" -- see waeSetCurrentMap()) rather than anything this script
+  // determines itself.
+  function waeShouldShowPulses(map, surface) {
+    if (surface === 'submit') return true;
     if (!map || typeof map.getZoom !== 'function') return true;
     const z = map.getZoom();
     return (typeof z === 'number') && z >= 8;
@@ -1277,7 +1364,7 @@
     if (!map) return;
     if (typeof google === 'undefined' || !google.maps?.Marker) return;
 
-    if (!waeShouldShowPulses(map)) {
+    if (!waeShouldShowPulses(map, WAE_PULSES.surface)) {
       waeClearPulses();
       return;
     }
@@ -1335,10 +1422,11 @@
   // same way to "the map WFMM.map handed us is a different object than
   // what we had", so it's one place rather than two copies that could
   // drift out of sync with each other.
-  function waeSetCurrentMap(map) {
+  function waeSetCurrentMap(map, surface) {
     if (WAE_PULSES.map === map) return;
     waeClearPulses();
     WAE_PULSES.map = map;
+    WAE_PULSES.surface = map ? (surface || null) : null;
     // Re-cluster on every zoom change -- clustering itself is zoom-
     // dependent (screen-pixel distance changes with zoom even though
     // lat/lng doesn't), so this can't just be a cheap visibility toggle
@@ -1356,7 +1444,13 @@
   async function waeAttachToMapIfNeeded() {
     const map = await wfmmWindow.WFMM.map.refresh({ reason: 'wae-attach' });
     if (!map) return false;
-    waeSetCurrentMap(map);
+    // refresh() only ever returns the bare google.maps.Map object, not
+    // the surrounding context WFMM.map itself tracks (route/surface/
+    // adapter/etc) -- getContext() is a separate call for that, and it's
+    // safe to call right after refresh() resolves since refresh() is
+    // what sets it in the first place.
+    const context = wfmmWindow.WFMM.map.getContext?.();
+    waeSetCurrentMap(map, context?.surface);
     return true;
   }
 
@@ -1375,22 +1469,65 @@
   let waeMapClearedUnsub = null;
   let waeRouteEnterUnsub = null;
   let waeRouteChangeUnsub = null;
+  // BUGFIX (not upstream): "Show on Map" left toggled on from a previous
+  // session didn't reliably re-show its markers on a fresh page load --
+  // needed a manual toggle off/on to actually appear. Root cause: this
+  // plugin now runs at document-start (see the header's own v1.26.1
+  // changelog note), so waeResyncMapIfVisible()'s very first
+  // WFMM.map.refresh() call can genuinely race ahead of Angular/Google
+  // Maps finishing initialization -- confirmed against the real source
+  // (src/core/map/service.js): refresh() already retries internally (80
+  // attempts, 250ms apart, ~20s total) before giving up and emitting
+  // "map:not-found", but nothing retries again after that -- another
+  // .refresh() call only ever happens from a route change or another
+  // explicit call, neither of which happens on a page you're already on
+  // when it finishes loading. A slow-loading page could exhaust that
+  // whole 20s window before its map component ever renders, and from
+  // then on the single failed search was just the end of it. Toggling
+  // the button off and on again worked purely because that's a SECOND,
+  // later .refresh() call, made after the map had had more time to
+  // actually appear -- not because anything about the toggle itself
+  // mattered. Retrying automatically here removes the need for that.
+  let waeMapNotFoundUnsub = null;
+  let waeMapRetryTimer = null;
+  let waeMapRetriesLeft = 0;
+  // Only armed for the two silent/background triggers below (the initial
+  // resync at startup, and a route change) -- deliberately NOT armed for
+  // the "Show on Map" button's own click handler, which already has its
+  // own clear, immediate error message on failure; layering a delayed
+  // silent retry underneath that too would risk the button already
+  // having shown "couldn't find the map" while pulses then quietly
+  // appear anyway a few seconds later, which reads as more confusing
+  // than just letting a manual click be its own cheap retry.
+  const WAE_MAP_RETRY_LIMIT = 3;
 
   function waeStartMapTracking() {
     if (waeMapReadyUnsub) return; // already subscribed
     const WFMM = wfmmWindow.WFMM;
-    waeMapReadyUnsub = WFMM.map.onReady(({ map }) => {
-      waeSetCurrentMap(map);
+    waeMapReadyUnsub = WFMM.map.onReady(({ map, context }) => {
+      waeMapRetriesLeft = 0; // a real map showed up -- nothing left to retry
+      waeSetCurrentMap(map, context?.surface);
       if (isMapPulsesEnabled()) waeRefreshPulses();
     });
     waeMapClearedUnsub = WFMM.map.onCleared(() => {
       WAE_PULSES.map = null;
+      WAE_PULSES.surface = null;
     });
     const onMapRouteEvent = () => {
-      if (isMapPulsesEnabled()) WFMM.map.refresh({ reason: 'wae-route-change' });
+      if (!isMapPulsesEnabled()) return;
+      waeMapRetriesLeft = WAE_MAP_RETRY_LIMIT; // fresh route -> a fresh search that can itself race Angular/Maps, same as the startup case
+      WFMM.map.refresh({ reason: 'wae-route-change' });
     };
     waeRouteEnterUnsub = WFMM.routes.onEnterMapRoute(onMapRouteEvent);
     waeRouteChangeUnsub = WFMM.routes.onChangeMapRoute(onMapRouteEvent);
+    waeMapNotFoundUnsub = WFMM.events.on('map:not-found', () => {
+      if (!isMapPulsesEnabled() || waeMapRetryTimer || waeMapRetriesLeft <= 0) return;
+      waeMapRetriesLeft -= 1;
+      waeMapRetryTimer = setTimeout(() => {
+        waeMapRetryTimer = null;
+        if (isMapPulsesEnabled()) WFMM.map.refresh({ reason: 'wae-retry-after-not-found' });
+      }, 3000);
+    });
   }
 
   function waeStopMapTracking() {
@@ -1398,18 +1535,26 @@
     waeMapClearedUnsub?.();
     waeRouteEnterUnsub?.();
     waeRouteChangeUnsub?.();
+    waeMapNotFoundUnsub?.();
+    if (waeMapRetryTimer) { clearTimeout(waeMapRetryTimer); waeMapRetryTimer = null; }
     waeMapReadyUnsub = null;
     waeMapClearedUnsub = null;
     waeRouteEnterUnsub = null;
     waeRouteChangeUnsub = null;
+    waeMapNotFoundUnsub = null;
+    waeMapRetriesLeft = 0;
   }
 
   // Panel-row click -> jump the map to that location. The panel is a
   // full-screen backdrop, so the map isn't visible until it closes -- this
-  // closes it as part of navigating, the same way clicking a location is
-  // expected to actually show it rather than just move something behind
-  // the modal. Shows the InfoWindow on arrival too, as immediate visual
-  // confirmation regardless of whether "Show on Map" pins are toggled on.
+  // closes it as part of navigating BY DEFAULT, the same way clicking a
+  // location is expected to actually show it rather than just move
+  // something behind the modal -- but only when
+  // waeAutoCloseOnNavigateEnabled() says so; see that setting's own
+  // comment for why it's optional. Shows the InfoWindow on arrival
+  // either way, as immediate visual confirmation regardless of whether
+  // "Show on Map" pins are toggled on -- that part was never conditional
+  // on autoclose, only whether the panel itself gets out of the way.
   async function waeGoToLocation(record) {
     if (!Number.isFinite(record.latitude) || !Number.isFinite(record.longitude)) return;
     const attached = await waeAttachToMapIfNeeded();
@@ -1422,7 +1567,7 @@
     map.setCenter(latLng);
     const z = map.getZoom();
     if (typeof z === 'number' && z < 17) map.setZoom(17);
-    closePanel();
+    if (waeAutoCloseOnNavigateEnabled()) closePanel();
     google.maps.event.addListenerOnce(map, 'idle', () => waeShowPulseInfoWindow(record, latLng));
   }
 
@@ -1433,13 +1578,19 @@
   // Re-syncs the map layer with whatever's currently in storage, but only
   // if the toggle is actually on -- called after scan/clear so the map
   // doesn't silently drift out of date while "Show on Map" is active, and
-  // at bootstrap so a persisted-on toggle re-attaches on page load.
+  // at bootstrap so a persisted-on toggle re-attaches on page load. The
+  // bootstrap case is exactly where WAE_MAP_RETRY_LIMIT (see
+  // waeStartMapTracking()'s own comment) matters most -- @run-at
+  // document-start means this specific call can run before Angular/
+  // Google Maps have actually finished initializing, so it's armed here
+  // before attaching, not just left at whatever it happened to be.
   // Keeping in sync with view switches after this point is
   // waeStartMapTracking()'s job (see its own comment), not this
   // function's -- that's a one-time subscription set up in startPlugin(),
   // not something re-armed on every resync.
   async function waeResyncMapIfVisible() {
     if (!isMapPulsesEnabled()) return;
+    waeMapRetriesLeft = WAE_MAP_RETRY_LIMIT;
     const attached = await waeAttachToMapIfNeeded();
     if (attached) waeRefreshPulses();
   }
@@ -2028,6 +2179,12 @@
       placeholder: 'Search name, ticket, location/report text\u2026',
     });
 
+    const autoCloseToggle = ui.checkboxRow({
+      label: 'Close this panel when a row jumps the map to its location',
+      checked: waeAutoCloseOnNavigateEnabled(),
+      onChange: (checked) => localStorage.setItem(WAE_AUTOCLOSE_ON_NAVIGATE_KEY, String(checked)),
+    });
+
     const tableContainer = ui.createElement('div', { className: 'wae-table-container' });
     const logEl = ui.createElement('div', { className: 'wae-log' });
 
@@ -2113,7 +2270,7 @@
       ],
     });
 
-    modal.body.append(countEl, buttonRowEl, progressEl, searchInput, tableContainer, logEl, styleSection);
+    modal.body.append(countEl, buttonRowEl, progressEl, searchInput, autoCloseToggle.row, tableContainer, logEl, styleSection);
 
     waeUI = { countEl, tableContainer, logEl, scanBtn, mapToggleBtn, exportBtn, clearBtn, searchInput };
 

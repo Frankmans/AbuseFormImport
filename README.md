@@ -3,10 +3,20 @@
 Two companion Tampermonkey userscripts that pull Niantic Support's
 "Reporting Abuse in Wayfarer" Helpshift ticket emails out of Gmail (or
 `.eml` files), and extract a best-guess Wayspot name + coordinates from
-each one into an exportable CSV. Both hook into [Tntnnbltn's
-wayfarer-map-mods suite][base] side panel rather than having their own
-floating UI. Wayfarer itself moved to `wayfarer.scopely.com`; both
-scripts and this README are updated for that.
+each one into an exportable CSV. As of v4.7.2/v1.26.0 their display names
+are **Wayfarer Map Mods - Abuse Email Importer** and **Wayfarer Map Mods
+- Abuse Report Extractor**, so it's clear they're WFMM-affiliated
+wherever they show up standalone — Tampermonkey's dashboard, Plugin
+Manager's own list, devtools console — though the underlying filenames
+(and their `@downloadURL`s below) are unchanged.
+
+Both hook into [Tntnnbltn's wayfarer-map-mods suite][base]'s own UI
+service (`WFMM.ui`) for their panels — real, suite-native modals
+(draggable/resizable if you've turned that on in Base's own settings,
+same as every other WFMM modal), not a hand-rolled lookalike — rather
+than having their own floating UI. Wayfarer itself moved to
+`wayfarer.scopely.com`; both scripts and this README are updated for
+that.
 
 [base]: https://gitlab.com/Tntnnbltn/wayfarer-map-mods
 
@@ -15,7 +25,7 @@ scripts and this README are updated for that.
 | File | Role |
 |---|---|
 | `wayfarer-abuse-email-importer.user.js` | Gmail OAuth sync + `.eml` drop -> raw email store |
-| `wayfarer-abuse-report-extractor.user.js` | Classifies stored emails, extracts name/coordinates, CSV export |
+| `wayfarer-abuse-report-extractor.user.js` | Classifies stored emails, extracts name/coordinates, CSV export, map markers |
 | `opr-email-lib.js` | Shared MIME parsing + classification library (pulled in via `@require`, not installed separately) |
 | `wst-storage.js` | Shared IndexedDB wrapper for the raw email store (also `@require`d, not installed separately) |
 
@@ -96,6 +106,14 @@ time the page loads and kept in memory only, for the session.
    **Show on Map** to see them plotted directly on the map instead (see
    below).
 
+The **Conversation** and **Status** column headers are clickable to sort
+— click again to flip ascending/descending, click the other header to
+switch columns; Status sorts by pipeline stage (Received → Pending Review
+→ a settled state), not alphabetically. Your chosen sort is remembered
+across sessions. The extractor panel also has its own **Marker Style**
+section — color, size, opacity, and a clickable-markers toggle for the
+map markers it draws (see "Plotting on the map" below).
+
 Both scripts also show up as their own entries — with a name,
 description, and enable/disable toggle — in the wayfarer-map-mods
 suite's own **Plugin Manager** settings screen, alongside its bundled
@@ -115,15 +133,19 @@ seems broken. If you're on an older version than that, update.
 
 ## What counts as an "abuse report" email
 
-Gmail sync only searches `support@nianticlabs.com` — Niantic Support's
-Helpshift "Reporting Abuse in Wayfarer" ticket threads. It used to also
-pull in general Wayfarer/Spatial/Ingress nomination-status notifications
-from several other senders; that was narrowed in v4.4.0 to keep this
-tool scoped to abuse reports specifically. Left unchanged when Wayfarer
-itself moved to `wayfarer.scopely.com` — that's a separate concern (who
-sends support email vs. which domain the web app runs on), and nothing
-so far indicates the sender address changed too. Worth checking if
-tickets stop arriving.
+Gmail sync searches two sender addresses — `support@nianticlabs.com` and
+`support-explore@scopely.com` (Niantic Support's Helpshift "Reporting
+Abuse in Wayfarer" ticket threads; the second address, display name
+"Scopely Explore Support," was added in v4.7.4 once tickets started
+arriving from it — same Helpshift transcript format underneath, nothing
+else needed to change for those to classify and extract correctly). Both
+are kept rather than one replacing the other, since nothing confirms
+Niantic's own address has actually stopped sending. It used to also pull
+in general Wayfarer/Spatial/Ingress nomination-status notifications from
+several other senders; that was narrowed in v4.4.0 to keep this tool
+scoped to abuse reports specifically. Worth checking if tickets stop
+arriving from either address — that'd be the sign a third one is now in
+use.
 
 Dropped `.eml` files are accepted from any sender — screening happens at
 extraction time instead, via `opr-email-lib.js`'s `classify()`, which
@@ -133,25 +155,39 @@ only keeps emails it recognizes as `ABUSE_REPORT_*`.
 
 A single ticket can report more than one Wayspot — either all at once in
 the original submission, or with more added in a later reply ("I see I
-missed some: ..."). The extractor picks up both:
+missed some: ...", or plain prose like "but Example Park North Gate
+(lat,lng) of the same type has now been added by the same user"). The
+extractor picks up all of these:
 
 - The original form's **Provide details of the location(s)** field is
   split per line, so a report listing several Wayspots at once (each as
-  its own `Name (lat, lng)` or `Name, lat,lng` line) becomes one entry
-  per line, not just the first.
-- Every other message in the thread is scanned the same way, so Wayspots
-  a reporter adds in a follow-up reply are picked up too.
+  its own `Name (lat, lng)`, `Name, lat,lng`, or `"Name" at lat,lng`
+  line) becomes one entry per line, not just the first — including two
+  entries that end up sharing one line with no separator at all between
+  them, which can happen when a line break is lost during HTML-to-text
+  conversion (see "Known limitations" below).
+- Every other message in the thread is also scanned for locations — both
+  structured list-style replies (handled the same way as the original
+  field) **and** a coordinate mentioned in ordinary prose. A prose
+  mention still adds the location, but its "name" is only kept if a
+  short, clean label was actually found right before the coordinate;
+  when it isn't (a whole sentence sitting in front of the coordinate
+  instead of a clean label), the row is added with the name left blank
+  rather than showing a run-on sentence as if it were a Wayspot name —
+  the coordinate itself is what matters, and it's kept either way.
 
 Each entry becomes its own CSV row, sharing that ticket's
 `Conversation ID` / `Issue Type` / raw-text columns. Deliberately **not**
 turned into a *new* location entry: a corrected coordinate mentioned in
-prose (e.g. "(is actually here: &lt;lat,lng&gt;)") — that's a correction to
-a Wayspot already named elsewhere in the same message, not a new one, so
-treating every number pair in prose as a distinct report would invent
-duplicate rows. A Street View / Maps link found near a location isn't
-dropped, though — it's kept as that entry's `Comment` (see below). If a
-reply mixes a genuinely new Wayspot into the same sentence as a
-correction, it may need a manual check.
+the original submission's own free-prose fields (e.g. "(is actually here:
+&lt;lat,lng&gt;)") — that's a correction to a Wayspot already named
+elsewhere in the same message, not a new one, so treating every number
+pair there as a distinct report would invent duplicate rows. A Street
+View / Maps link found near a location isn't dropped, though — it's kept
+as that entry's `Comment` (see below), whether it sits right after the
+coordinate on the same line or a name and its coordinate happen to share
+a line with a link. If a reply mixes a genuinely new Wayspot into the
+same sentence as a correction, it may still need a manual check.
 
 ## Long-running tickets spanning several emails
 
@@ -167,6 +203,20 @@ and the original form fields still resolve even if the newest export's
 own quoted history no longer reaches back that far. Import every email
 you have for an active ticket, not just the latest one, for the most
 complete picture — auto-sync already does this automatically.
+
+## Replies sent from your own mail client
+
+Clicking Helpshift's own reply link keeps the whole thread in Helpshift's
+own transcript format. Replying using your mail client's normal reply
+button instead (Gmail's, for example) works too, but the client wraps the
+entire quoted history in its own `>` quoting, and can also re-derive the
+quoted text from the original email's HTML rather than reusing its
+plaintext part — a different, but still-recognized, transcript shape
+under the hood. The extractor detects and unwraps this automatically,
+splitting your own new reply text out as its own message and parsing the
+quoted history normally underneath it, so a ticket doesn't stop
+classifying or extracting correctly just because a reply came from your
+own inbox instead of Helpshift's reply link.
 
 ## CSV columns
 
@@ -254,18 +304,28 @@ doesn't touch the imported emails — re-scan any time to rebuild it.
 
 ## Known limitations
 
-- Coordinate/name extraction is **best-effort**. It's been confirmed
-  against real tickets and one significant parsing bug has already been
-  found and fixed (Helpshift renders the reporter's own messages with a
-  blank author name, which an earlier version of the header-parsing
-  regex silently dropped — including the message with the actual report
-  fields), but treat low-confidence rows as needing a manual check
-  before you rely on them.
-- Multi-location extraction only recognizes the two per-line list
-  formats seen so far (`Name (lat, lng)` and `Name, lat,lng`). A reply
-  that mixes a genuinely new Wayspot into the same sentence as a
-  correction, rather than giving it its own line, may need a manual
-  check — see "Multiple Wayspots per ticket" above.
+- Coordinate/name extraction is **best-effort**, confirmed and refined
+  against a growing set of real tickets rather than derived from a spec —
+  several real parsing bugs have been found and fixed this way (a blank
+  author name on the reporter's own messages that an earlier header regex
+  silently dropped, including the message with the actual report fields;
+  a stray trailing character that could drop the last form field
+  entirely; a URL landing in a location's name field instead of the
+  actual name; two locations glued onto one line with no separator at all
+  between them; a stray trailing `" at` left on a name under a third
+  location-naming format, `"Name" at lat,lng`, that a ticket from the
+  newer support-explore@scopely.com sender turned out to use). Full
+  detail for each lives in `opr-email-lib.js`'s own inline comments, not
+  repeated here — but the takeaway is the same: treat low-confidence rows
+  as needing a manual check before you rely on them, especially anything
+  unusual enough that it might be a format this hasn't been tested
+  against yet.
+- A location's *name* is only kept when a short, clean label was found —
+  a coordinate mentioned in the middle of a longer sentence still adds
+  the location, but with the name left blank rather than guessed at (see
+  "Multiple Wayspots per ticket" above). A reply that mixes a genuinely
+  new Wayspot into the same sentence as a correction to an existing one
+  may still need a manual check.
 - No inline editing of extracted rows — corrections happen in the
   exported CSV.
 
@@ -307,15 +367,24 @@ location directly on the Wayfarer map — the same idea as Report
 Wayspots' own reported-wayspot history markers, but for what this script
 extracted from imported emails, and without needing Report Wayspots
 installed. Nearby locations cluster into a single numbered badge when
-zoomed out, splitting apart into individual red-X markers as you zoom in
+zoomed out, splitting apart into individual X markers as you zoom in
 close enough to tell them apart — clustering is based on actual on-screen
 distance at the current zoom, not a fixed real-world radius, so it
 adapts correctly whether you're looking at the whole country or one
 neighborhood. Click an individual marker for its name, coordinates,
 comment, and ticket ID; click a cluster to zoom in on it. The toggle's
 state is remembered (`localStorage`) and re-attaches automatically next
-time the mapview loads if you left it on; markers stay in sync
+time a map-having page loads if you left it on; markers stay in sync
 automatically after every scan or clear while it's on.
+
+Works on **both** the general mapview and the zoomed-in submit/edit view
+you land on when nominating or reviewing a specific Wayspot — those are
+two separate `google.maps.Map` objects under the hood, and switching
+between them is picked up automatically, no manual re-toggle needed. Map
+lookup goes through the suite's own shared `WFMM.map` service (the same
+one Report History relies on, with its own dedicated, maintained support
+for both pages) rather than anything this script tries to work out for
+itself.
 
 Every table row with coordinates is clickable too, independent of whether
 the map markers themselves are toggled on — click a row to jump the map
@@ -323,17 +392,42 @@ straight to that location (centering and zooming in) and show the same
 info popup there. Since the panel is a full-screen backdrop, clicking a
 row also closes it, so the map you just navigated to is actually visible.
 
-The suite itself has no marker-plotting API — this ports its confirmed-
-working map-lookup code, then plots results as native
-`google.maps.Marker` objects (custom SVG icons) rather than anything
-from the suite, so it doesn't read as the same layer as its own
-reported-wayspot history markers. `window.WayfarerAbuseEmailImporter
-.publishPoiToMap()` is unrelated to this — it used to hand a POI to a
-`#wfmapmods-poi-bridge` element for the suite's own side-panel selection
-(never a map marker, even before this), but that bridge was removed
-entirely in the suite's v4.0.0; the function is now a documented no-op
-kept only for API compatibility. Real map-plotting has only ever been
-this script's own "Show on Map".
+### Marker Style
+
+The extractor panel has its own **Marker Style** section: color, size,
+fill opacity, ring color/width/opacity for the cluster badges, and a
+**Clickable markers** toggle (turn it off to let clicks pass through to
+whatever's underneath — the map itself, or a Wayspot marker at the same
+spot — instead of opening this plugin's own popup). Changes apply live if
+markers are already showing. The individual-report X shape itself stays
+fixed by design — it's meant to read as "a problem here," distinct from
+an ordinary POI dot — only its color and size are adjustable; the cluster
+badge, already a filled circle, gets the full set of controls.
+
+These settings are also registered with `WFMM.markerAppearance` (the
+suite's own marker-styling engine), so this is a real, discoverable style
+bucket in that system, not just an internal constant only this script
+knows about. One honest caveat: that does **not** mean this shows up as a
+new row in the suite's own built-in marker-color settings screen (the one
+listing Wayspots/Pokéstops/Gyms/Power Spots) — that particular screen's
+list of kinds is hardcoded in the suite itself, with no way for another
+script to add an entry to it. The underlying styling engine it's built on
+is genuinely shared, general-purpose infrastructure, though, which is why
+using it here was possible at all — it just surfaces through this
+plugin's own panel instead of that one fixed screen.
+
+The suite itself has no marker-*plotting* API (styling and lookup are
+separate concerns from actually drawing something) — this plots results
+as native `google.maps.Marker` objects (custom SVG icons, built from the
+Marker Style settings above) rather than anything from the suite, so it
+doesn't read as the same layer as its own reported-wayspot history
+markers. `window.WayfarerAbuseEmailImporter.publishPoiToMap()` is
+unrelated to this — it used to hand a POI to a `#wfmapmods-poi-bridge`
+element for the suite's own side-panel selection (never a map marker,
+even before this), but that bridge was removed entirely in the suite's
+v4.0.0; the function is now a documented no-op kept only for API
+compatibility. Real map-plotting has only ever been this script's own
+"Show on Map".
 
 Markers reposition themselves via the Maps SDK on pan with no app code
 involved, but a full re-render (recomputing clusters) does run on every
@@ -359,15 +453,6 @@ pairwise scan — with a few thousand accumulated rows that was slow enough
 to visibly hang the panel while opening. It's now grid-bucketed (only
 compares records in the same ~111m neighborhood, not every pair) and
 skipped entirely when nothing's changed since last time.
-
-Zooming into a specific Wayspot switches Wayfarer into a separate
-submit/edit view with its own map component — a genuinely different
-`google.maps.Map` object than the general mapview's. Markers only ever
-render on the one map they were created against, so this used to make
-every marker silently vanish when you zoomed in, with nothing bringing
-them back until you manually re-toggled. A lightweight watch (checks
-every 2s, only while pins are toggled on) now notices that swap and
-re-attaches automatically.
 
 ## Why no `@require` for the suite
 
@@ -414,8 +499,8 @@ needed since it's plain `@require`-able JS.
 
 ## Versions covered by this README
 
-- `wayfarer-abuse-email-importer.user.js` — v4.6.1
-- `wayfarer-abuse-report-extractor.user.js` — v1.21.2
+- `wayfarer-abuse-email-importer.user.js` — v4.7.4
+- `wayfarer-abuse-report-extractor.user.js` — v1.26.1
 - Verified against `wayfarer-map-mods.user.js` v4.0.0 (the consolidated
   suite both scripts depend on — see Requirements above).
 

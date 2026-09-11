@@ -760,9 +760,25 @@
         // that happens to have a link elsewhere on the same line, unlike
         // just discarding the whole name whenever a URL is present
         // anywhere in it).
+        // BUGFIX (not upstream -- found via a real ticket from the new
+        // support-explore@scopely.com sender, see wei.js's own
+        // SUPPORTED_SENDERS comment): that ticket's location list uses a
+        // THIRD naming convention neither of the other two formats this
+        // function already handled cover -- '"Name" at lat,lng' (the
+        // name quoted, then the literal word "at" before the
+        // coordinate) -- leaving a stray trailing `" at` attached to the
+        // name instead of a clean "Name". Stripping a trailing "at" (at
+        // a word boundary, so it can't accidentally eat the last few
+        // letters of a name that genuinely ends in "...at" as part of a
+        // longer word, e.g. "Habitat") before the existing punctuation
+        // trim, and adding straight/curly quote characters to what that
+        // trim strips, handles it without touching either of the
+        // existing formats -- neither of which use quotes or the word
+        // "at" around the name at all.
         const namePart = line.slice(sliceStart, m.index)
           .replace(/https?:\/\/\S+/gi, "")
-          .replace(/^[,\s()]+|[,\s(]+$/g, "")
+          .replace(/\bat\s*$/i, "")
+          .replace(/^[,\s()"'\u201c\u201d]+|[,\s("'\u201c\u201d]+$/g, "")
           .trim();
         const name = namePart || null;
         const trailing = line.slice(matchEnd, segmentEnd).replace(/^[\s),]+/, "").trim();
