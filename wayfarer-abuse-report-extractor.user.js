@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Report Extractor
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.28.0
+// @version      1.29.1
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -15,6 +15,42 @@
 // ==/UserScript==
 
 /*
+ * v1.29.1 CHANGE FROM v1.29.0: fixes the plugin becoming permanently
+ * unreachable ("unavailable") after swapping between different pages on
+ * the same domain -- see the "Map Mods - Base side panel integration"
+ * section comment (right above insertSettingsLinkIfReady()) for the full
+ * explanation. Short version: the settings-link MutationObserver used to
+ * disconnect itself the moment it successfully inserted the link, on the
+ * assumption Base's own side panel section persists for the whole SPA
+ * session -- if Angular's router ever tears down and rebuilds that
+ * section on client-side navigation between Wayfarer's own routed views
+ * (which nothing here fully confirms against Base's own source, but
+ * matches both ordinary Angular behavior and what was actually reported),
+ * an already-disconnected observer had no way to notice the link was
+ * gone and put it back, silently losing the only way to reach this
+ * plugin's panel even though its own background logic kept running the
+ * whole time. Left running for the plugin's whole lifetime now instead.
+ *
+ * v1.29.0 CHANGE FROM v1.28.0: fixes "zooming becomes very slow while
+ * abuse markers are rendered" -- two compounding causes, both in the
+ * marker-clustering path (waeComputeClusters()/waeSetCurrentMap()):
+ * (1) cluster recomputation was wired to zoom_changed with no debounce
+ * at all, and Google Maps fires that once per discrete zoom LEVEL, not
+ * once per gesture -- a fast scroll-wheel zoom or a double-click zoom
+ * (which animates through intermediate levels on its own) could trigger
+ * several expensive synchronous recomputes back to back, each blocking
+ * the main thread while the map itself was trying to animate. Moved to
+ * a debounced idle listener instead (200ms, trailing-edge) -- idle fires
+ * once after the map actually settles, so a fast zoom now triggers
+ * exactly one recompute instead of several stacked mid-animation ones.
+ * (2) every recompute re-ran the full lat/lng-to-world-point Mercator
+ * projection for every single record, even though that result never
+ * actually depends on zoom (only the subsequent `* scale` step does) --
+ * real, avoidable per-record work, scaling with dataset size, redone
+ * from scratch on every call for no reason. Cached per record id now
+ * (waeWorldPointCache), invalidated only when the map instance itself
+ * changes.
+ *
  * v1.28.0 CHANGE FROM v1.27.0: adds a "Last Response" column -- the
  * ticket's most recent message across every source email that fed into
  * it (merged.messages[0], since mergeThreads() already re-sorts newest-
@@ -1254,7 +1290,28 @@
   // radius, then greedily merge each point with unassigned neighbors in
   // its own and adjacent cells that fall within the radius. Not a
   // perfectly optimal clustering, but visually solid and cheap enough to
-  // rerun on every zoom_changed.
+  // rerun on every recompute -- see waeSetCurrentMap()'s own comment for
+  // how often that actually happens now (debounced, off idle rather than
+  // every zoom_changed).
+  //
+  // waeWorldPointCache (keyed by record.id) -- BUGFIX (not upstream): the
+  // projection.fromLatLngToPoint() call is the same for a given record
+  // every single time, regardless of zoom -- only the `* scale` step
+  // actually depends on it -- but this used to redo that projection
+  // (plus constructing a fresh google.maps.LatLng to feed it) for EVERY
+  // record on EVERY call, i.e. real, avoidable per-record work that
+  // scales with dataset size and was being repeated on every recompute
+  // for no reason. Cached per record id now, invalidated only when the
+  // map instance itself changes (a different map could, in principle,
+  // have a different projection, even though in practice Google's
+  // standard Mercator projection is the same for every normal map) --
+  // NOT when waeAllRecords changes, since a record's own lat/lng is
+  // immutable once extracted and the cache is keyed by id, so a scan
+  // that adds new records just adds new cache entries rather than
+  // invalidating everything already computed.
+  let waeWorldPointCache = new Map();
+  let waeWorldPointCacheMap = null;
+
   function waeComputeClusters(map, records) {
     const projection = map.getProjection();
     const zoom = map.getZoom();
@@ -1262,9 +1319,18 @@
       return records.map((r) => ({ recordIds: [r.id], records: [r], lat: r.latitude, lng: r.longitude }));
     }
 
+    if (waeWorldPointCacheMap !== map) {
+      waeWorldPointCache = new Map();
+      waeWorldPointCacheMap = map;
+    }
+
     const scale = Math.pow(2, zoom);
     const points = records.map((r) => {
-      const world = projection.fromLatLngToPoint(new google.maps.LatLng(r.latitude, r.longitude));
+      let world = waeWorldPointCache.get(r.id);
+      if (!world) {
+        world = projection.fromLatLngToPoint(new google.maps.LatLng(r.latitude, r.longitude));
+        waeWorldPointCache.set(r.id, world);
+      }
       return { record: r, x: world.x * scale, y: world.y * scale };
     });
 
@@ -1437,23 +1503,38 @@
   // same way to "the map WFMM.map handed us is a different object than
   // what we had", so it's one place rather than two copies that could
   // drift out of sync with each other.
+  // BUGFIX (not upstream): zoom_changed was recomputing clusters (a full
+  // re-projection + grid-bucket pass over every record, see
+  // waeComputeClusters()) SYNCHRONOUSLY on every single firing, with no
+  // debounce at all -- and Google Maps fires zoom_changed once per
+  // discrete zoom level, not once per gesture, so a fast scroll-wheel
+  // zoom through several levels (or a double-click zoom, which animates
+  // through intermediate levels on its own) could trigger several of
+  // these expensive synchronous recomputes back to back, each one
+  // blocking the main thread while the map itself is trying to animate
+  // -- reported as "zooming becomes very slow while markers are
+  // rendered". Debounced now (waeZoomDebounceMs, trailing-edge -- only
+  // the LAST zoom level in a fast sequence actually triggers a
+  // recompute, not every intermediate one) and moved off zoom_changed
+  // onto idle, which fires once after the map has actually settled
+  // (covers pans too, not just zooms, but idle only fires once per
+  // gesture regardless, so that's a single redundant recompute on a pure
+  // pan at worst, not a pileup of them) -- see waeComputeClusters()'s own
+  // comment for the other half of this fix (caching each record's
+  // projected position, which zoom itself never actually changes).
+  const WAE_ZOOM_DEBOUNCE_MS = 200;
   function waeSetCurrentMap(map, surface) {
     if (WAE_PULSES.map === map) return;
     waeClearPulses();
     WAE_PULSES.map = map;
     WAE_PULSES.surface = map ? (surface || null) : null;
-    // Re-cluster on every zoom change -- clustering itself is zoom-
-    // dependent (screen-pixel distance changes with zoom even though
-    // lat/lng doesn't), so this can't just be a cheap visibility toggle
-    // anymore. Still no 'idle'/pan listener at all -- individual markers
-    // within one cluster layout still reposition themselves on pan with
-    // no app code involved, only a zoom step changes which records
-    // group together. Only added here (i.e. only when the map reference
-    // actually changed) rather than on every waeAttachToMapIfNeeded()
-    // call -- WFMM.map.refresh() returns the same cached object on
-    // repeated calls as long as it's still valid, and re-adding this
-    // listener every time would stack up duplicates.
-    if (map) map.addListener?.('zoom_changed', () => waeRefreshPulses());
+    if (map) {
+      let debounceTimer = null;
+      map.addListener?.('idle', () => {
+        clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(waeRefreshPulses, WAE_ZOOM_DEBOUNCE_MS);
+      });
+    }
   }
 
   async function waeAttachToMapIfNeeded() {
@@ -2518,9 +2599,31 @@
   // <a> into ".wfmapmods-settings-links" the first time it exists, found
   // via a MutationObserver on document.documentElement (childList+subtree,
   // debounced 50ms) that fires until "#wfmapmods-side-panel" is present.
-  // That script disconnects its observer once its links are in; this one
-  // does the same, since the settings section persists for the rest of
-  // the SPA session once Base has rendered it once.
+  //
+  // BUGFIX (not upstream): that other script's own observer disconnects
+  // itself once its links are in, and this one used to copy that exactly
+  // on the assumption that the settings section persists for the rest of
+  // the SPA session once Base has rendered it once -- reported as the
+  // plugin becoming completely unreachable ("unavailable") after
+  // swapping between different pages on the same domain, since Wayfarer
+  // being an Angular app means most navigation between its own routed
+  // views (mapview, submit-new, etc.) is client-side, not a real page
+  // load this script would ever re-run for. If Base's own side panel (or
+  // just the .wfmapmods-settings-links section within it) gets torn down
+  // and rebuilt by Angular's router on one of those navigations -- not
+  // confirmed against Base's own source, but consistent with ordinary
+  // Angular router behavior and with what was actually reported -- an
+  // observer that already disconnected itself the first time would have
+  // no way to notice the link is gone and never re-add it, permanently
+  // losing the only way to reach this plugin's panel even though its own
+  // background logic (map tracking, etc.) keeps running the whole time.
+  // Left running indefinitely now instead (only actually disconnected in
+  // stopPlugin()) so a rebuilt side panel gets the link re-inserted the
+  // same way the very first appearance did. The observer's own handler
+  // is already a cheap early-return once the link exists, so leaving it
+  // attached for the rest of the page's lifetime rather than a one-shot
+  // "until inserted" watch isn't a meaningfully heavier cost, just a more
+  // correct one for an SPA.
   // ---------------------------------------------------------------------
 
   const SETTINGS_LINK_ID = 'wae-settings-link';
@@ -2549,7 +2652,7 @@
 
   function sidePanelMutationHandler() {
     if (!document.querySelector('#wfmapmods-side-panel')) return;
-    if (insertSettingsLinkIfReady()) stopSidePanelWatcher();
+    insertSettingsLinkIfReady();
   }
 
   function startSidePanelWatcher() {

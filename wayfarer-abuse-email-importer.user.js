@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Email Importer
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      4.7.5
+// @version      4.7.6
 // @description  Imports Niantic Support "Reporting Abuse in Wayfarer" tickets from Gmail via OAuth, or from .eml files -- using a port of bilde2910/OPR-Tools' email parser -- and stores them for the Abuse Report Extractor script (and other consumers) to search.
 // @author       Frankmans
 // @grant        GM_xmlhttpRequest
@@ -26,6 +26,17 @@
 // exception, not an oversight.
 
 /*
+ * v4.7.6 CHANGE FROM v4.7.5: fixes the plugin becoming permanently
+ * unreachable ("unavailable") after swapping between different pages on
+ * the same domain, matching the extractor's own v1.29.1 fix -- see that
+ * script's changelog entry, or this file's own "Map Mods - Base side
+ * panel integration" section comment, for the full explanation. Short
+ * version: the settings-link MutationObserver used to disconnect itself
+ * once the link was first inserted, which loses the only way to reach
+ * this plugin's panel if Base's own side panel section is ever torn down
+ * and rebuilt by Angular's router during navigation. Left running for
+ * the plugin's whole lifetime now instead.
+ *
  * v4.7.5 CHANGE FROM v4.7.4: SUPPORTED_SENDERS now also includes
  * support@scopelyexplore.mail.helpshift.com -- confirmed via a real
  * ticket where the only email actually available was a named agent's
@@ -1129,6 +1140,16 @@
   // it exists, found via a debounced MutationObserver gated on
   // "#wfmapmods-side-panel". Replaces the old standalone floating button --
   // the panel now opens from this link instead.
+  //
+  // BUGFIX (not upstream, matching the extractor's own fix): the observer
+  // used to disconnect itself the moment the link was first inserted,
+  // on the assumption the settings section persists for the rest of the
+  // SPA session -- see the extractor's own copy of this comment for the
+  // full "swapping between pages can make the plugin unavailable"
+  // explanation. Left running indefinitely now (only actually
+  // disconnected in stopPlugin()) so a side panel that gets torn down
+  // and rebuilt by Angular's router on navigation gets the link
+  // re-inserted the same way the first appearance did.
   // ---------------------------------------------------------------------
 
   const SETTINGS_LINK_ID = 'wei-settings-link';
@@ -1157,7 +1178,7 @@
 
   function sidePanelMutationHandler() {
     if (!document.querySelector('#wfmapmods-side-panel')) return;
-    if (insertSettingsLinkIfReady()) stopSidePanelWatcher();
+    insertSettingsLinkIfReady();
   }
 
   function startSidePanelWatcher() {
