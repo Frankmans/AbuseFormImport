@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Report Extractor
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.29.1
+// @version      1.29.3
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -15,6 +15,37 @@
 // ==/UserScript==
 
 /*
+ * v1.29.3 CHANGE FROM v1.29.2: markers still weren't showing up
+ * consistently on the submit-Wayspot page specifically, even after the
+ * route-level WFMM.map fixes from v1.26.x -- see the WAE_MAP_PERIODIC_
+ * RECHECK_MS block (right above waeStartMapTracking()) for the full
+ * explanation and the honest caveat that the exact cause isn't confirmed
+ * against Base's own source. Short version: unlike the general mapview,
+ * /new/submit/new is a single route from start to finish, and if its
+ * underlying map object gets torn down and recreated partway through
+ * that flow, nothing here had a way to notice -- route-change events
+ * don't fire without an actual route change, and the not-found retry
+ * only fires from a failed search, not an already-attached map quietly
+ * going stale under it. Added a periodic (5s) safety-net
+ * WFMM.map.refresh() call, gated on pulses actually being on, to catch
+ * this regardless of the exact cause -- negligible cost when nothing's
+ * changed (refresh()'s fast path is just a staleness check against a
+ * cached value), real work only on the tick where something actually
+ * did.
+ *
+ * v1.29.2 CHANGE FROM v1.29.1: fixes the Status/Last Response columns
+ * visually overlapping -- see the STYLE block's own "BUGFIX v1.29.2"
+ * comment (right above the column-width rules) for the full explanation.
+ * Short version: the per-column width percentages were tuned for 7
+ * columns and never revisited when Last Response was added, leaving it
+ * and Status too narrow for a status pill and a date + sort-arrow header
+ * to actually fit -- and since overflow:hidden only applied to the two
+ * free-text columns at the time, that content visually spilled out past
+ * its own cell into its neighbor instead of wrapping or clipping.
+ * Rebalanced the widths and extended overflow:hidden to every column, so
+ * the same thing clips instead of bleeding into a neighbor if a future
+ * column ever ends up undersized the same way.
+ *
  * v1.29.1 CHANGE FROM v1.29.0: fixes the plugin becoming permanently
  * unreachable ("unavailable") after swapping between different pages on
  * the same domain -- see the "Map Mods - Base side panel integration"
@@ -1596,6 +1627,30 @@
   // appear anyway a few seconds later, which reads as more confusing
   // than just letting a manual click be its own cheap retry.
   const WAE_MAP_RETRY_LIMIT = 3;
+  // BUGFIX (not upstream): abuse crosses still weren't showing up
+  // reliably on the submit-Wayspot page specifically, even after the
+  // route-level fixes above -- reported as "inconsistent" rather than
+  // "never", which pointed at something route-level tracking wouldn't
+  // catch. Likely explanation (not confirmed against Base's own source,
+  // since this needs live testing on the actual submit flow to fully
+  // verify): unlike the general mapview, /new/submit/new is ONE route
+  // start to finish -- picking a location, confirming it, moving between
+  // whatever internal steps that flow has -- and if the underlying
+  // google.maps.Map object gets torn down and recreated as part of that
+  // (rather than staying the same instance for the route's whole
+  // lifetime), nothing here would ever notice: onEnterMapRoute/
+  // onChangeMapRoute only fire on an actual ROUTE change, and this
+  // plugin's own map:not-found retry above only fires from a failed
+  // SEARCH, not from an already-attached map silently going stale under
+  // it. A periodic safety-net refresh() call, gated on pulses actually
+  // being on, covers this regardless of the exact internal cause --
+  // refresh()'s own fast path (the currently-attached map is still
+  // valid) is just a staleness check against a cached value, so this
+  // costs essentially nothing on every tick where nothing's actually
+  // changed, and only does real work (a fresh search, then onReady above
+  // picking up the result) on the tick where it turns out something did.
+  const WAE_MAP_PERIODIC_RECHECK_MS = 5000;
+  let waeMapPeriodicRecheckTimer = null;
 
   function waeStartMapTracking() {
     if (waeMapReadyUnsub) return; // already subscribed
@@ -1624,6 +1679,9 @@
         if (isMapPulsesEnabled()) WFMM.map.refresh({ reason: 'wae-retry-after-not-found' });
       }, 3000);
     });
+    waeMapPeriodicRecheckTimer = setInterval(() => {
+      if (isMapPulsesEnabled()) WFMM.map.refresh({ reason: 'wae-periodic-recheck' });
+    }, WAE_MAP_PERIODIC_RECHECK_MS);
   }
 
   function waeStopMapTracking() {
@@ -1633,6 +1691,7 @@
     waeRouteChangeUnsub?.();
     waeMapNotFoundUnsub?.();
     if (waeMapRetryTimer) { clearTimeout(waeMapRetryTimer); waeMapRetryTimer = null; }
+    if (waeMapPeriodicRecheckTimer) { clearInterval(waeMapPeriodicRecheckTimer); waeMapPeriodicRecheckTimer = null; }
     waeMapReadyUnsub = null;
     waeMapClearedUnsub = null;
     waeRouteEnterUnsub = null;
@@ -1911,21 +1970,34 @@
        rolled #wae-table had this constraint (max-width:160px + ellipsis
        on every td) and it silently didn't carry over when the table
        switched to WFMM.ui.table() -- fixed widths per column below (by
-       position, since table() has no per-column width option) plus
-       ellipsis truncation on the two variable-length text columns
-       (Conversation, Wayspot Name) restores it, this time scoped to just
-       those two rather than every td (lat/lng/status are short fixed-
-       format values that were never the problem). */
+       position, since table() has no per-column width option) restore
+       it.
+       BUGFIX v1.29.2: percentages below were tuned for 7 columns and
+       never revisited when the "Last Response" column was added
+       (v1.28.0), landing it and Status (both real content -- a status
+       pill, and a date + sort-arrow header -- not filler) too narrow for
+       what they actually render. Only columns 1-2 had overflow:hidden at
+       the time (the two free-text columns, the original overflow risk),
+       so instead of wrapping or clipping, Status'/Last Response's own
+       content just visually spilled out past their cell boundary into
+       whatever sits next to them -- reported as the two columns
+       "overlapping". Widths rebalanced below to actually fit a "Pending
+       Review" badge and a wrapped two-line "Last Response ▼" header
+       without that, and overflow:hidden now applies to every column, not
+       just the two free-text ones -- so the next new column added here
+       clips instead of bleeding into its neighbor if it's ever undersized
+       the same way, rather than silently reproducing this exact bug
+       again. */
     .wae-table{ table-layout: fixed; }
-    .wae-table th:nth-child(1), .wae-table td:nth-child(1){ width: 16%; }
-    .wae-table th:nth-child(2), .wae-table td:nth-child(2){ width: 28%; }
-    .wae-table th:nth-child(3), .wae-table td:nth-child(3){ width: 10%; }
-    .wae-table th:nth-child(4), .wae-table td:nth-child(4){ width: 10%; }
-    .wae-table th:nth-child(5), .wae-table td:nth-child(5){ width: 6%; }
-    .wae-table th:nth-child(6), .wae-table td:nth-child(6){ width: 6%; }
-    .wae-table th:nth-child(7), .wae-table td:nth-child(7){ width: 10%; }
-    .wae-table th:nth-child(8), .wae-table td:nth-child(8){ width: 14%; }
-    .wae-table td:nth-child(1), .wae-table td:nth-child(2){
+    .wae-table th:nth-child(1), .wae-table td:nth-child(1){ width: 10%; }
+    .wae-table th:nth-child(2), .wae-table td:nth-child(2){ width: 22%; }
+    .wae-table th:nth-child(3), .wae-table td:nth-child(3){ width: 9%; }
+    .wae-table th:nth-child(4), .wae-table td:nth-child(4){ width: 9%; }
+    .wae-table th:nth-child(5), .wae-table td:nth-child(5){ width: 5%; }
+    .wae-table th:nth-child(6), .wae-table td:nth-child(6){ width: 5%; }
+    .wae-table th:nth-child(7), .wae-table td:nth-child(7){ width: 18%; }
+    .wae-table th:nth-child(8), .wae-table td:nth-child(8){ width: 22%; }
+    .wae-table td{
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     }
     .wae-pagination{ display:flex; align-items:center; justify-content:center; gap:10px; margin-top:8px; }
