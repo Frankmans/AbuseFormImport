@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Report Extractor
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.29.3
+// @version      1.29.4
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -15,6 +15,20 @@
 // ==/UserScript==
 
 /*
+ * v1.29.4 CHANGE FROM v1.29.3: yes -- confirmed and fixed. Even after the
+ * zoom-debounce and cached-projection fixes (v1.29.0), every recompute
+ * was still clustering/diffing markers against the ENTIRE dataset with
+ * coordinates, worldwide, regardless of how small a slice of the map was
+ * actually visible -- zoomed into one city out of a countrywide dataset
+ * was still full-dataset work for a screen that could only ever show a
+ * city's worth of it. waeGetPaddedBounds()/waeWithinPaddedBounds() (right
+ * above waeRefreshPulses()) now filter to the current viewport (padded
+ * 75% in every direction, so a small pan doesn't immediately show a gap
+ * at the edge before the next idle catches up) before clustering runs at
+ * all -- the biggest win of the three zoom-performance fixes so far for
+ * anyone with a large dataset who's normally zoomed into one area of it,
+ * not looking at the whole thing at once.
+ *
  * v1.29.3 CHANGE FROM v1.29.2: markers still weren't showing up
  * consistently on the submit-Wayspot page specifically, even after the
  * route-level WFMM.map fixes from v1.26.x -- see the WAE_MAP_PERIODIC_
@@ -1467,6 +1481,40 @@
   // member record ids, so re-running at the SAME zoom with the SAME data
   // (e.g. after a scan that didn't change anything) doesn't recreate
   // markers needlessly -- only a genuine zoom change or data change does.
+  // BUGFIX (not upstream): even after the zoom-debounce and cached-
+  // projection fixes (v1.29.0), zoom could still be slow with a large
+  // dataset -- every recompute was still clustering/diffing markers for
+  // EVERY record with coordinates, worldwide, regardless of how small a
+  // slice of the map was actually visible. Zoomed into one city out of a
+  // dataset covering a whole country, that's still full-dataset work for
+  // a screen that can only ever show a city's worth of it. Padding
+  // (WAE_VIEWPORT_PAD_FACTOR, 75% of the viewport's own span in each
+  // direction) means panning a little doesn't immediately show a blank
+  // gap at the edge while markers there catch up on the next idle --
+  // there's already a one-recompute-per-settle delay from the debounce,
+  // so a modest buffer around the visible area smooths that over.
+  // Longitude wraparound at the antimeridian isn't handled (a plain
+  // west<=lng<=east range check, which breaks if the view happens to
+  // straddle it) -- a real gap, but one shared with the existing nearby-
+  // duplicate grid-bucketing's own simplifications, and not worth the
+  // extra complexity for how rarely an abuse report near the date line
+  // would come up in practice.
+  const WAE_VIEWPORT_PAD_FACTOR = 0.75;
+  function waeGetPaddedBounds(map) {
+    const bounds = map.getBounds?.();
+    if (!bounds) return null; // no bounds yet (e.g. map not fully idle) -- caller should render everything rather than wrongly show nothing
+    const ne = bounds.getNorthEast();
+    const sw = bounds.getSouthWest();
+    const latPad = (ne.lat() - sw.lat()) * WAE_VIEWPORT_PAD_FACTOR;
+    const lngPad = (ne.lng() - sw.lng()) * WAE_VIEWPORT_PAD_FACTOR;
+    return { north: ne.lat() + latPad, south: sw.lat() - latPad, east: ne.lng() + lngPad, west: sw.lng() - lngPad };
+  }
+  function waeWithinPaddedBounds(record, padded) {
+    if (!padded) return true;
+    return record.latitude >= padded.south && record.latitude <= padded.north
+      && record.longitude >= padded.west && record.longitude <= padded.east;
+  }
+
   function waeRefreshPulses() {
     const map = WAE_PULSES.map;
     // No local staleness check needed anymore -- WFMM.map.onCleared()
@@ -1481,7 +1529,8 @@
       return;
     }
 
-    const wanted = waeAllRecords.filter((r) => Number.isFinite(r.latitude) && Number.isFinite(r.longitude));
+    const paddedBounds = waeGetPaddedBounds(map);
+    const wanted = waeAllRecords.filter((r) => Number.isFinite(r.latitude) && Number.isFinite(r.longitude) && waeWithinPaddedBounds(r, paddedBounds));
     const clusters = waeComputeClusters(map, wanted);
     const wantedKeys = new Set(clusters.map(waeClusterKey));
     const appearance = waeLoadAppearance();
