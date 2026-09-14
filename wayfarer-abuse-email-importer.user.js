@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Email Importer
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      4.7.6
+// @version      4.8.0
 // @description  Imports Niantic Support "Reporting Abuse in Wayfarer" tickets from Gmail via OAuth, or from .eml files -- using a port of bilde2910/OPR-Tools' email parser -- and stores them for the Abuse Report Extractor script (and other consumers) to search.
 // @author       Frankmans
 // @grant        GM_xmlhttpRequest
@@ -26,6 +26,22 @@
 // exception, not an oversight.
 
 /*
+ * v4.8.0 CHANGE FROM v4.7.6: fixes a large batch of Gmail fetch failures
+ * (e.g. "2806 message(s) failed to fetch") with zero visibility into why
+ * -- see the WEI_RETRYABLE_STATUSES block (right above fetchMessagesRaw())
+ * for the full explanation. Two parts: (1) gmApiGet() already produced a
+ * real, specific error (an HTTP status, a message) for every failure,
+ * but nothing ever looked at it beyond the one authExpired special
+ * case -- runSync()'s own logging now breaks failures down by an actual
+ * reason ("2790 rate limited (HTTP 429), 16 network error") instead of a
+ * bare count with nowhere to look for more detail. (2) the likely actual
+ * root cause -- Gmail API rate-limiting on a large batch, with
+ * CONCURRENCY=5 and no backoff at all -- is now retried automatically
+ * (exponential backoff, up to 3 attempts, honoring a Retry-After header
+ * when Gmail sends one) for 429/403-rate-limit and transient 5xx errors
+ * specifically, rather than every one of those being treated as a
+ * permanent failure on the first try.
+ *
  * v4.7.6 CHANGE FROM v4.7.5: fixes the plugin becoming permanently
  * unreachable ("unavailable") after swapping between different pages on
  * the same domain, matching the extractor's own v1.29.1 fix -- see that
@@ -506,14 +522,22 @@
         onload: (res) => {
           if (res.status >= 200 && res.status < 300) {
             try { resolve(JSON.parse(res.responseText)); }
-            catch (e) { reject(new Error('Gmail API returned something that wasn\u2019t valid JSON')); }
+            catch (e) { reject(Object.assign(new Error('Gmail API returned something that wasn\u2019t valid JSON'), { status: res.status })); }
           } else if (res.status === 401) {
-            reject(Object.assign(new Error('Gmail token expired or was revoked'), { authExpired: true }));
+            reject(Object.assign(new Error('Gmail token expired or was revoked'), { authExpired: true, status: 401 }));
           } else {
-            reject(new Error(`Gmail API error ${res.status}: ${res.responseText.slice(0, 300)}`));
+            // status/retryAfter tagged on here (not just folded into the
+            // message string) so fetchMessagesRaw()'s retry logic and
+            // runSync()'s error-breakdown logging can both act on the
+            // status code directly, rather than each having to re-parse
+            // it back out of a formatted string -- see BUGFIX note below.
+            reject(Object.assign(new Error(`Gmail API error ${res.status}: ${res.responseText.slice(0, 300)}`), {
+              status: res.status,
+              retryAfter: Number(res.responseHeaders?.match(/retry-after:\s*(\d+)/i)?.[1]) || null,
+            }));
           }
         },
-        onerror: () => reject(new Error('Network error calling the Gmail API')),
+        onerror: () => reject(Object.assign(new Error('Network error calling the Gmail API'), { status: null })),
       });
     });
   }
@@ -555,6 +579,49 @@
     return ids;
   }
 
+  // BUGFIX (not upstream): a large sync (thousands of messages) could
+  // come back with a large fraction failed -- reported as 2806 out of a
+  // batch failing with zero visibility into why beyond a bare count.
+  // gmApiGet() itself already produced a real, specific error for each
+  // failure (an HTTP status, a message), fetchMessagesRaw() just never
+  // gave any of that to its caller -- see runSync()'s own updated
+  // logging below for the other half of this fix. Root cause for a
+  // failure spike this size is almost certainly Gmail API rate-limiting
+  // (429, or occasionally 403 with a rate-limit reason instead) --
+  // CONCURRENCY=5 with no backoff at all on a batch of thousands can
+  // easily outrun Gmail's own per-user quota, and every single one of
+  // those was being treated as a permanent failure rather than "try
+  // again shortly". Retried now (exponential backoff, capped at 3
+  // attempts total per message) specifically for the status codes where
+  // retrying is actually the right move -- 429/403 (rate limit) and
+  // 500/502/503/504 (transient server-side) -- honoring a Retry-After
+  // header when Gmail sends one rather than guessing. 401 (token
+  // expired) and anything else (a genuinely malformed request, a
+  // permissions issue, etc.) still fail immediately, same as before --
+  // retrying those would just waste time on something backoff can't fix.
+  const WEI_RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
+  function weiIsRateLimitError(e) {
+    if (e?.status === 429) return true;
+    // Gmail sometimes returns 403 for a rate/quota issue instead of 429 --
+    // the distinguishing "reason" only shows up in the response body, not
+    // the status code, so a plain 403 (an actual permissions problem) has
+    // to be told apart by checking for that text rather than the status
+    // alone.
+    return e?.status === 403 && /rateLimitExceeded|userRateLimitExceeded|quotaExceeded/i.test(e?.message || '');
+  }
+  function weiIsRetryableError(e) {
+    return weiIsRateLimitError(e) || WEI_RETRYABLE_STATUSES.has(e?.status);
+  }
+  function weiSleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+  function weiDescribeFetchError(e) {
+    if (weiIsRateLimitError(e)) return `rate limited (HTTP ${e.status})`;
+    if (WEI_RETRYABLE_STATUSES.has(e?.status)) return `transient server error (HTTP ${e.status})`;
+    if (e?.status) return `HTTP ${e.status}`;
+    return 'network error';
+  }
+
   // Bounded-concurrency fetch of each message's raw RFC822 content.
   async function fetchMessagesRaw(ids, token, onProgress) {
     const results = new Array(ids.length);
@@ -563,12 +630,24 @@
       while (cursor < ids.length) {
         const i = cursor++;
         const url = `https://gmail.googleapis.com/gmail/v1/users/me/messages/${ids[i]}?format=raw`;
-        try {
-          const msg = await gmApiGet(url, token);
-          results[i] = { id: ids[i], raw: msg.raw, error: null };
-        } catch (e) {
-          results[i] = { id: ids[i], raw: null, error: e };
+        let lastError = null;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            const msg = await gmApiGet(url, token);
+            results[i] = { id: ids[i], raw: msg.raw, error: null };
+            lastError = null;
+            break;
+          } catch (e) {
+            lastError = e;
+            if (attempt < 2 && weiIsRetryableError(e)) {
+              const delayMs = e.retryAfter ? e.retryAfter * 1000 : 500 * Math.pow(2, attempt);
+              await weiSleep(delayMs);
+              continue;
+            }
+            break;
+          }
         }
+        if (lastError) results[i] = { id: ids[i], raw: null, error: lastError };
         done++;
         if (onProgress) onProgress(done, ids.length);
       }
@@ -772,11 +851,27 @@
       });
 
       const records = [];
-      let fetchErrors = 0, parseErrors = 0;
+      let parseErrors = 0;
+      // Grouped by a readable label rather than logged once per message --
+      // with a failure count in the thousands, one line per message would
+      // both flood the 200-line log cap and bury everything else in it,
+      // while telling the user nothing they couldn't already see from the
+      // bare count. A breakdown by WHY (rate-limited vs. some other HTTP
+      // status vs. a plain network error) is what's actually useful here
+      // -- see the BUGFIX note on WEI_RETRYABLE_STATUSES above for why
+      // this was invisible before (the specific error each fetch failed
+      // with existed, in gmApiGet()'s own thrown Error, but nothing here
+      // ever looked at it).
+      const fetchErrorCounts = new Map();
+      let authExpiredSeen = false;
       for (const r of raws) {
         if (r.error) {
-          fetchErrors++;
-          if (r.error.authExpired) weiLog('Gmail token expired mid-sync -- run Sync again to resume', 'err');
+          if (r.error.authExpired) {
+            authExpiredSeen = true;
+          } else {
+            const label = weiDescribeFetchError(r.error);
+            fetchErrorCounts.set(label, (fetchErrorCounts.get(label) || 0) + 1);
+          }
           continue;
         }
         try {
@@ -793,7 +888,18 @@
         const abuseSuffix = abuseCount ? `, ${abuseCount} abuse report ticket${abuseCount === 1 ? '' : 's'}` : '';
         weiLog(`✓ ${auto ? 'Auto-sync: synced' : 'Synced'} ${records.length} message(s) from Gmail: ${inserted} new, ${updated} updated${abuseSuffix}`, 'ok');
       }
-      if (fetchErrors) weiLog(`${fetchErrors} message(s) failed to fetch (see above)`, 'err');
+      if (authExpiredSeen) weiLog('Gmail token expired mid-sync -- run Sync again to resume', 'err');
+      const totalFetchErrors = Array.from(fetchErrorCounts.values()).reduce((a, b) => a + b, 0);
+      if (totalFetchErrors) {
+        const breakdown = Array.from(fetchErrorCounts.entries())
+          .sort((a, b) => b[1] - a[1])
+          .map(([label, count]) => `${count} ${label}`)
+          .join(', ');
+        weiLog(`✗ ${totalFetchErrors} message(s) failed to fetch: ${breakdown}`, 'err');
+        if (Array.from(fetchErrorCounts.keys()).some((label) => label.startsWith('rate limited'))) {
+          weiLog('Most/all of those were rate-limited by Gmail -- already retried automatically a couple of times each. If some are still missing, try Sync again in a few minutes, or turn down how often Auto-sync runs.', 'skip');
+        }
+      }
       if (parseErrors) weiLog(`${parseErrors} message(s) could not be parsed as MIME email`, 'err');
 
       localStorage.setItem(LAST_SYNC_KEY, String(syncStartedAt));
