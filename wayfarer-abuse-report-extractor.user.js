@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Report Extractor
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.29.4
+// @version      1.30.0
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -15,6 +15,20 @@
 // ==/UserScript==
 
 /*
+ * v1.30.0 CHANGE FROM v1.29.4: adds a live-Wayspot ticket annotation --
+ * clicking a Wayspot on the map now shows "#<ticket>" just above the
+ * LIVE/status badge row in its side-panel details card, for any Wayspot
+ * within WAE_NEARBY_THRESHOLD_METERS of one of this plugin's own
+ * extracted locations. See waeStartSidePanelDetailsWatcher()'s own
+ * comment (right above it) for the full mechanism -- found after
+ * confirming there's no hook into Wayfarer's truly-native popup
+ * rendering, but WFMM.sidePanel (real, public, confirmed against
+ * src/core/side-panel.js -- the same service Base's own code uses to
+ * build that exact card) turned out to expose enough to append into the
+ * ALREADY-rendered card without needing one. Multiple matching tickets
+ * show comma-separated; no match means nothing gets added, same
+ * appearance as before this version everywhere else.
+ *
  * v1.29.4 CHANGE FROM v1.29.3: yes -- confirmed and fixed. Even after the
  * zoom-debounce and cached-projection fixes (v1.29.0), every recompute
  * was still clustering/diffing markers against the ENTIRE dataset with
@@ -1749,6 +1763,82 @@
     waeMapRetriesLeft = 0;
   }
 
+  // ---------------------------------------------------------------------
+  // Live Wayspot ticket annotation -- appends "#<ticket>" just above the
+  // LIVE/status badge row in the side panel's own Wayspot details card
+  // (the one that opens when you click a Wayspot on the map), for any
+  // Wayspot within WAE_NEARBY_THRESHOLD_METERS of one of this plugin's
+  // own extracted locations.
+  //
+  // Uses WFMM.sidePanel -- a real, public service (confirmed against the
+  // real source, src/core/side-panel.js), NOT the same as this plugin's
+  // OWN "Show on Map" markers/popups, and NOT a hook into Wayfarer's
+  // truly-native rendering (there isn't a confirmed one -- see the
+  // earlier back-and-forth on this feature for why an approach that
+  // needed one was abandoned). This IS how Base itself builds that same
+  // card (createPoiDetailsElement(), confirmed against the same source),
+  // so this plugin is using the identical public surface Base's own code
+  // does, not reverse-engineering something undocumented.
+  //
+  // The mechanism: WFMM.sidePanel.setDetails() -- what Base calls every
+  // time a different Wayspot gets selected -- fully replaces the details
+  // slot's content, THEN emits "side-panel:details-changed" with a
+  // reference to that slot. This plugin only ever listens for that event
+  // and inserts one extra element into the ALREADY-rendered slot after
+  // the fact -- it never calls setDetails() itself, which would wipe out
+  // Base's own card (title, photo, everything) rather than adding to it.
+  // Each event gives a freshly-Base-rendered slot (whatever this plugin
+  // inserted last time is already gone by the time the event fires, wiped
+  // by Base's own replaceSlotContent()), so there's nothing to clean up
+  // beforehand -- just insert fresh every time, or don't if there's no
+  // match.
+  //
+  // Which Wayspot is showing isn't in the event payload itself (just
+  // {pluginId, panel, slot}) -- read from the already-rendered DOM
+  // instead: the coords element Base's own createCoordsElement() builds
+  // carries the exact lat/lng as data-lat/data-lng attributes (confirmed
+  // against the same source), which is more robust than trying to parse
+  // the "(50.312940,6.731698)" display text back apart.
+  let waeSidePanelDetailsUnsub = null;
+
+  function waeFindMatchingTicketNumbers(lat, lng) {
+    const seen = new Set();
+    for (const r of waeAllRecords) {
+      if (!Number.isFinite(r.latitude) || !Number.isFinite(r.longitude)) continue;
+      if (waeHaversineMeters(lat, lng, r.latitude, r.longitude) <= WAE_NEARBY_THRESHOLD_METERS) {
+        seen.add(r.conversationId || r.sourceEmailId);
+      }
+    }
+    return Array.from(seen);
+  }
+
+  function waeStartSidePanelDetailsWatcher() {
+    if (waeSidePanelDetailsUnsub) return; // already subscribed
+    const WFMM = wfmmWindow.WFMM;
+    waeSidePanelDetailsUnsub = WFMM.events.on(WFMM.sidePanel.EVENTS.DETAILS_CHANGED, ({ slot }) => {
+      if (!slot) return;
+      const coordsEl = slot.querySelector('.wfmapmods-detail-coords');
+      const lat = Number(coordsEl?.dataset.lat);
+      const lng = Number(coordsEl?.dataset.lng);
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+
+      const tickets = waeFindMatchingTicketNumbers(lat, lng);
+      if (!tickets.length) return;
+
+      const statusRow = slot.querySelector('.wfmapmods-detail-status');
+      if (!statusRow || !statusRow.parentNode) return;
+      const line = document.createElement('div');
+      line.className = 'wae-detail-ticket-line';
+      line.textContent = tickets.map((t) => `#${t}`).join(', ');
+      statusRow.parentNode.insertBefore(line, statusRow);
+    });
+  }
+
+  function waeStopSidePanelDetailsWatcher() {
+    waeSidePanelDetailsUnsub?.();
+    waeSidePanelDetailsUnsub = null;
+  }
+
   // Panel-row click -> jump the map to that location. The panel is a
   // full-screen backdrop, so the map isn't visible until it closes -- this
   // closes it as part of navigating BY DEFAULT, the same way clicking a
@@ -2011,6 +2101,15 @@
     .wae-log div.warn{ color:#b45309; }
     .wae-log div.err{ color:#dc2626; }
     .wae-search-input{ margin:6px 0; }
+    /* Live Wayspot ticket annotation -- see waeStartSidePanelDetailsWatcher()'s
+       own comment. Styled as a small badge-ish line (not plain text, and
+       not one of the wae-status-badge pills either) so it reads as "this
+       plugin added something here" without looking like it's part of
+       Base's own card. */
+    .wae-detail-ticket-line{
+      font-size:11px; font-weight:600; color:#dc2626;
+      margin:2px 0 6px;
+    }
     /* BUGFIX v1.25.0: WFMM.ui.table()'s own base CSS (.wfmm-table) has no
        table-layout:fixed and no per-cell max-width/overflow -- columns
        size purely to content, so one long unbroken string (e.g. a URL)
@@ -2844,6 +2943,10 @@
     // subscriptions themselves are cheap and their callbacks already
     // check isMapPulsesEnabled() before doing any real work.
     waeStartMapTracking();
+    // Unlike map pulses, this doesn't depend on "Show on Map" being
+    // toggled at all -- it's a separate feature (see its own comment)
+    // that should just always be live while the plugin itself is.
+    waeStartSidePanelDetailsWatcher();
     waeResyncMapIfVisible();
   }
 
@@ -2853,6 +2956,7 @@
     waeCloseNearbyPopover();
     closePanel(); // no-op if the panel isn't open; openModal's own close() tears its DOM down
     waeStopMapTracking();
+    waeStopSidePanelDetailsWatcher();
     waeClearPulses();
     waeUnregisterAppearance?.();
     waeUnregisterAppearance = null;
