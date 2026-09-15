@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Email Importer
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      4.8.1
+// @version      4.8.2
 // @description  Imports Niantic Support "Reporting Abuse in Wayfarer" tickets from Gmail via OAuth, or from .eml files -- using a port of bilde2910/OPR-Tools' email parser -- and stores them for the Abuse Report Extractor script (and other consumers) to search.
 // @author       Frankmans
 // @grant        GM_xmlhttpRequest
@@ -26,6 +26,27 @@
 // exception, not an oversight.
 
 /*
+ * v4.8.2 CHANGE FROM v4.8.1: v4.8.1's own error-sample logging did its
+ * job -- surfaced the real text behind another "HTTP 403" case (3274/3274
+ * fetches, confirmed real message: "Quota exceeded for quota metric
+ * 'Total Query Cost' and limit 'Units per minute per user'..."), which
+ * revealed two more bugs at once. (1) A literal one: the rate-limit
+ * regex checked for "quotaExceeded" (no space, the older Gmail-specific
+ * reason-enum spelling), but this newer Google API error wording is
+ * "Quota exceeded" (with a space) -- so it silently fell through to an
+ * unhelpful bare label with zero retries, despite being about as
+ * short-term as a rate limit gets ("per minute"). Fixed with a \s*
+ * between the words. (2) A real design gap once (1) was fixed: this
+ * quota is shared across every concurrent request, not per-message, so
+ * CONCURRENCY=5 workers each individually backing off their own one
+ * failed message would just have the other four re-hit the same still-
+ * exhausted quota within milliseconds -- no per-message retry delay can
+ * let a SHARED budget actually recover. Added weiQuotaCooldownUntil, a
+ * module-level gate every worker checks before its next request, so
+ * whichever one hits this error first pauses all of them for ~65s
+ * (rather than each independently discovering the same exhaustion one
+ * 403 at a time).
+ *
  * v4.8.1 CHANGE FROM v4.8.0: v4.8.0's own diagnostic breakdown surfaced a
  * real case its guessed labels didn't cover -- 2823/2823 fetches failing
  * identically with a bare "HTTP 403" that didn't match the
@@ -644,7 +665,18 @@
     // the status code, so a plain 403 (an actual permissions problem) has
     // to be told apart by checking for that text rather than the status
     // alone.
-    return e?.status === 403 && /rateLimitExceeded|userRateLimitExceeded|quotaExceeded/i.test(e?.message || '');
+    //
+    // BUGFIX (not upstream): \s* between "quota" and "exceeded" -- a
+    // literal quotaExceeded (no space, the older Gmail-specific reason
+    // enum this already checked for) does NOT match a real confirmed
+    // message using Google's newer, more generic quota-error wording
+    // instead: "Quota exceeded for quota metric 'Total Query Cost' and
+    // limit 'Units per minute per user'..." -- note the space. That's a
+    // plain per-MINUTE quota (about as short-term as a rate limit gets),
+    // but fell all the way through to an unhelpful bare "HTTP 403" with
+    // zero retries, since neither this check nor weiIsDailyLimitError's
+    // matched it.
+    return /rateLimitExceeded|userRateLimitExceeded/i.test(e?.message || '') || /quota\s*exceeded/i.test(e?.message || '');
   }
   function weiIsRetryableError(e) {
     if (weiIsDailyLimitError(e)) return false;
@@ -661,6 +693,27 @@
     return 'network error';
   }
 
+  // BUGFIX (not upstream): even with weiIsRateLimitError() now correctly
+  // catching this, a per-MESSAGE retry alone isn't enough for a "Units
+  // per minute per user" quota specifically -- confirmed via a real sync
+  // where 3274/3274 fetches failed the same way. That quota is shared
+  // across every concurrent request this script makes, not per-message,
+  // so with CONCURRENCY=5 workers all still firing new requests the
+  // instant one of them backs off, the other four just re-hit the exact
+  // same still-exhausted quota within milliseconds -- individually
+  // backing off one message at a time can never actually let a shared
+  // per-minute budget recover. weiQuotaCooldownUntil is a MODULE-level
+  // gate every worker checks before its next request (not just the one
+  // that got the 403) -- whichever worker hits this error first pauses
+  // ALL of them for WEI_QUOTA_COOLDOWN_MS, rather than each discovering
+  // the same exhausted quota independently, one 403 at a time. 65s
+  // (rather than a flat 60s) intentionally overshoots a per-minute
+  // window rather than racing its exact edge, in case this fetch's own
+  // "now" and Google's own quota-window boundary aren't perfectly
+  // aligned.
+  const WEI_QUOTA_COOLDOWN_MS = 65000;
+  let weiQuotaCooldownUntil = 0;
+
   // Bounded-concurrency fetch of each message's raw RFC822 content.
   async function fetchMessagesRaw(ids, token, onProgress) {
     const results = new Array(ids.length);
@@ -668,6 +721,9 @@
     async function worker() {
       while (cursor < ids.length) {
         const i = cursor++;
+        if (Date.now() < weiQuotaCooldownUntil) {
+          await weiSleep(weiQuotaCooldownUntil - Date.now());
+        }
         const url = `https://gmail.googleapis.com/gmail/v1/users/me/messages/${ids[i]}?format=raw`;
         let lastError = null;
         for (let attempt = 0; attempt < 3; attempt++) {
@@ -678,9 +734,21 @@
             break;
           } catch (e) {
             lastError = e;
+            if (weiIsRateLimitError(e)) {
+              // Shared cooldown, not just this one message's own retry
+              // delay -- see WEI_QUOTA_COOLDOWN_MS's own comment. Only
+              // ever pushes the deadline further out, never back in, so
+              // several workers hitting this around the same time don't
+              // each reset it to a shorter wait than what's already
+              // in effect.
+              weiQuotaCooldownUntil = Math.max(weiQuotaCooldownUntil, Date.now() + (e.retryAfter ? e.retryAfter * 1000 : WEI_QUOTA_COOLDOWN_MS));
+            }
             if (attempt < 2 && weiIsRetryableError(e)) {
-              const delayMs = e.retryAfter ? e.retryAfter * 1000 : 500 * Math.pow(2, attempt);
-              await weiSleep(delayMs);
+              if (weiIsRateLimitError(e)) {
+                await weiSleep(Math.max(0, weiQuotaCooldownUntil - Date.now()));
+              } else {
+                await weiSleep(e.retryAfter ? e.retryAfter * 1000 : 500 * Math.pow(2, attempt));
+              }
               continue;
             }
             break;
