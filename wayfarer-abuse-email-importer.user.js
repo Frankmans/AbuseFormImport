@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Email Importer
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      4.8.0
+// @version      4.8.1
 // @description  Imports Niantic Support "Reporting Abuse in Wayfarer" tickets from Gmail via OAuth, or from .eml files -- using a port of bilde2910/OPR-Tools' email parser -- and stores them for the Abuse Report Extractor script (and other consumers) to search.
 // @author       Frankmans
 // @grant        GM_xmlhttpRequest
@@ -26,6 +26,23 @@
 // exception, not an oversight.
 
 /*
+ * v4.8.1 CHANGE FROM v4.8.0: v4.8.0's own diagnostic breakdown surfaced a
+ * real case its guessed labels didn't cover -- 2823/2823 fetches failing
+ * identically with a bare "HTTP 403" that didn't match the
+ * rateLimitExceeded/quotaExceeded text it was checking for. Two fixes:
+ * (1) the log now also shows a sample of Gmail's own actual error TEXT
+ * for each distinct failure label, not just the label -- rather than
+ * keep guessing at every possible reason string Gmail might send back,
+ * showing its own message directly answers it. (2) added detection for
+ * dailyLimitExceeded specifically, and -- unlike a per-second rate limit
+ * -- deliberately excluded it from the short-backoff retry path: a daily
+ * quota won't clear for potentially hours, so retrying it a few times a
+ * few seconds apart within the same sync is pure wasted time across
+ * thousands of messages, not a fix. Still labeled and surfaced clearly
+ * (as "daily quota exceeded", with matching advice -- try again
+ * tomorrow, not in a few minutes) rather than falling through to an
+ * unhelpful bare "HTTP 403" the way it did before this version.
+ *
  * v4.8.0 CHANGE FROM v4.7.6: fixes a large batch of Gmail fetch failures
  * (e.g. "2806 message(s) failed to fetch") with zero visibility into why
  * -- see the WEI_RETRYABLE_STATUSES block (right above fetchMessagesRaw())
@@ -599,9 +616,29 @@
   // expired) and anything else (a genuinely malformed request, a
   // permissions issue, etc.) still fail immediately, same as before --
   // retrying those would just waste time on something backoff can't fix.
+  //
+  // BUGFIX (not upstream): a DAILY quota error (403, reason
+  // dailyLimitExceeded) is a real case that fits "backoff can't fix it"
+  // just as much as a permissions error does, even though it's still a
+  // quota/rate issue in the general sense -- confirmed via a real sync
+  // where 2823/2823 fetches failed identically, which the short-backoff
+  // retry path (meant for per-second limits that often clear within
+  // seconds) would have just wasted several seconds per message on, for
+  // thousands of messages, before giving up anyway -- a quota that won't
+  // reset for potentially hours doesn't care how many times or how long
+  // you wait within the same sync run. Split out from the short-term
+  // rate-limit check below so it's identified and labeled the same way
+  // (still clearly a quota issue, not a bare unexplained "HTTP 403",
+  // and still excluded from being treated as instantly, permanently
+  // broken) but is deliberately NOT included in what
+  // weiIsRetryableError() will actually retry.
   const WEI_RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
+  function weiIsDailyLimitError(e) {
+    return e?.status === 403 && /dailyLimitExceeded/i.test(e?.message || '');
+  }
   function weiIsRateLimitError(e) {
     if (e?.status === 429) return true;
+    if (weiIsDailyLimitError(e)) return false;
     // Gmail sometimes returns 403 for a rate/quota issue instead of 429 --
     // the distinguishing "reason" only shows up in the response body, not
     // the status code, so a plain 403 (an actual permissions problem) has
@@ -610,12 +647,14 @@
     return e?.status === 403 && /rateLimitExceeded|userRateLimitExceeded|quotaExceeded/i.test(e?.message || '');
   }
   function weiIsRetryableError(e) {
+    if (weiIsDailyLimitError(e)) return false;
     return weiIsRateLimitError(e) || WEI_RETRYABLE_STATUSES.has(e?.status);
   }
   function weiSleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
   function weiDescribeFetchError(e) {
+    if (weiIsDailyLimitError(e)) return `daily quota exceeded (HTTP ${e.status})`;
     if (weiIsRateLimitError(e)) return `rate limited (HTTP ${e.status})`;
     if (WEI_RETRYABLE_STATUSES.has(e?.status)) return `transient server error (HTTP ${e.status})`;
     if (e?.status) return `HTTP ${e.status}`;
@@ -855,14 +894,23 @@
       // Grouped by a readable label rather than logged once per message --
       // with a failure count in the thousands, one line per message would
       // both flood the 200-line log cap and bury everything else in it,
-      // while telling the user nothing they couldn't already see from the
-      // bare count. A breakdown by WHY (rate-limited vs. some other HTTP
-      // status vs. a plain network error) is what's actually useful here
-      // -- see the BUGFIX note on WEI_RETRYABLE_STATUSES above for why
-      // this was invisible before (the specific error each fetch failed
-      // with existed, in gmApiGet()'s own thrown Error, but nothing here
-      // ever looked at it).
+      // Grouped by a readable label rather than logged once per message --
+      // with a failure count in the thousands, one line per message would
+      // both flood the 200-line log cap and bury everything else in it.
+      // A sample of the actual error TEXT for each label (not just the
+      // label itself) is kept alongside the count -- BUGFIX (not
+      // upstream): the first version of this only showed a guessed label
+      // ("HTTP 403") with nothing else, which turned out not to be enough
+      // to actually diagnose a real case (2823/2823 failing with the same
+      // status, consistently -- not the scattered pattern per-second rate-
+      // limiting would produce, and not matched by the rateLimitExceeded/
+      // quotaExceeded text this already checked for, so it fell through
+      // to a bare, unhelpful "HTTP 403"). Rather than keep guessing at
+      // every possible reason string Gmail might send back, showing
+      // Gmail's own actual message text directly answers it without
+      // another guess-and-check round trip.
       const fetchErrorCounts = new Map();
+      const fetchErrorSamples = new Map();
       let authExpiredSeen = false;
       for (const r of raws) {
         if (r.error) {
@@ -871,6 +919,7 @@
           } else {
             const label = weiDescribeFetchError(r.error);
             fetchErrorCounts.set(label, (fetchErrorCounts.get(label) || 0) + 1);
+            if (!fetchErrorSamples.has(label)) fetchErrorSamples.set(label, r.error.message || String(r.error));
           }
           continue;
         }
@@ -896,8 +945,14 @@
           .map(([label, count]) => `${count} ${label}`)
           .join(', ');
         weiLog(`✗ ${totalFetchErrors} message(s) failed to fetch: ${breakdown}`, 'err');
+        for (const [label, sample] of fetchErrorSamples.entries()) {
+          weiLog(`  ${label} sample: ${sample}`, 'err');
+        }
         if (Array.from(fetchErrorCounts.keys()).some((label) => label.startsWith('rate limited'))) {
           weiLog('Most/all of those were rate-limited by Gmail -- already retried automatically a couple of times each. If some are still missing, try Sync again in a few minutes, or turn down how often Auto-sync runs.', 'skip');
+        }
+        if (Array.from(fetchErrorCounts.keys()).some((label) => label.startsWith('daily quota exceeded'))) {
+          weiLog('Those hit a DAILY Gmail API quota -- unlike a per-second rate limit, that won\u2019t clear for potentially hours, so retrying again soon (today) will very likely fail the same way. Try again tomorrow, or check/raise the quota on the Google Cloud project this OAuth Client ID belongs to.', 'skip');
         }
       }
       if (parseErrors) weiLog(`${parseErrors} message(s) could not be parsed as MIME email`, 'err');
