@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Report Extractor
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.32.1
+// @version      1.32.2
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -15,6 +15,10 @@
 // ==/UserScript==
 
 /*
+ * v1.32.2 CHANGE FROM v1.32.1: centers the ticket-number line in the
+ * Wayspot details side panel (see v1.30.0) -- was left-aligned, matching
+ * the metadata lines around it; now centered instead.
+ *
  * v1.32.1 CHANGE FROM v1.32.0: fixes sorting by star not being possible
  * -- the star column's header label was '' (correctly copied from the
  * Comment/Nearby icon columns, which are NOT sortable), but combined
@@ -2207,7 +2211,7 @@
        Base's own card. */
     .wae-detail-ticket-line{
       font-size:11px; font-weight:600; color:#dc2626;
-      margin:2px 0 6px;
+      margin:2px 0 6px; text-align:center;
     }
     /* Star toggle -- matches Report History's own \u2605/\u2606 button
        convention (plain glyph, no pill/border) rather than inventing a
