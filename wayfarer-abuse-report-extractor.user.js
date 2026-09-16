@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Report Extractor
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.32.0
+// @version      1.32.1
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -15,6 +15,15 @@
 // ==/UserScript==
 
 /*
+ * v1.32.1 CHANGE FROM v1.32.0: fixes sorting by star not being possible
+ * -- the star column's header label was '' (correctly copied from the
+ * Comment/Nearby icon columns, which are NOT sortable), but combined
+ * with sortable: true, table()'s own header-building code rendered a
+ * real, clickable sort button with genuinely no visible text -- it
+ * technically worked, there was just nothing to see or reliably click.
+ * The header label is now a literal \u2605, giving it something visible
+ * (and self-explanatory) to click, same as every other sortable column.
+ *
  * v1.32.0 CHANGE FROM v1.31.0: registers the abuse-cross markers as a
  * real WFMM.layers entry ("Abuse Report Crosses") instead of only being
  * toggleable from this plugin's own "Show on Map" button -- confirmed
@@ -2383,7 +2392,19 @@
 
     const columns = [
       {
-        key: 'starred', label: '', sortable: true, cellClassName: 'wae-star-cell',
+        // BUGFIX (not upstream): label was '' (matching the Comment/
+        // Nearby icon columns, which are correctly blank since they're
+        // NOT sortable) -- but combined with sortable: true, table()'s
+        // own header-building code (children: [column.label ?? column.key,
+        // marker]) renders a real, clickable sort button with genuinely
+        // no visible text before it's ever been sorted by, since ''
+        // isn't nullish and so doesn't fall through to column.key
+        // either. The button technically existed and worked, there was
+        // just nothing to see or reliably click -- reported as sorting
+        // by star not being possible at all. A literal star as the
+        // header label fixes both at once: something visible to click,
+        // and it reads as "this column is about stars" on its own.
+        key: 'starred', label: '\u2605', sortable: true, cellClassName: 'wae-star-cell',
         render: (r) => waeUiApi.createElement('button', {
           className: 'wae-star-toggle',
           text: r.starred ? '\u2605' : '\u2606',
