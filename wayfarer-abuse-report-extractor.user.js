@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Report Extractor
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.30.0
+// @version      1.32.0
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -15,6 +15,37 @@
 // ==/UserScript==
 
 /*
+ * v1.32.0 CHANGE FROM v1.31.0: registers the abuse-cross markers as a
+ * real WFMM.layers entry ("Abuse Report Crosses") instead of only being
+ * toggleable from this plugin's own "Show on Map" button -- confirmed
+ * against the real source that the suite's native Layers menu (the
+ * stacked-squares icon next to the map's search bar) just iterates
+ * WFMM.layers.list() and builds a plain checkbox per entry, so
+ * registering is the whole integration; nothing else needed for it to
+ * show up there with a working toggle. WFMM.layers (backed by WFMM's own
+ * settings persistence) is now the single source of truth for on/off --
+ * the old standalone localStorage flag (WAE_MAP_VISIBLE_KEY) is only
+ * read once, as the starting default for whoever upgrades into this
+ * version with it already set, never written to again. The "Show on Map"
+ * button still works exactly as before, it just flips the same shared
+ * flag now, so toggling from the button or from the native Layers menu
+ * can never drift out of sync with each other.
+ *
+ * v1.31.0 CHANGE FROM v1.30.0: adds a star/favorite toggle to the table,
+ * matching Report History's own \u2605/\u2606 button (confirmed against
+ * the real source -- it's called "Star" there, not "Favorite", flagged
+ * per-record with a boolean field, no separate favorites list). Click the
+ * star cell to toggle; sortable like the other columns (ascending shows
+ * starred first, matching Report History's own "Starred first" wording
+ * for the same sort), included in the CSV export, and -- since a scan
+ * fully rebuilds the extracted-records store from the source emails every
+ * time rather than upserting (see the scan handler's own long-standing
+ * "Rebuild from scratch" comment) -- explicitly carried forward across a
+ * re-scan by matching ticket+coordinates (not the row's own `id`, which
+ * isn't reliably stable across scans either -- see waeStarredKey()'s own
+ * comment), so re-scanning doesn't silently un-star everything the way a
+ * naive rebuild would have.
+ *
  * v1.30.0 CHANGE FROM v1.29.4: adds a live-Wayspot ticket annotation --
  * clicking a Wayspot on the map now shows "#<ticket>" just above the
  * LIVE/status badge row in its side-panel details card, for any Wayspot
@@ -1110,7 +1141,16 @@
   // naming which ticket a marker belongs to earns its keep here.
   // ---------------------------------------------------------------------
 
+  // BUGFIX (not upstream): only kept now for its OLD saved value, read
+  // once at registration time (see startPlugin()) as the starting
+  // default for WAE_LAYER_ID the first time this version ever runs for a
+  // given user -- WFMM.layers itself is the actual source of truth for
+  // on/off going forward (see isMapPulsesEnabled()'s own comment for the
+  // full explanation), not this key. Never written to again after this
+  // version; left in place rather than deleted since there's no harm in
+  // an unused old key sitting in localStorage.
   const WAE_MAP_VISIBLE_KEY = 'wae_map_pulses_visible';
+  const WAE_LAYER_ID = 'wae-abuse-crosses';
   // Whether clicking a table row (waeGoToLocation()) closes this panel as
   // part of jumping the map to that location. Defaults to on (matches
   // every version before this setting existed) -- since the panel is a
@@ -1138,7 +1178,7 @@
   // survives a full page reload, not just closing/reopening the panel --
   // module-level state alone already covered that part, same as before.
   const WAE_SORT_STORAGE_KEY = 'wae_sort_state';
-  const WAE_SORTABLE_KEYS = ['conversation', 'status', 'lastResponse'];
+  const WAE_SORTABLE_KEYS = ['starred', 'conversation', 'status', 'lastResponse'];
   function waeLoadSortState() {
     try {
       const saved = JSON.parse(localStorage.getItem(WAE_SORT_STORAGE_KEY) || 'null');
@@ -1865,8 +1905,57 @@
     google.maps.event.addListenerOnce(map, 'idle', () => waeShowPulseInfoWindow(record, latLng));
   }
 
+  // BUGFIX (not upstream): this used to be its own independent
+  // localStorage flag, toggled only from this plugin's own "Show on Map"
+  // button -- meaning it had no presence in the suite's own native
+  // Layers menu (the stacked-squares icon next to the map's search bar),
+  // unlike Wayspots/OSM/etc. Registered as a real WFMM.layers entry now
+  // (see startPlugin()) instead, confirmed against the real source
+  // (src/core/layers.js) -- that menu (src/plugins/map-ui/layers-menu.js)
+  // just iterates WFMM.layers.list() and builds a plain checkbox per
+  // entry, so registering ours is the entire integration; nothing else
+  // to build for it to show up there with a working toggle. This is now
+  // the single source of truth for on/off, backed by WFMM's own settings
+  // persistence rather than this plugin's -- both this function and the
+  // "Show on Map" button (see its own click handler) go through it, so
+  // toggling from either place, or from the native Layers menu itself,
+  // all stay in sync automatically.
   function isMapPulsesEnabled() {
-    return localStorage.getItem(WAE_MAP_VISIBLE_KEY) === 'true';
+    return wfmmWindow.WFMM.layers.isEnabled(WAE_LAYER_ID);
+  }
+
+  // The one place that actually reacts to the layer's on/off state
+  // changing, regardless of which of the three places changed it (this
+  // plugin's own button, the native Layers menu, or a future caller of
+  // WFMM.layers.setEnabled() this plugin doesn't know about yet) --
+  // registered as the layer's own onChange in startPlugin(), and also
+  // what the "Show on Map" button's click handler wraps rather than
+  // duplicating this same attach/refresh/clear logic itself.
+  async function waeApplyLayerEnabled(enabled) {
+    if (enabled) {
+      if (waeUI) {
+        waeUI.mapToggleBtn.disabled = true;
+        waeUI.mapToggleBtn.textContent = 'Attaching to map...';
+      }
+      const attached = await waeAttachToMapIfNeeded();
+      if (attached) {
+        waeRefreshPulses();
+      } else {
+        if (waeUI) log(waeUI.logEl, '✗ Could not find the Wayfarer map on this page -- try again from the mapview or the submit-Wayspot map.', 'err');
+        // Couldn't actually attach -- don't leave the layer claiming to
+        // be on. Triggers this same function again (via onChange, since
+        // the state genuinely changes false->true->false), which just
+        // takes the `else` branch below and no-ops on an already-empty
+        // set of markers.
+        wfmmWindow.WFMM.layers.setEnabled(WAE_LAYER_ID, false);
+      }
+    } else {
+      waeClearPulses();
+    }
+    if (waeUI) {
+      waeUI.mapToggleBtn.disabled = false;
+      waeUI.mapToggleBtn.textContent = isMapPulsesEnabled() ? 'Hide from Map' : 'Show on Map';
+    }
   }
 
   // Re-syncs the map layer with whatever's currently in storage, but only
@@ -2023,6 +2112,7 @@
   // ---------------------------------------------------------------------
 
   const CSV_COLUMNS = [
+    ['starred', 'Starred'],
     ['conversationId', 'Conversation ID'],
     ['ticketStatus', 'Ticket Status'],
     ['lastResponseAt', 'Last Response (UTC)'],
@@ -2110,6 +2200,15 @@
       font-size:11px; font-weight:600; color:#dc2626;
       margin:2px 0 6px;
     }
+    /* Star toggle -- matches Report History's own \u2605/\u2606 button
+       convention (plain glyph, no pill/border) rather than inventing a
+       new visual language for what's already a familiar affordance. */
+    .wae-star-cell{ text-align:center; cursor:pointer; }
+    .wae-star-toggle{
+      background:none; border:none; padding:0; margin:0; cursor:pointer;
+      font-size:15px; line-height:1; color:#d97706;
+    }
+    .wae-star-toggle:hover{ color:#b45309; }
     /* BUGFIX v1.25.0: WFMM.ui.table()'s own base CSS (.wfmm-table) has no
        table-layout:fixed and no per-cell max-width/overflow -- columns
        size purely to content, so one long unbroken string (e.g. a URL)
@@ -2137,14 +2236,15 @@
        the same way, rather than silently reproducing this exact bug
        again. */
     .wae-table{ table-layout: fixed; }
-    .wae-table th:nth-child(1), .wae-table td:nth-child(1){ width: 10%; }
-    .wae-table th:nth-child(2), .wae-table td:nth-child(2){ width: 22%; }
-    .wae-table th:nth-child(3), .wae-table td:nth-child(3){ width: 9%; }
+    .wae-table th:nth-child(1), .wae-table td:nth-child(1){ width: 5%; }
+    .wae-table th:nth-child(2), .wae-table td:nth-child(2){ width: 8%; }
+    .wae-table th:nth-child(3), .wae-table td:nth-child(3){ width: 19%; }
     .wae-table th:nth-child(4), .wae-table td:nth-child(4){ width: 9%; }
-    .wae-table th:nth-child(5), .wae-table td:nth-child(5){ width: 5%; }
+    .wae-table th:nth-child(5), .wae-table td:nth-child(5){ width: 9%; }
     .wae-table th:nth-child(6), .wae-table td:nth-child(6){ width: 5%; }
-    .wae-table th:nth-child(7), .wae-table td:nth-child(7){ width: 18%; }
-    .wae-table th:nth-child(8), .wae-table td:nth-child(8){ width: 22%; }
+    .wae-table th:nth-child(7), .wae-table td:nth-child(7){ width: 5%; }
+    .wae-table th:nth-child(8), .wae-table td:nth-child(8){ width: 18%; }
+    .wae-table th:nth-child(9), .wae-table td:nth-child(9){ width: 22%; }
     .wae-table td{
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     }
@@ -2239,6 +2339,26 @@
     return { short: d.toLocaleDateString(), full: d.toLocaleString() };
   }
 
+  // Identity key for carrying a starred flag across a re-scan -- NOT the
+  // record's own `id`, which isn't reliably stable between scans (a
+  // ticket's row count can change if extraction finds more/fewer
+  // locations than last time, shifting the "conv:X:0"/"conv:X:1"-style
+  // index suffixes -- see the scan handler's own "Rebuild from scratch"
+  // comment for why that already rules out id-based upserting for the
+  // rows themselves, and the same instability applies here). Coordinates
+  // are what actually identify "the same real-world location" across two
+  // scans of the same source emails, so ticket + coordinates is used
+  // instead wherever a record has them; falling back to ticket + name for
+  // the (rarer) case of a starred record with no coordinates, since
+  // there's nothing else stable enough to key on there.
+  function waeStarredKey(r) {
+    const ticket = r.conversationId || r.sourceEmailId || '';
+    if (Number.isFinite(r.latitude) && Number.isFinite(r.longitude)) {
+      return `${ticket}|${r.latitude.toFixed(6)},${r.longitude.toFixed(6)}`;
+    }
+    return `${ticket}|name:${r.wayspotName || ''}`;
+  }
+
   // Builds the table (or an empty-state) for the current page, using
   // WFMM.ui.table()/pager()/emptyState() instead of an innerHTML string --
   // see the v1.22.0 changelog note. table()'s own onRowClick fires for
@@ -2262,6 +2382,14 @@
     const pageRecords = sorted.slice(startIdx, startIdx + WAE_PAGE_SIZE);
 
     const columns = [
+      {
+        key: 'starred', label: '', sortable: true, cellClassName: 'wae-star-cell',
+        render: (r) => waeUiApi.createElement('button', {
+          className: 'wae-star-toggle',
+          text: r.starred ? '\u2605' : '\u2606',
+          attrs: { type: 'button', title: r.starred ? 'Unstar' : 'Star' },
+        }),
+      },
       {
         key: 'conversation', label: 'Conversation', sortable: true,
         render: (r) => {
@@ -2337,6 +2465,25 @@
         waeRenderFilteredTable();
       },
       onRowClick: (record, rowIndex, event) => {
+        const starToggle = event.target.closest('.wae-star-toggle');
+        if (starToggle) {
+          event.stopPropagation();
+          const next = !record.starred;
+          record.starred = next;
+          starToggle.textContent = next ? '\u2605' : '\u2606';
+          starToggle.title = next ? 'Unstar' : 'Star';
+          // Fire-and-forget, same as Report History's own equivalent --
+          // the visible toggle above already happened, so a slow/failed
+          // write shouldn't block or roll back what the user just saw
+          // happen. putExtractedRecords() upserts by id, and `record` is
+          // the exact same object already held in waeAllRecords (not a
+          // copy), so this persists the one changed field without
+          // needing to touch or re-fetch anything else on the row.
+          putExtractedRecords([record]).catch((e) => {
+            if (waeUI) log(waeUI.logEl, `\u2717 Could not save star: ${e.message || e}`, 'err');
+          });
+          return;
+        }
         const flagTrigger = event.target.closest('.wae-nearby-trigger');
         if (flagTrigger) {
           event.stopPropagation();
@@ -2419,7 +2566,14 @@
     const filtered = q ? waeAllRecords.filter((r) => waeMatchesQuery(r, q)) : waeAllRecords;
     const dir = waeSortDirection === 'asc' ? 1 : -1;
     let compare;
-    if (waeSortKey === 'conversation') {
+    if (waeSortKey === 'starred') {
+      // Ascending (the default the first time this header's clicked)
+      // means starred-first here, not literally "false before true" --
+      // that reads as the useful default (show me what I starred),
+      // matching Report History's own "Starred first" wording for what
+      // amounts to the same sort.
+      compare = (a, b) => dir * ((a.starred ? 0 : 1) - (b.starred ? 0 : 1));
+    } else if (waeSortKey === 'conversation') {
       compare = (a, b) => dir * String(a.conversationId || a.sourceEmailId).localeCompare(String(b.conversationId || b.sourceEmailId), undefined, { numeric: true, sensitivity: 'base' });
     } else if (waeSortKey === 'status') {
       compare = (a, b) => dir * (waeStatusSortRank(a.ticketStatus) - waeStatusSortRank(b.ticketStatus));
@@ -2658,41 +2812,36 @@
       }, 200);
     });
 
-    mapToggleBtn.addEventListener('click', async () => {
-      const turningOn = !isMapPulsesEnabled();
-      if (turningOn) {
-        mapToggleBtn.disabled = true;
-        mapToggleBtn.textContent = 'Attaching to map...';
-        const attached = await waeAttachToMapIfNeeded();
-        mapToggleBtn.disabled = false;
-        if (!attached) {
-          log(logEl, '✗ Could not find the Wayfarer map on this page -- try again from the mapview or the submit-Wayspot map.', 'err');
-          mapToggleBtn.textContent = 'Show on Map';
-          return;
-        }
-        localStorage.setItem(WAE_MAP_VISIBLE_KEY, 'true');
-        await waeRefreshPulses();
-        // No waeStartStaleWatch()-equivalent call needed here anymore --
-        // waeStartMapTracking() (see startPlugin()) subscribes once for
-        // the plugin's whole lifetime, not per-toggle; its own callbacks
-        // already check isMapPulsesEnabled() before doing any real work,
-        // so there's nothing extra to arm just because the toggle turned
-        // on.
-        mapToggleBtn.textContent = 'Hide from Map';
-      } else {
-        localStorage.setItem(WAE_MAP_VISIBLE_KEY, 'false');
-        waeClearPulses();
-        mapToggleBtn.textContent = 'Show on Map';
-      }
+    // waeApplyLayerEnabled() (registered as WAE_LAYER_ID's own onChange in
+    // startPlugin()) does all the actual attach/refresh/clear work and
+    // updates this button's text/disabled state -- toggling here just
+    // flips the one shared WFMM.layers flag, so a toggle from this
+    // button and a toggle from the native Layers menu behave identically
+    // and never drift out of sync with each other.
+    mapToggleBtn.addEventListener('click', () => {
+      wfmmWindow.WFMM.layers.toggle(WAE_LAYER_ID);
     });
 
     scanBtn.addEventListener('click', async () => {
       scanBtn.disabled = true;
       progressEl.textContent = 'Scanning imported emails...';
       try {
+        // Fetched BEFORE the rebuild below wipes them -- carries starred
+        // flags forward across a re-scan, which the full-rebuild-from-
+        // scratch approach (see the comment a few lines down) would
+        // otherwise silently lose every single time, same as it would
+        // any other flag not sourced fresh from the emails themselves.
+        const previousRecords = await getAllExtractedRecords();
+        const starredKeys = new Set(previousRecords.filter((r) => r.starred).map(waeStarredKey));
+
         const { extracted, ticketDetails } = await scanImportedEmails((done, total) => {
           progressEl.textContent = `Scanning imported emails... ${done}/${total}`;
         });
+        if (starredKeys.size) {
+          for (const r of extracted) {
+            if (starredKeys.has(waeStarredKey(r))) r.starred = true;
+          }
+        }
         // Rebuild from scratch rather than upsert: a ticket's row count can
         // change between scans (a multi-location ticket now yields several
         // "conv:X:0" / "conv:X:1" / ... rows instead of one "conv:X" row),
@@ -2906,9 +3055,9 @@
     // Registering as an external plugin (the only path startPlugin() is
     // reached from -- see registerOrSelfStart() below) already implies
     // WFMM.plugins exists, which per the real v4.0.0+ source means
-    // WFMM.ui and WFMM.markerAppearance do too -- all populated by the
-    // same suite bootstrap (confirmed: WFMM.markerAppearance is assigned
-    // right alongside WFMM.ui in that bootstrap sequence).
+    // WFMM.ui, WFMM.markerAppearance, and WFMM.layers do too -- all
+    // populated by the same suite bootstrap (confirmed: all three are
+    // assigned right alongside each other in that bootstrap sequence).
     // injectStyle() is idempotent (replaces by id, see WFMM.ui's own
     // dom.js), so this is safe to call every startPlugin() -- no separate
     // "already injected" guard needed.
@@ -2935,6 +3084,22 @@
         return { markerType: 'generic', generic: { markerSize, fillColor, fillOpacity, borderColor, borderWidth, borderOpacity } };
       },
     });
+    // register() itself throws if the same id is already registered --
+    // same reasoning as registerStyle() above, and the same reason
+    // unregister() is paired with it in stopPlugin(). defaultEnabled
+    // reads the OLD standalone localStorage flag (see WAE_MAP_VISIBLE_KEY's
+    // own comment) purely as a one-time starting value for whoever
+    // upgrades into this version with it already set -- WFMM.layers'
+    // OWN persisted value (from a previous run of THIS version) always
+    // wins over this if one already exists, matching register()'s own
+    // documented savedEnabled ?? defaultEnabled priority.
+    wfmmWindow.WFMM.layers.register({
+      id: WAE_LAYER_ID,
+      pluginId: PLUGIN_ID,
+      label: 'Abuse Report Crosses',
+      defaultEnabled: localStorage.getItem(WAE_MAP_VISIBLE_KEY) === 'true',
+      onChange: (enabled) => { waeApplyLayerEnabled(enabled); },
+    });
     startSidePanelWatcher();
     // Subscribes to WFMM.map/WFMM.routes for this plugin's whole
     // lifetime (see waeStartMapTracking()'s own comment for why this
@@ -2960,6 +3125,7 @@
     waeClearPulses();
     waeUnregisterAppearance?.();
     waeUnregisterAppearance = null;
+    wfmmWindow.WFMM.layers.unregister(WAE_LAYER_ID);
   }
 
   // ---------------------------------------------------------------------
