@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Report Extractor
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.32.2
+// @version      1.33.0
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -15,6 +15,26 @@
 // ==/UserScript==
 
 /*
+ * v1.33.0 CHANGE FROM v1.32.2: removes this plugin's own "Show on Map"/
+ * "Hide from Map" button entirely -- purely redundant once v1.32.0
+ * registered the same on/off state as a real WFMM.layers entry with its
+ * own native checkbox in the suite's own Layers menu. Verified the whole
+ * mechanism end to end against the real source while doing this (not
+ * just the parts this plugin owns): register() itself does NOT invoke
+ * onChange on registration, only setEnabled() does when the state
+ * actually changes -- confirming waeResyncMapIfVisible() (called right
+ * after register() in startPlugin()) is what actually applies a
+ * restored/default "on" state on page load, not something left over and
+ * now redundant. The native Layers menu's own checkbox is wired to
+ * WFMM.layers.setEnabled() on change and rebuilds its whole list fresh
+ * every time it's opened (confirmed against src/plugins/map-ui/
+ * layers-menu.js), so it correctly reflects this plugin's layer being
+ * unregistered in stopPlugin() too, even though that specific event
+ * isn't one the menu subscribes to directly for a live in-place refresh
+ * -- reopening it shows the correct list regardless. No functional gap
+ * found; this version is a pure removal plus comment cleanup for
+ * everything that referenced the now-gone button/click handler.
+ *
  * v1.32.2 CHANGE FROM v1.32.1: centers the ticket-number line in the
  * Wayspot details side panel (see v1.30.0) -- was left-aligned, matching
  * the metadata lines around it; now centered instead.
@@ -1736,12 +1756,14 @@
   let waeMapRetriesLeft = 0;
   // Only armed for the two silent/background triggers below (the initial
   // resync at startup, and a route change) -- deliberately NOT armed for
-  // the "Show on Map" button's own click handler, which already has its
-  // own clear, immediate error message on failure; layering a delayed
-  // silent retry underneath that too would risk the button already
-  // having shown "couldn't find the map" while pulses then quietly
-  // appear anyway a few seconds later, which reads as more confusing
-  // than just letting a manual click be its own cheap retry.
+  // an explicit toggle (the native Layers menu checkbox, the only way to
+  // turn this on now -- see WAE_LAYER_ID's own comment), which already
+  // gets its own clear, immediate error message on failure via
+  // waeApplyLayerEnabled(); layering a delayed silent retry underneath
+  // that too would risk that error already having shown while pulses
+  // then quietly appear anyway a few seconds later, which reads as more
+  // confusing than just letting the user flip the checkbox again
+  // themselves as their own cheap retry.
   const WAE_MAP_RETRY_LIMIT = 3;
   // BUGFIX (not upstream): abuse crosses still weren't showing up
   // reliably on the submit-Wayspot page specifically, even after the
@@ -1929,27 +1951,25 @@
   // entry, so registering ours is the entire integration; nothing else
   // to build for it to show up there with a working toggle. This is now
   // the single source of truth for on/off, backed by WFMM's own settings
-  // persistence rather than this plugin's -- both this function and the
-  // "Show on Map" button (see its own click handler) go through it, so
-  // toggling from either place, or from the native Layers menu itself,
-  // all stay in sync automatically.
+  // persistence rather than this plugin's own. This plugin's own "Show
+  // on Map" button was removed entirely in v1.33.0 once it became purely
+  // redundant with that native checkbox -- the checkbox is the only way
+  // to toggle this now, and this function is just reading whatever it's
+  // currently set to.
   function isMapPulsesEnabled() {
     return wfmmWindow.WFMM.layers.isEnabled(WAE_LAYER_ID);
   }
 
   // The one place that actually reacts to the layer's on/off state
-  // changing, regardless of which of the three places changed it (this
-  // plugin's own button, the native Layers menu, or a future caller of
-  // WFMM.layers.setEnabled() this plugin doesn't know about yet) --
-  // registered as the layer's own onChange in startPlugin(), and also
-  // what the "Show on Map" button's click handler wraps rather than
-  // duplicating this same attach/refresh/clear logic itself.
+  // changing -- registered as the layer's own onChange in startPlugin().
+  // The only way to toggle this is the native Layers menu now (v1.33.0
+  // removed this plugin's own "Show on Map"/"Hide from Map" button,
+  // since it was entirely redundant with that menu once the layer was
+  // registered there -- see WAE_LAYER_ID's own comment) -- no button of
+  // this plugin's own left to show a transient "Attaching to map..."
+  // state on, or to disable/re-enable around the attach.
   async function waeApplyLayerEnabled(enabled) {
     if (enabled) {
-      if (waeUI) {
-        waeUI.mapToggleBtn.disabled = true;
-        waeUI.mapToggleBtn.textContent = 'Attaching to map...';
-      }
       const attached = await waeAttachToMapIfNeeded();
       if (attached) {
         waeRefreshPulses();
@@ -1964,10 +1984,6 @@
       }
     } else {
       waeClearPulses();
-    }
-    if (waeUI) {
-      waeUI.mapToggleBtn.disabled = false;
-      waeUI.mapToggleBtn.textContent = isMapPulsesEnabled() ? 'Hide from Map' : 'Show on Map';
     }
   }
 
@@ -2664,8 +2680,6 @@
 
     waeUI.exportBtn.disabled = waeAllRecords.length === 0;
     waeUI.clearBtn.disabled = waeAllRecords.length === 0;
-    waeUI.mapToggleBtn.disabled = withCoords === 0;
-    waeUI.mapToggleBtn.textContent = isMapPulsesEnabled() ? 'Hide from Map' : 'Show on Map';
   }
 
   let waeNearbyMapFingerprint = null;
@@ -2720,10 +2734,9 @@
     const countEl = ui.createElement('div', { className: 'wae-sub', text: 'Loading...' });
 
     const scanBtn = ui.button({ text: 'Scan Imported Emails', variant: 'primary' });
-    const mapToggleBtn = ui.button({ text: 'Show on Map', disabled: true });
     const exportBtn = ui.button({ text: 'Export CSV', disabled: true });
     const clearBtn = ui.button({ text: 'Clear Extracted Data', variant: 'danger', disabled: true });
-    const buttonRowEl = ui.buttonRow([scanBtn, mapToggleBtn, exportBtn, clearBtn]);
+    const buttonRowEl = ui.buttonRow([scanBtn, exportBtn, clearBtn]);
 
     const progressEl = ui.createElement('div', { className: 'wae-progress' });
 
@@ -2825,7 +2838,7 @@
 
     modal.body.append(countEl, buttonRowEl, progressEl, searchInput, autoCloseToggle.row, tableContainer, logEl, styleSection);
 
-    waeUI = { countEl, tableContainer, logEl, scanBtn, mapToggleBtn, exportBtn, clearBtn, searchInput };
+    waeUI = { countEl, tableContainer, logEl, scanBtn, exportBtn, clearBtn, searchInput };
 
     let waeSearchDebounceTimer = null;
     searchInput.addEventListener('input', () => {
@@ -2835,16 +2848,6 @@
         waeCurrentPage = 1;
         waeRenderFilteredTable();
       }, 200);
-    });
-
-    // waeApplyLayerEnabled() (registered as WAE_LAYER_ID's own onChange in
-    // startPlugin()) does all the actual attach/refresh/clear work and
-    // updates this button's text/disabled state -- toggling here just
-    // flips the one shared WFMM.layers flag, so a toggle from this
-    // button and a toggle from the native Layers menu behave identically
-    // and never drift out of sync with each other.
-    mapToggleBtn.addEventListener('click', () => {
-      wfmmWindow.WFMM.layers.toggle(WAE_LAYER_ID);
     });
 
     scanBtn.addEventListener('click', async () => {
