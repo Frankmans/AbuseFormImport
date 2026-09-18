@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Report Extractor
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.33.0
+// @version      1.34.1
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -15,6 +15,47 @@
 // ==/UserScript==
 
 /*
+ * v1.34.1 CHANGE FROM v1.34.0: fixes crosses vanishing on a zoom change
+ * and not coming back until the "Abuse Report Crosses" Layers checkbox
+ * is toggled off and back on. Root cause: the debounced 'idle' listener
+ * in waeSetCurrentMap() is the only thing that keeps the crosses synced
+ * with the map after the initial attach (confirmed against WFMM.map's
+ * own source: its refresh() fast path doesn't re-emit "map:ready" for a
+ * map that's still valid, so nothing else re-fires on an ordinary zoom),
+ * and neither it nor waeRefreshPulses()/waeComputeClusters() had any
+ * error handling. A transient non-finite projected point right as a
+ * zoom gesture settled (see waeComputeClusters()'s own comment) could
+ * throw partway through a render -- after old markers were already
+ * cleared but before new ones went up -- with no other automatic path
+ * left to retry it. Three changes: waeComputeClusters() now drops a
+ * record whose projected point isn't finite instead of letting it
+ * corrupt a cluster; waeRefreshPulses()'s per-cluster marker
+ * create/update is now individually try/caught so one bad cluster can't
+ * take the rest of the redraw down with it; and the 'idle' handler
+ * itself now catches a failure and retries once, shortly after, rather
+ * than leaving the layer empty until another map interaction happens to
+ * come along.
+ *
+ * v1.34.0 CHANGE FROM v1.33.0: adds "Import CSV" -- for locations that
+ * didn't come from a scanned email at all (a known problem spot from
+ * another source, something to track manually), not another export from
+ * this same tool. Deliberately forgiving: only Latitude/Longitude are
+ * required (matched case-insensitively against a few common spellings --
+ * "Lat"/"Latitude", "Lng"/"Long"/"Longitude" -- not one fixed header),
+ * every other column (Name/Comment/Conversation ID) is optional. A format
+ * hint with a one-line example is always shown above the button, not
+ * just after a failed attempt. Imported rows show up in the table/map
+ * like any other (Status "Imported", a distinct purple badge -- see
+ * WAE_STATUS_BADGES' own CSV_IMPORT entry) and are explicitly carried
+ * forward across a re-scan (which otherwise fully rebuilds the extracted-
+ * records store from scratch -- see the scan handler's own long-standing
+ * comment) and called out by name in the "Clear Extracted Data" confirm
+ * dialog, since -- unlike scanned data -- there's no email to re-derive a
+ * CSV-imported row from if either of those wipes it. Verified the parser
+ * itself (quoted fields with embedded commas, a bare lat/lng-only file,
+ * mixed valid/invalid rows, a missing-columns file, no trailing newline)
+ * against the exact example text shown in the hint before shipping this.
+ *
  * v1.33.0 CHANGE FROM v1.32.2: removes this plugin's own "Show on Map"/
  * "Hide from Map" button entirely -- purely redundant once v1.32.0
  * registered the same on/off state as a real WFMM.layers entry with its
@@ -1457,6 +1498,24 @@
     }
 
     const scale = Math.pow(2, zoom);
+    // BUGFIX (not upstream): projection.fromLatLngToPoint() -- or the
+    // `* scale` step right after it -- can transiently hand back a
+    // non-finite x/y for a split second right as a zoom gesture settles
+    // (observed as "crosses vanish on a zoom change and don't come back
+    // until the Layers checkbox is toggled off/on"). A single bad point
+    // here used to propagate into a cluster's averaged lat/lng below,
+    // which google.maps.Marker#setPosition() throws on (it requires
+    // finite coordinates) -- and since this whole computation runs
+    // inside the debounced 'idle' handler with no try/catch anywhere in
+    // the chain (see waeRefreshPulses()), that throw aborted the refresh
+    // AFTER old markers had already been cleared but BEFORE new ones
+    // were added, and nothing else re-triggers a refresh until the next
+    // zoom/pan -- so a transient bad value on the LAST settle of a zoom
+    // gesture left the layer empty indefinitely. Dropping just the
+    // offending record here (instead of letting a bad point corrupt
+    // whatever cluster it lands in) keeps one flaky projection from
+    // taking out the whole redraw; it's very likely to project cleanly
+    // again on the very next recompute.
     const points = records.map((r) => {
       let world = waeWorldPointCache.get(r.id);
       if (!world) {
@@ -1464,7 +1523,7 @@
         waeWorldPointCache.set(r.id, world);
       }
       return { record: r, x: world.x * scale, y: world.y * scale };
-    });
+    }).filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y));
 
     const cellSize = WAE_CLUSTER_PIXEL_RADIUS;
     const buckets = new Map();
@@ -1629,39 +1688,58 @@
       }
     }
 
+    // BUGFIX (not upstream): this loop used to run with no error handling
+    // at all -- if any single cluster's position/icon/etc call threw
+    // (e.g. a still-non-finite lat/lng that slipped past the filter in
+    // waeComputeClusters(), or any other one-off marker API hiccup), the
+    // exception aborted the WHOLE refresh right here, after the removal
+    // loop above had already cleared out markers no longer wanted --
+    // leaving the layer visibly empty (or half-updated) with nothing
+    // left to re-trigger a retry until the next zoom/pan (or the Layers
+    // checkbox, toggled off then back on, which calls this function
+    // directly outside the debounce). Isolating each cluster in its own
+    // try/catch means one bad cluster gets skipped -- and picked back up
+    // on the very next recompute, once whatever made it transiently bad
+    // has passed -- instead of taking every other cluster's marker down
+    // with it.
     for (const cluster of clusters) {
-      const key = waeClusterKey(cluster);
-      const isCluster = cluster.records.length > 1;
-      const position = { lat: cluster.lat, lng: cluster.lng };
-      let marker = WAE_PULSES.markersById.get(key);
-      if (!marker) {
-        marker = new google.maps.Marker({});
-        // Read from the marker itself, not a closed-over `cluster`, so a
-        // later re-render that rebuilds this same cluster's data is
-        // reflected even though the click listener below was only
-        // attached once at creation time.
-        marker.addListener('click', () => {
-          const c = marker.waeCluster;
-          if (c.records.length > 1) {
-            WAE_PULSES.map.setCenter(marker.getPosition());
-            WAE_PULSES.map.setZoom(Math.min((WAE_PULSES.map.getZoom() || 8) + 3, 21));
-          } else {
-            waeShowPulseInfoWindow(c.records[0], marker.getPosition());
-          }
-        });
-        WAE_PULSES.markersById.set(key, marker);
+      if (!Number.isFinite(cluster.lat) || !Number.isFinite(cluster.lng)) continue;
+      try {
+        const key = waeClusterKey(cluster);
+        const isCluster = cluster.records.length > 1;
+        const position = { lat: cluster.lat, lng: cluster.lng };
+        let marker = WAE_PULSES.markersById.get(key);
+        if (!marker) {
+          marker = new google.maps.Marker({});
+          // Read from the marker itself, not a closed-over `cluster`, so a
+          // later re-render that rebuilds this same cluster's data is
+          // reflected even though the click listener below was only
+          // attached once at creation time.
+          marker.addListener('click', () => {
+            const c = marker.waeCluster;
+            if (c.records.length > 1) {
+              WAE_PULSES.map.setCenter(marker.getPosition());
+              WAE_PULSES.map.setZoom(Math.min((WAE_PULSES.map.getZoom() || 8) + 3, 21));
+            } else {
+              waeShowPulseInfoWindow(c.records[0], marker.getPosition());
+            }
+          });
+          WAE_PULSES.markersById.set(key, marker);
+        }
+        marker.waeCluster = cluster;
+        marker.setPosition(position);
+        marker.setIcon(isCluster ? waeGetClusterIcon() : waeGetMarkerIcon());
+        marker.setLabel(isCluster ? { text: String(cluster.records.length), color: '#ffffff', fontSize: '10px', fontWeight: '700' } : null);
+        marker.setTitle(isCluster ? `${cluster.records.length} reports` : (cluster.records[0].wayspotName || '(unnamed report)'));
+        // setClickable(false) doesn't just suppress the click listener above
+        // -- it also drops the pointer cursor and lets the click reach
+        // whatever's underneath (the map itself, or a Wayspot marker at the
+        // same spot), which is the point of turning this off.
+        marker.setClickable(appearance.clickable);
+        marker.setMap(map);
+      } catch (e) {
+        console.warn('[Wayfarer Map Mods - Abuse Report Extractor] Skipped rendering one cluster:', e);
       }
-      marker.waeCluster = cluster;
-      marker.setPosition(position);
-      marker.setIcon(isCluster ? waeGetClusterIcon() : waeGetMarkerIcon());
-      marker.setLabel(isCluster ? { text: String(cluster.records.length), color: '#ffffff', fontSize: '10px', fontWeight: '700' } : null);
-      marker.setTitle(isCluster ? `${cluster.records.length} reports` : (cluster.records[0].wayspotName || '(unnamed report)'));
-      // setClickable(false) doesn't just suppress the click listener above
-      // -- it also drops the pointer cursor and lets the click reach
-      // whatever's underneath (the map itself, or a Wayspot marker at the
-      // same spot), which is the point of turning this off.
-      marker.setClickable(appearance.clickable);
-      marker.setMap(map);
     }
   }
 
@@ -1690,6 +1768,27 @@
   // comment for the other half of this fix (caching each record's
   // projected position, which zoom itself never actually changes).
   const WAE_ZOOM_DEBOUNCE_MS = 200;
+  // BUGFIX (not upstream): this 'idle' listener is the ONLY thing that
+  // keeps the crosses in sync with the map after the initial attach --
+  // WFMM.map.refresh()'s own fast path (confirmed against the real
+  // source) returns without re-emitting "map:ready" whenever the map is
+  // still valid, so nothing else here re-fires on an ordinary zoom/pan.
+  // That made this the single point of failure behind "crosses vanish on
+  // a zoom change and only come back after toggling the layer off/on":
+  // waeRefreshPulses() used to have no error handling at all, so if it
+  // threw for any reason on a given settle (a transient bad projection
+  // value right as the zoom gesture stopped -- see waeComputeClusters()'s
+  // own comment), the exception was swallowed by the browser as an
+  // uncaught error inside this setTimeout callback, and nothing else
+  // would call waeRefreshPulses() again until the NEXT zoom/pan (or the
+  // Layers checkbox, which calls it directly). If that failed settle
+  // happened to be the last one in the gesture -- i.e. the user stopped
+  // zooming right there -- the layer just stayed empty. Now: (1)
+  // waeRefreshPulses() itself no longer lets one bad cluster take the
+  // whole redraw down (see its own comment), and (2) this listener
+  // catches anything that still gets through and retries once, shortly
+  // after, instead of leaving the layer to rot until another map
+  // interaction happens to come along.
   function waeSetCurrentMap(map, surface) {
     if (WAE_PULSES.map === map) return;
     waeClearPulses();
@@ -1697,9 +1796,19 @@
     WAE_PULSES.surface = map ? (surface || null) : null;
     if (map) {
       let debounceTimer = null;
+      const runRefresh = () => {
+        try {
+          waeRefreshPulses();
+        } catch (e) {
+          console.warn('[Wayfarer Map Mods - Abuse Report Extractor] Pulse refresh failed, retrying shortly:', e);
+          setTimeout(() => {
+            try { waeRefreshPulses(); } catch (e2) { /* give up quietly -- next real map interaction will try again */ }
+          }, WAE_ZOOM_DEBOUNCE_MS);
+        }
+      };
       map.addListener?.('idle', () => {
         clearTimeout(debounceTimer);
-        debounceTimer = setTimeout(waeRefreshPulses, WAE_ZOOM_DEBOUNCE_MS);
+        debounceTimer = setTimeout(runRefresh, WAE_ZOOM_DEBOUNCE_MS);
       });
     }
   }
@@ -2186,13 +2295,121 @@
   }
 
   // ---------------------------------------------------------------------
-  // UI -- opened via a link injected into Map Mods - Base's own side panel
-  // settings section (.wfmapmods-settings-links), the same way Report
-  // Wayspots adds its "Reporting History" / "Reporting Settings" links
-  // (insertReportingHistoryLinkIfReady / insertReportingSettingsLinkIfReady
-  // -- both appendChild a plain <a>, found via a debounced MutationObserver
-  // gated on "#wfmapmods-side-panel"). The panel itself is now a real
-  // modal built from Base's own CSS classes (.wfmapmods-modal-backdrop /
+  // CSV import -- for locations that didn't come from a scanned email at
+  // all (a known problem spot from another source, something a reviewer
+  // wants to track manually, etc.) rather than anything this plugin
+  // extracted itself. Deliberately forgiving: only Latitude/Longitude are
+  // required, every other column is optional, and column names are
+  // matched case-insensitively against a short list of common spellings
+  // rather than requiring one exact header row -- someone hand-building a
+  // CSV in a spreadsheet app is the expected case, not another export
+  // from this same tool.
+  //
+  // A minimal RFC4180-ish parser (quoted fields, "" as an escaped quote
+  // inside one, commas/newlines inside quotes) -- not the full spec (no
+  // BOM stripping here specifically, since File.text() already decodes
+  // as UTF-8 and a leading BOM character just ends up harmless leading
+  // whitespace on the first header name once trimmed), but enough for
+  // what a spreadsheet app or a hand-written file will actually produce.
+  function csvParse(text) {
+    const rows = [];
+    let row = [];
+    let field = '';
+    let inQuotes = false;
+    let i = 0;
+    const n = text.length;
+    while (i < n) {
+      const c = text[i];
+      if (inQuotes) {
+        if (c === '"') {
+          if (text[i + 1] === '"') { field += '"'; i += 2; continue; }
+          inQuotes = false; i++; continue;
+        }
+        field += c; i++; continue;
+      }
+      if (c === '"') { inQuotes = true; i++; continue; }
+      if (c === ',') { row.push(field); field = ''; i++; continue; }
+      if (c === '\r') { i++; continue; } // swallow bare \r -- \r\n handled by the \n case below, a lone \r (old Mac line endings) still just ends the row
+      if (c === '\n') { row.push(field); rows.push(row); row = []; field = ''; i++; continue; }
+      field += c; i++;
+    }
+    // Final field/row if the file doesn't end in a newline.
+    if (field !== '' || row.length) { row.push(field); rows.push(row); }
+    return rows.filter((r) => !(r.length === 1 && r[0].trim() === '')); // drop fully-blank trailing lines
+  }
+
+  // header -> column index, matched against a few common spellings per
+  // field rather than one fixed name -- e.g. "Lat" and "Latitude" both
+  // work, so does "Lng"/"Long"/"Longitude". Latitude/longitude are the
+  // only ones that block the whole file if missing; everything else
+  // just means that field comes back empty for every row.
+  const WAE_CSV_COLUMN_ALIASES = {
+    latitude: ['latitude', 'lat'],
+    longitude: ['longitude', 'lng', 'long', 'lon'],
+    wayspotName: ['name', 'wayspot name', 'wayspotname'],
+    comment: ['comment', 'comments', 'note', 'notes'],
+    conversationId: ['conversation id', 'conversationid', 'ticket', 'ticket id', 'ticketid'],
+  };
+  function waeMapCsvHeader(headerRow) {
+    const normalized = headerRow.map((h) => h.trim().toLowerCase());
+    const indexOf = {};
+    for (const [field, aliases] of Object.entries(WAE_CSV_COLUMN_ALIASES)) {
+      const idx = normalized.findIndex((h) => aliases.includes(h));
+      if (idx !== -1) indexOf[field] = idx;
+    }
+    return indexOf;
+  }
+
+  // Returns { records, skipped, error }. `error` (a string) means the
+  // whole file was rejected outright (no usable header); otherwise each
+  // unparseable/out-of-range row is just skipped and counted rather than
+  // failing the whole import over one bad line.
+  function waeParseCsvImport(text) {
+    const rows = csvParse(text);
+    if (!rows.length) return { records: [], skipped: 0, error: 'That file is empty.' };
+    const indexOf = waeMapCsvHeader(rows[0]);
+    if (indexOf.latitude === undefined || indexOf.longitude === undefined) {
+      return { records: [], skipped: 0, error: 'Could not find Latitude/Longitude columns in the header row -- see the format hint above the button.' };
+    }
+    const records = [];
+    let skipped = 0;
+    for (const cells of rows.slice(1)) {
+      const lat = Number((cells[indexOf.latitude] || '').trim());
+      const lng = Number((cells[indexOf.longitude] || '').trim());
+      if (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) {
+        skipped++;
+        continue;
+      }
+      const conversationId = indexOf.conversationId !== undefined ? (cells[indexOf.conversationId] || '').trim() || null : null;
+      // A stable id (ticket + rounded coordinates) when the row supplies
+      // its own Conversation ID, so re-importing the same file updates
+      // those rows instead of duplicating them -- there's no other
+      // reliable dedup key for data that didn't come from this plugin's
+      // own extraction in the first place. Falls back to a random id
+      // when no Conversation ID is given, same as it would for any
+      // other never-seen-before location.
+      const id = conversationId
+        ? `csv:${conversationId}:${lat.toFixed(6)},${lng.toFixed(6)}`
+        : `csv:${crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`}`;
+      records.push({
+        id,
+        ticketKey: null,
+        conversationId,
+        ticketStatus: 'CSV_IMPORT',
+        lastResponseAt: null,
+        wayspotName: indexOf.wayspotName !== undefined ? (cells[indexOf.wayspotName] || '').trim() || null : null,
+        latitude: lat,
+        longitude: lng,
+        comment: indexOf.comment !== undefined ? (cells[indexOf.comment] || '').trim() || null : null,
+        sourceEmailId: null,
+        sourceFilename: null,
+        scannedAt: Date.now(),
+        source: 'csv',
+      });
+    }
+    return { records, skipped, error: null };
+  }
+
   // -dialog / -title / -btn etc., confirmed against openModal() in Base's
   // real source) instead of a custom floating box -- centered, white,
   // blocks the rest of the page while open, closes on the × button,
@@ -2327,6 +2544,12 @@
     ABUSE_REPORT_ACTIONED: { label: 'Actioned', color: '#16a34a' },
     ABUSE_REPORT_DENIED: { label: 'Denied', color: '#6b7280' },
     ABUSE_REPORT_UPDATED: { label: 'Updated', color: '#6b7280' },
+    // Not a real ticket status at all -- see waeParseCsvImport()'s own
+    // comment. Placed last so sorting by Status still puts every genuine
+    // abuse-report pipeline stage before it, rather than interleaving
+    // with them at whatever rank an unrecognized value would otherwise
+    // fall back to.
+    CSV_IMPORT: { label: 'Imported', color: '#7c3aed' },
   };
 
   function waeStatusLabel(ticketStatus) {
@@ -2734,9 +2957,23 @@
     const countEl = ui.createElement('div', { className: 'wae-sub', text: 'Loading...' });
 
     const scanBtn = ui.button({ text: 'Scan Imported Emails', variant: 'primary' });
+    const importCsvBtn = ui.button({ text: 'Import CSV' });
     const exportBtn = ui.button({ text: 'Export CSV', disabled: true });
     const clearBtn = ui.button({ text: 'Clear Extracted Data', variant: 'danger', disabled: true });
-    const buttonRowEl = ui.buttonRow([scanBtn, exportBtn, clearBtn]);
+    const buttonRowEl = ui.buttonRow([scanBtn, importCsvBtn, exportBtn, clearBtn]);
+    const csvFileInput = ui.createElement('input', {
+      attrs: { type: 'file', accept: '.csv,text/csv' },
+      style: { display: 'none' },
+    });
+    // Always visible, not just shown after a failed import -- the whole
+    // point is knowing the format going in, not finding out by trial and
+    // error. Latitude/Longitude are the only columns waeParseCsvImport()
+    // actually requires; everything else in this example is there to
+    // show what else it recognizes, not because a real file needs them.
+    const csvHint = ui.createElement('div', {
+      className: 'wae-sub wae-csv-hint',
+      text: 'Import CSV expects a header row -- only Latitude/Longitude are required. Example: Latitude,Longitude,Name,Comment,Conversation ID then 52.006199,4.535424,Example Wayspot,Optional note,12345',
+    });
 
     const progressEl = ui.createElement('div', { className: 'wae-progress' });
 
@@ -2836,7 +3073,7 @@
       ],
     });
 
-    modal.body.append(countEl, buttonRowEl, progressEl, searchInput, autoCloseToggle.row, tableContainer, logEl, styleSection);
+    modal.body.append(countEl, buttonRowEl, csvHint, csvFileInput, progressEl, searchInput, autoCloseToggle.row, tableContainer, logEl, styleSection);
 
     waeUI = { countEl, tableContainer, logEl, scanBtn, exportBtn, clearBtn, searchInput };
 
@@ -2861,6 +3098,15 @@
         // any other flag not sourced fresh from the emails themselves.
         const previousRecords = await getAllExtractedRecords();
         const starredKeys = new Set(previousRecords.filter((r) => r.starred).map(waeStarredKey));
+        // CSV-imported rows (see waeParseCsvImport()) don't come from a
+        // scanned email at all, so there's nothing for a re-scan to
+        // re-derive them from -- unlike every other row, wiping them in
+        // the rebuild below would be permanent, not just "re-scan to get
+        // them back". Set aside here and re-added after the rebuild
+        // completes, same idea as the starred carry-over just above but
+        // for whole rows rather than one field on rows that do get
+        // re-derived.
+        const csvRecords = previousRecords.filter((r) => r.source === 'csv');
 
         const { extracted, ticketDetails } = await scanImportedEmails((done, total) => {
           progressEl.textContent = `Scanning imported emails... ${done}/${total}`;
@@ -2881,7 +3127,7 @@
         // than each carrying their own copy (see EXTRACT_DB_VERSION note).
         await clearExtractedRecords();
         await clearTicketDetails();
-        await putExtractedRecords(extracted);
+        await putExtractedRecords([...extracted, ...csvRecords]);
         await putTicketDetails(ticketDetails);
         progressEl.textContent = '';
         const ticketCount = new Set(extracted.map((r) => r.conversationId || r.sourceEmailId)).size;
@@ -2895,6 +3141,33 @@
         log(logEl, `✗ Scan failed: ${e.message || e}`, 'err');
       } finally {
         scanBtn.disabled = false;
+        waeCurrentPage = 1;
+        refreshPanel();
+        waeResyncMapIfVisible();
+      }
+    });
+
+    importCsvBtn.addEventListener('click', () => csvFileInput.click());
+    csvFileInput.addEventListener('change', async () => {
+      const file = csvFileInput.files[0];
+      csvFileInput.value = '';
+      if (!file) return;
+      try {
+        const text = await file.text();
+        const { records, skipped, error } = waeParseCsvImport(text);
+        if (error) {
+          log(logEl, `✗ ${error}`, 'err');
+          return;
+        }
+        if (!records.length) {
+          log(logEl, `${skipped ? `All ${skipped} row(s)` : 'No rows'} had missing or invalid coordinates -- nothing imported.`, 'warn');
+          return;
+        }
+        await putExtractedRecords(records);
+        log(logEl, `✓ Imported ${records.length} location(s) from "${file.name}"${skipped ? ` (${skipped} row(s) skipped: missing/invalid coordinates)` : ''}.`, 'ok');
+      } catch (e) {
+        log(logEl, `✗ CSV import failed: ${e.message || e}`, 'err');
+      } finally {
         waeCurrentPage = 1;
         refreshPanel();
         waeResyncMapIfVisible();
@@ -2924,7 +3197,18 @@
     });
 
     clearBtn.addEventListener('click', async () => {
-      if (!confirm('Clear all extracted abuse-report data? The original imported emails are untouched -- you can re-scan any time.')) return;
+      // BUGFIX (not upstream): this warning used to only mention scanned
+      // data ("you can re-scan any time"), which was accurate for every
+      // row until CSV-imported ones existed -- those don't come from an
+      // email at all, so there's nothing to re-derive them from if this
+      // clears them too. Checked for and mentioned explicitly now rather
+      // than letting the reassuring "re-scan any time" line quietly
+      // apply to rows it doesn't actually cover.
+      const hasCsvRows = (await getAllExtractedRecords()).some((r) => r.source === 'csv');
+      const csvWarning = hasCsvRows
+        ? ' This will ALSO permanently delete any CSV-imported location(s) -- unlike scanned data, those cannot be recovered by re-scanning.'
+        : '';
+      if (!confirm(`Clear all extracted abuse-report data? The original imported emails are untouched -- you can re-scan any time.${csvWarning}`)) return;
       try {
         await clearExtractedRecords();
         await clearTicketDetails();
