@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Report Extractor
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.34.2
+// @version      1.34.3
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -15,6 +15,15 @@
 // ==/UserScript==
 
 /*
+ * v1.34.3 CHANGE FROM v1.34.2: the "Import CSV" format hint above the
+ * button now shows its example as an actual two-line CSV (header row,
+ * then a data row below it) instead of one run-on sentence joining them
+ * with "then". .wae-csv-hint gets white-space:pre-line so the \n in the
+ * hint text actually breaks the line rather than collapsing like normal
+ * HTML whitespace. Purely cosmetic -- waeParseCsvImport() itself is
+ * unchanged, still just needs a Latitude/Longitude header somewhere in
+ * the first row.
+ *
  * v1.34.2 CHANGE FROM v1.34.1: fixes crosses reappearing on their own
  * after turning the "Abuse Report Crosses" layer off and then just
  * scrolling through zoom levels -- no re-enabling involved.
@@ -2465,6 +2474,7 @@
   const STYLE = `
     #wae-panel .wfmapmods-modal-dialog{ width:600px; max-width:calc(100vw - 24px); }
     .wae-sub{ font-size:11px; color:var(--wfmm-muted-text, #667085); margin-bottom:8px; }
+    .wae-csv-hint{ white-space:pre-line; font-family:ui-monospace, monospace; }
     .wae-progress{ font-size:11px; color:#2563eb; margin:4px 0; min-height:14px; }
     .wae-log{ margin-top:8px; max-height:110px; overflow-y:auto; font-size:11px; line-height:1.5; }
     .wae-log div.ok{ color:#16a34a; }
@@ -3004,9 +3014,13 @@
     // error. Latitude/Longitude are the only columns waeParseCsvImport()
     // actually requires; everything else in this example is there to
     // show what else it recognizes, not because a real file needs them.
+    // The header and its data row are on separate lines (.wae-csv-hint
+    // has white-space:pre-line for this) rather than run together with
+    // "then", so the example actually reads like a real CSV instead of
+    // a sentence describing one.
     const csvHint = ui.createElement('div', {
       className: 'wae-sub wae-csv-hint',
-      text: 'Import CSV expects a header row -- only Latitude/Longitude are required. Example: Latitude,Longitude,Name,Comment,Conversation ID then 52.006199,4.535424,Example Wayspot,Optional note,12345',
+      text: 'Import CSV expects a header row -- only Latitude/Longitude are required. Example:\nLatitude,Longitude,Name,Comment,Conversation ID\n52.006199,4.535424,Example Wayspot,Optional note,12345',
     });
 
     const progressEl = ui.createElement('div', { className: 'wae-progress' });
