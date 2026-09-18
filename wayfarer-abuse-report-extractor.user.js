@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Report Extractor
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.34.1
+// @version      1.34.2
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -15,6 +15,22 @@
 // ==/UserScript==
 
 /*
+ * v1.34.2 CHANGE FROM v1.34.1: fixes crosses reappearing on their own
+ * after turning the "Abuse Report Crosses" layer off and then just
+ * scrolling through zoom levels -- no re-enabling involved.
+ * waeRefreshPulses() never actually checked isMapPulsesEnabled(); it
+ * only checked that a map existed and that waeShouldShowPulses()
+ * (zoom/surface) allowed showing something. waeApplyLayerEnabled(false)
+ * clears the markers once, at the moment of the toggle, but the
+ * debounced 'idle' listener stays attached to the map for its whole
+ * lifetime (see waeSetCurrentMap()) and keeps firing on every zoom/pan
+ * regardless -- so the very next one silently rebuilt every marker with
+ * no awareness the layer had been switched off, undoing the toggle.
+ * waeRefreshPulses() now bails out (clearing anything that snuck back
+ * before this existed) whenever the layer is off, so every automatic
+ * refresh actually respects the current on/off state rather than only
+ * the single clear that runs at toggle time.
+ *
  * v1.34.1 CHANGE FROM v1.34.0: fixes crosses vanishing on a zoom change
  * and not coming back until the "Abuse Report Crosses" Layers checkbox
  * is toggled off and back on. Root cause: the debounced 'idle' listener
@@ -1669,6 +1685,24 @@
     // value here can be trusted without re-checking it ourselves.
     if (!map) return;
     if (typeof google === 'undefined' || !google.maps?.Marker) return;
+
+    // BUGFIX (not upstream): this function never checked whether the
+    // "Abuse Report Crosses" layer was actually enabled -- only whether
+    // a map existed and waeShouldShowPulses() (zoom/surface) allowed it.
+    // waeApplyLayerEnabled(false) calls waeClearPulses() exactly once
+    // when the checkbox is switched off, but the debounced 'idle'
+    // listener set up in waeSetCurrentMap() stays attached to the map
+    // for its whole lifetime regardless -- so the very next zoom (or
+    // pan) fired this function again, which happily rebuilt every
+    // marker with no idea the layer had been turned off, undoing the
+    // toggle. Bailing out (and clearing anything that snuck back before
+    // this check existed) whenever the layer is off makes every
+    // automatic refresh respect the current on/off state, not just the
+    // one that fires at the moment of the toggle itself.
+    if (!isMapPulsesEnabled()) {
+      waeClearPulses();
+      return;
+    }
 
     if (!waeShouldShowPulses(map, WAE_PULSES.surface)) {
       waeClearPulses();
