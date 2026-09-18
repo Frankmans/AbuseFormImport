@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Report Extractor
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.34.3
+// @version      1.34.4
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -15,6 +15,22 @@
 // ==/UserScript==
 
 /*
+ * v1.34.4 CHANGE FROM v1.34.3: Export CSV no longer repeats the raw
+ * per-ticket text (Issue Type / Location Details / Report Details) on
+ * every Wayspot row a ticket reported -- it's now written once, on the
+ * first row for that ticket, and left blank on the rest of that
+ * ticket's rows. That text was already stored just once per ticket at
+ * rest (the ticketDetails store, since v1.21.0); getAllExtractedRecords()
+ * hydrates it back onto every location row for in-memory use (table,
+ * search, nearby-duplicate detection all still rely on that), and CSV
+ * export used to just take those fully-hydrated rows as-is -- so a
+ * 12-location ticket's export repeated the same raw text 12 times. See
+ * waeDedupeTicketLevelColumnsForExport()'s own comment for the full
+ * reasoning, including why conversationId/ticketStatus/lastResponseAt
+ * deliberately stay on every row (short, and needed to tell which
+ * ticket a blanked-out row belongs to) and why Comment isn't touched
+ * (it's genuinely per-location, not per-ticket).
+ *
  * v1.34.3 CHANGE FROM v1.34.2: the "Import CSV" format hint above the
  * button now shows its example as an actual two-line CSV (header row,
  * then a data row below it) instead of one run-on sentence joining them
@@ -2315,9 +2331,47 @@
     return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   }
 
+  // BUGFIX (not upstream): issueType/locationDetails/reportDetails are
+  // genuinely per-TICKET data (see the v1.21.0 changelog note on
+  // EXTRACT_DB_VERSION) -- they're stored just once per ticket, in the
+  // separate ticketDetails object store, precisely so a 12-location
+  // ticket doesn't pay for 12 copies of the same raw text at rest.
+  // getAllExtractedRecords() then transparently HYDRATES that one stored
+  // copy back onto every location row sharing the ticket, so every
+  // existing caller (table rendering, search, nearby-duplicate
+  // detection) keeps seeing the same familiar per-row shape without
+  // needing its own join logic -- that hydration is correct and
+  // intentional for those callers. CSV export used to hand the fully
+  // hydrated rows straight to recordsToCsv() too, though, which meant a
+  // reader opening the file saw the same (often long) raw report text
+  // repeated once per Wayspot the ticket reported -- reported as "many
+  // duplicated texts" in the export (and, from the outside, easy to
+  // mistake for the storage itself being duplicated, even though that
+  // part was already fixed in v1.21.0). This keeps the raw ticket-level
+  // text on only the FIRST row for a given ticketKey and blanks it on
+  // every later row of that same ticket, purely for the exported file --
+  // waeAllRecords / the on-screen table / getAllExtractedRecords() are
+  // untouched, so nothing else loses the per-row hydration it relies on.
+  // conversationId/ticketStatus/lastResponseAt stay on every row
+  // deliberately -- they're short, and needed on every row to identify
+  // which ticket it belongs to once the raw text below is blanked out.
+  const WAE_TICKET_LEVEL_EXPORT_COLUMNS = ['issueType', 'locationDetails', 'reportDetails'];
+  function waeDedupeTicketLevelColumnsForExport(records) {
+    const seenTicketKeys = new Set();
+    return records.map((r) => {
+      const alreadySeen = seenTicketKeys.has(r.ticketKey);
+      seenTicketKeys.add(r.ticketKey);
+      if (!alreadySeen) return r;
+      const deduped = { ...r };
+      for (const key of WAE_TICKET_LEVEL_EXPORT_COLUMNS) deduped[key] = null;
+      return deduped;
+    });
+  }
+
   function recordsToCsv(records) {
     const header = CSV_COLUMNS.map(([, label]) => csvEscape(label)).join(',');
-    const rows = records.map((r) => CSV_COLUMNS.map(([key]) => csvEscape(r[key])).join(','));
+    const rows = waeDedupeTicketLevelColumnsForExport(records)
+      .map((r) => CSV_COLUMNS.map(([key]) => csvEscape(r[key])).join(','));
     return [header, ...rows].join('\r\n');
   }
 
