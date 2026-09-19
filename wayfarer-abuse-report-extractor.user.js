@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Report Extractor
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.39.0
+// @version      1.39.2
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -15,6 +15,47 @@
 // ==/UserScript==
 
 /*
+ * v1.39.2 CHANGE FROM v1.39.1: fixes the review-page show/hide toggle's
+ * label text being unreadable in dark mode. waeEnsureReviewToggle()'s
+ * checkbox is inserted directly into the review page's own DOM, outside
+ * any WFMM.ui modal/panel wrapper -- unlike every other control this
+ * plugin builds, which all live inside a WFMM.ui.openModal() dialog and
+ * pick up that dialog's own dark-mode CSS for free, this one had
+ * nothing making it theme-aware. Given its own self-contained pill
+ * background/text pair now (matching Base's own .dark override
+ * convention, e.g. .dark .wfmm-submit-draft-select's #262626/#ffffff)
+ * instead of depending on inherited context that was never actually
+ * there -- .dark is the real class Wayfarer applies (confirmed against
+ * Base's own source, which has .dark overrides for other elements on
+ * this exact page too), not a prefers-color-scheme media query.
+ *
+ * v1.39.1 CHANGE FROM v1.39.0: fixes crosses never appearing on a fresh
+ * page load even with the layer on -- only showing up after zooming/
+ * panning the map or toggling the layer off and back on. Root cause:
+ * startPlugin() called waeStartReviewMapTracking() (v1.39.0's review-
+ * page support) BEFORE waeStartSidePanelDetailsWatcher() and, critically,
+ * waeResyncMapIfVisible() -- the one call that actually triggers this
+ * plugin's first render on page load. That review-page function is
+ * built on WFMM.routes.onEnter()/onLeave(), which -- unlike
+ * onEnterMapRoute()/onChangeMapRoute() used elsewhere in this file --
+ * were never confirmed as guaranteed-present public methods, only
+ * observed being used by one other bundled plugin. If they didn't
+ * exist, or anything else in that function threw, startPlugin() aborted
+ * right there and silently skipped everything after it in the same
+ * call, including waeResyncMapIfVisible(). Meanwhile
+ * waeStartMapTracking() (called just before the throw) had already
+ * wired up its 'idle' listener, so zooming/panning worked fine, and the
+ * Layers checkbox worked too (a separate code path, waeApplyLayerEnabled()
+ * -> WFMM.map.refresh() directly) -- matching exactly what got
+ * reported. Fixed two ways: waeStartReviewMapTracking() is now wrapped
+ * in its own try/catch (a warning logs instead, and the rest of this
+ * file works exactly as before), and, as defense in depth,
+ * startPlugin() now calls it LAST, after waeStartSidePanelDetailsWatcher()
+ * and waeResyncMapIfVisible() rather than before them, so even a future
+ * uncaught failure there can't block anything those two do again.
+ * waeStopReviewMapTracking() (stopPlugin()) gets the same try/catch
+ * treatment for the same reason.
+ *
  * v1.39.0 CHANGE FROM v1.38.1: crosses now also render on the review
  * page (/new/review), with only a show/hide toggle active there -- no
  * click behavior (no info window, no recenter-and-zoom), no ticket-
@@ -2562,7 +2603,36 @@
     if (WAE_PULSES.surface === 'review') waeSetCurrentMap(null, null);
   }
 
+  // BUGFIX (not upstream): startPlugin() calls this, then
+  // waeStartSidePanelDetailsWatcher(), then waeResyncMapIfVisible() --
+  // the ONE call that triggers this plugin's very first render on a
+  // fresh page load -- one after another, synchronously. Reported as
+  // "crosses never appear on page load, only after zooming/panning or
+  // toggling the layer off and on": if anything in here threw (this is
+  // the one piece of this file built on an internal technique rather
+  // than a confirmed-stable public API, see this section's own opening
+  // comment -- WFMM.routes.onEnter()/onLeave() specifically were never
+  // verified as guaranteed-present the way onEnterMapRoute()/
+  // onChangeMapRoute() elsewhere in this file are, only observed being
+  // used by ONE other bundled plugin), it would abort startPlugin()
+  // entirely right here, silently skipping waeResyncMapIfVisible() a
+  // few lines later -- while waeStartMapTracking() just before this,
+  // having already run, kept the mapview/submit 'idle'-driven refresh
+  // working fine, matching exactly what got reported: works once you
+  // interact with the map, never on init. A newer, admittedly less
+  // battle-tested feature failing shouldn't be able to take the whole
+  // plugin's init sequence down with it -- this is now isolated in its
+  // own try/catch so a failure here degrades to "no crosses on the
+  // review page specifically" instead.
   function waeStartReviewMapTracking() {
+    try {
+      waeStartReviewMapTrackingUnsafe();
+    } catch (e) {
+      console.warn('[Wayfarer Map Mods - Abuse Report Extractor] Review page support failed to start (crosses will still work everywhere else):', e);
+    }
+  }
+
+  function waeStartReviewMapTrackingUnsafe() {
     if (waeReviewRouteEnterUnsub) return; // already subscribed
     waeReviewRouteEnterUnsub = wfmmWindow.WFMM.routes.onEnter('review', waeScheduleReviewMapFind);
     waeReviewRouteLeaveUnsub = wfmmWindow.WFMM.routes.onLeave('review', waeHandleLeaveReviewRoute);
@@ -2578,14 +2648,18 @@
     // waeFindReviewMapHost() alone (a handful of querySelectors) is
     // cheap enough to just always run.
     waeReviewPeriodicRecheckTimer = setInterval(() => {
-      if (!waeIsReviewRoute()) return;
-      const host = waeFindReviewMapHost();
-      if (!host || host === waeReviewToggleHost) return;
-      const found = waeFindReviewMapOnce();
-      if (found) {
-        waeSetCurrentMap(found, 'review');
-        if (isMapPulsesEnabled()) waeSafeRefreshPulses();
-        waeEnsureReviewToggle(host);
+      try {
+        if (!waeIsReviewRoute()) return;
+        const host = waeFindReviewMapHost();
+        if (!host || host === waeReviewToggleHost) return;
+        const found = waeFindReviewMapOnce();
+        if (found) {
+          waeSetCurrentMap(found, 'review');
+          if (isMapPulsesEnabled()) waeSafeRefreshPulses();
+          waeEnsureReviewToggle(host);
+        }
+      } catch (e) {
+        console.warn('[Wayfarer Map Mods - Abuse Report Extractor] Review page recheck failed:', e);
       }
     }, WAE_REVIEW_PERIODIC_RECHECK_MS);
   }
@@ -3164,6 +3238,27 @@
     .wae-pulse-marker.wae-pulse-clickable{ pointer-events:auto; cursor:pointer; }
     .wae-pulse-marker svg{ display:block; }
     .wae-pulse-count{ position:absolute; top:50%; left:50%; transform:translate(-50%, -50%); color:#ffffff; font-size:10px; font-weight:700; pointer-events:none; user-select:none; }
+    /* BUGFIX (not upstream): waeEnsureReviewToggle()'s checkbox is
+       inserted directly into the review page's own DOM, outside any
+       WFMM.ui modal/panel wrapper -- unlike every other control this
+       plugin builds with ui.checkboxRow()/etc, which all live inside a
+       WFMM.ui.openModal() dialog and pick up that dialog's own dark-mode
+       CSS for free, this one isn't inside any such wrapper, so its label
+       text had nothing to make it readable against Wayfarer's dark
+       theme. Given its own self-contained background/text pair here
+       (values matching Base's own .dark override convention, e.g.
+       .dark .wfmm-submit-draft-select's #262626/#ffffff) instead of
+       depending on inherited theme context that isn't present at this
+       injection point -- .dark is the actual class Wayfarer applies
+       (confirmed against Base's own source, including .dark overrides
+       for other elements on this exact page), not a
+       prefers-color-scheme media query. The `* { color:inherit }` makes
+       sure ui.checkboxRow()'s own label text can't win with a color of
+       its own over this pill's.
+    */
+    .wae-review-toggle{ display:inline-flex; align-items:center; gap:6px; width:fit-content; margin:6px 0; padding:4px 8px; border-radius:6px; background:#f2f4f7; color:#101828; font-size:13px; }
+    .wae-review-toggle *{ color:inherit; }
+    .dark .wae-review-toggle{ background:#262626; color:#ffffff; }
     .wae-progress{ font-size:11px; color:#2563eb; margin:4px 0; min-height:14px; }
     .wae-log{ margin-top:8px; max-height:110px; overflow-y:auto; font-size:11px; line-height:1.5; }
     .wae-log div.ok{ color:#16a34a; }
@@ -4261,16 +4356,24 @@
     // subscriptions themselves are cheap and their callbacks already
     // check isMapPulsesEnabled() before doing any real work.
     waeStartMapTracking();
+    // BUGFIX (not upstream): waeStartSidePanelDetailsWatcher() and,
+    // critically, waeResyncMapIfVisible() -- the one call that triggers
+    // this plugin's very first render on a fresh page load -- now run
+    // BEFORE waeStartReviewMapTracking() rather than after it. Defense
+    // in depth on top of that function's own try/catch (see its
+    // comment): even if something in the review-page code (the one
+    // piece of this file built on an internal technique rather than a
+    // confirmed-stable public API) somehow still threw past its own
+    // guard, it would no longer be able to prevent the two calls below
+    // it from running, since they're not "below it" anymore.
+    waeStartSidePanelDetailsWatcher();
+    waeResyncMapIfVisible();
     // Review page (/new/review) support -- see its own section comment
     // above waeIsReviewRoute() for the full explanation. Independent of
     // waeStartMapTracking() above since WFMM.map doesn't cover this
-    // route at all; this plugin finds that page's map itself.
+    // route at all; this plugin finds that page's map itself. Runs last
+    // deliberately -- see this block's own comment just above.
     waeStartReviewMapTracking();
-    // Unlike map pulses, this doesn't depend on "Show on Map" being
-    // toggled at all -- it's a separate feature (see its own comment)
-    // that should just always be live while the plugin itself is.
-    waeStartSidePanelDetailsWatcher();
-    waeResyncMapIfVisible();
   }
 
   function stopPlugin() {
@@ -4283,7 +4386,11 @@
     waeCloseNearbyPopover();
     closePanel(); // no-op if the panel isn't open; openModal's own close() tears its DOM down
     waeStopMapTracking();
-    waeStopReviewMapTracking();
+    // Wrapped the same way waeStartReviewMapTracking() is (see its own
+    // comment) -- teardown for a less battle-tested feature shouldn't be
+    // able to leave the rest of this cleanup (unregistering the layer/
+    // appearance style below, in particular) undone either.
+    try { waeStopReviewMapTracking(); } catch (e) { console.warn('[Wayfarer Map Mods - Abuse Report Extractor] Review page cleanup failed:', e); }
     waeStopSidePanelDetailsWatcher();
     waeClearPulses();
     waeUnregisterAppearance?.();
