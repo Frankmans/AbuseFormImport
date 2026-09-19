@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Report Extractor
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.38.1
+// @version      1.39.0
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -15,6 +15,38 @@
 // ==/UserScript==
 
 /*
+ * v1.39.0 CHANGE FROM v1.38.1: crosses now also render on the review
+ * page (/new/review), with only a show/hide toggle active there -- no
+ * click behavior (no info window, no recenter-and-zoom), no ticket-
+ * annotation side-panel integration, no zoom-based hiding (treated like
+ * the submit-Wayspot page: always shown regardless of zoom). This page
+ * is NOT covered by WFMM.map at all (confirmed against Base's own
+ * source: its adapters only resolve "mapview"/"submit"), and the
+ * bundled "review-map-enhancements" plugin that owns this page's map
+ * internally doesn't expose it through any public API (WFMM.
+ * reviewMapEnhancements only has getSettings()/renderSettingsSection()).
+ * So this plugin finds that map itself, using the SAME technique Base's
+ * own review-map-enhancements plugin uses for the same job (confirmed
+ * against its real source): reading the map host's __ngContext__ (a
+ * standard Angular Ivy internal, not something private to Base) and
+ * walking it for anything that looks like a google.maps.Map. See the
+ * "Review page support" section comment (above waeIsReviewRoute()) for
+ * the full explanation, including why this is inherently more fragile
+ * than everywhere else this plugin hooks into WFMM in this file -- it's
+ * replicating an internal technique because no public API for this
+ * exists, not calling one, so this specific piece is genuinely less
+ * battle-tested than the rest of the script and could quietly stop
+ * finding the map if Wayfarer restructures that page -- worth watching
+ * for reports either way.
+ *
+ * The show/hide toggle itself is a small standalone checkbox this
+ * plugin injects directly next to the review map (waeEnsureReviewToggle()),
+ * reading/writing the SAME WFMM.layers enabled state as the native
+ * Layers checkbox on the general mapview -- that native checkbox isn't
+ * reachable from the review page at all (it only renders in the
+ * mapview's own Layers panel), so this is a second way to reach the one
+ * shared setting, not a separate one.
+ *
  * v1.38.1 CHANGE FROM v1.38.0: crosses/clusters now sit BELOW real
  * markers in stacking order (Wayspot/Pok\u00e9stop/Gym/Power Spot markers,
  * WFMM's own submission-pin/draft markers), instead of on top of them.
@@ -1806,7 +1838,14 @@
         const shapeSvg = isClusterMarker ? waeGetClusterSvgMarkup(isExpanded) : waeGetMarkerSvgMarkup();
         this._html = isClusterMarker ? `${shapeSvg}<span class="wae-pulse-count">${cluster.records.length}</span>` : shapeSvg;
         this._title = isClusterMarker ? `${cluster.records.length} reports` : (cluster.records[0].wayspotName || '(unnamed report)');
-        this._clickable = !!appearance.clickable;
+        // The review page (see waeStartReviewMapTracking()'s own
+        // comment) deliberately gets NO click behavior at all here --
+        // no info window, no recenter-and-zoom -- only the show/hide
+        // toggle waeEnsureReviewToggle() injects onto that page is
+        // meant to be active there, regardless of the Marker Style
+        // "Clickable markers" setting (which is about the general
+        // mapview/submit-Wayspot surfaces, not this one).
+        this._clickable = !!appearance.clickable && WAE_PULSES.surface !== 'review';
         this.applyToDiv();
         this.draw();
       }
@@ -1980,7 +2019,12 @@
   // -- so it has no floor of its own to expand at).
   const WAE_MIN_SHOW_ZOOM = 8;
   function waeShouldShowPulses(map, surface) {
-    if (surface === 'submit') return true;
+    // 'review' treated the same as 'submit' -- see waeStartReviewMapTracking()'s
+    // own comment for why this surface exists at all. A review-page map is
+    // typically already zoomed to one specific candidate location, so the
+    // same "hide when zoomed all the way out" reasoning that applies to
+    // the general mapview doesn't apply here either.
+    if (surface === 'submit' || surface === 'review') return true;
     if (!map || typeof map.getZoom !== 'function') return true;
     const z = map.getZoom();
     return (typeof z === 'number') && z >= WAE_MIN_SHOW_ZOOM;
@@ -2299,6 +2343,12 @@
       if (isMapPulsesEnabled()) waeSafeRefreshPulses();
     });
     waeMapClearedUnsub = WFMM.map.onCleared(() => {
+      // This event is about WFMM.map's OWN mapview/submit tracking --
+      // when the review page has its own map attached (see
+      // waeStartReviewMapTracking()), that map was never found through
+      // WFMM.map in the first place, so an unrelated mapview/submit
+      // teardown elsewhere shouldn't clear it out from under us.
+      if (WAE_PULSES.surface === 'review') return;
       WAE_PULSES.map = null;
       WAE_PULSES.surface = null;
     });
@@ -2336,6 +2386,217 @@
     waeRouteChangeUnsub = null;
     waeMapNotFoundUnsub = null;
     waeMapRetriesLeft = 0;
+  }
+
+  // ---------------------------------------------------------------------
+  // Review page (/new/review) support, as of v1.39.0.
+  //
+  // NOT covered by anything above -- confirmed against Base's own
+  // source, WFMM.map's own adapters only ever resolve "mapview"
+  // (app-wf-base-map) or "submit" (app-submit-wayspot-map); the review
+  // page's map is found and owned entirely internally by Base's own
+  // bundled "review-map-enhancements" plugin
+  // (src/plugins/review-map-enhancements/map/review-map.js), which
+  // doesn't expose its map instance through any public API --
+  // WFMM.reviewMapEnhancements only ever exposes getSettings()/
+  // renderSettingsSection(), confirmed against its own start() function.
+  // So this plugin finds the review map itself, using the SAME
+  // technique Base's own review-map-enhancements plugin uses internally
+  // for the exact same job (confirmed against its real source, not
+  // guessed): read the map host element's own __ngContext__ -- a
+  // standard Angular Ivy internal present on every Angular-rendered
+  // element, not something private to Base -- and walk it with a small
+  // generic object search for anything that looks like a
+  // google.maps.Map. This is inherently more fragile than everywhere
+  // else this plugin hooks into WFMM in this file (it's replicating an
+  // internal technique because no public API for this exists, not
+  // calling one), so if Wayfarer/Base ever restructure the review
+  // page's DOM this degrades silently -- crosses just stop appearing on
+  // this one page -- rather than erroring anywhere.
+  //
+  // Deliberately limited on this page, per its own request: crosses
+  // still render (always, regardless of zoom -- see
+  // waeShouldShowPulses()'s own 'review' handling) and are still
+  // affected by Marker Style's color/size settings, but get NO click
+  // behavior (see WaePulseOverlay#setCluster()'s own 'review' check) and
+  // no ticket-annotation side-panel integration (that feature only ever
+  // fires from WFMM.sidePanel, which this page doesn't use). The ONE
+  // thing genuinely exposed here is visibility -- since the general
+  // mapview's own native Layers checkbox for this (see WAE_LAYER_ID)
+  // isn't reachable from this page at all (that checkbox lives in the
+  // mapview's own Layers panel, which the review page doesn't have),
+  // waeEnsureReviewToggle() injects a small standalone checkbox of its
+  // own directly next to the review map, reading/writing the exact same
+  // WFMM.layers enabled state -- so it's still one single "is this
+  // layer on" setting either page toggles, just with two different
+  // places to reach it from.
+  // ---------------------------------------------------------------------
+
+  function waeIsReviewRoute() {
+    return !!wfmmWindow.WFMM.routes?.is?.('review') || window.location.pathname === '/new/review';
+  }
+
+  function waeLooksLikeGoogleMap(value) {
+    return !!(value && typeof value.getCenter === 'function' && typeof value.addListener === 'function' && typeof value.getDiv === 'function');
+  }
+
+  // Generic bounded object-graph search -- same shape (and same default
+  // maxDepth/maxItems) as Base's own findObjectDeep() in
+  // review-map-enhancements/shared/framework-internals.js, reimplemented
+  // here rather than reused since that one isn't exposed on WFMM either.
+  function waeFindObjectDeep(root, predicate, options) {
+    const maxDepth = options?.maxDepth ?? 9;
+    const maxItems = options?.maxItems ?? 5000;
+    const seen = new Set();
+    const stack = [{ value: root, depth: 0 }];
+    let inspected = 0;
+    while (stack.length && inspected < maxItems) {
+      const { value, depth } = stack.pop();
+      inspected++;
+      if (!value || (typeof value !== 'object' && typeof value !== 'function')) continue;
+      if (seen.has(value)) continue;
+      seen.add(value);
+      try {
+        if (predicate(value)) return value;
+      } catch (e) { /* a getter throwing shouldn't kill the whole search */ }
+      if (depth >= maxDepth) continue;
+      let values = [];
+      try {
+        values = Array.isArray(value) ? value : Object.values(value);
+      } catch (e) { values = []; }
+      for (const child of values) stack.push({ value: child, depth: depth + 1 });
+    }
+    return null;
+  }
+
+  // Covers the review modes with a straightforward map host element:
+  // duplicates-check, edit-location, edit-info -- same selectors Base's
+  // own findReviewMapHost() falls back to when it doesn't already know
+  // which review mode is active. The "photo" review mode's map host is
+  // found by review-map-enhancements' own private photoMapController,
+  // which isn't reachable from outside it -- crosses won't appear on
+  // that one specific sub-view; everywhere else on the review page they
+  // will.
+  function waeFindReviewMapHost() {
+    const dup = document.querySelector('#check-duplicates-card nia-map');
+    if (dup) return dup;
+    for (const card of document.querySelectorAll('wf-review-card')) {
+      const heading = card.querySelector('h4')?.textContent?.trim().toLowerCase();
+      if (heading === 'best location') {
+        const host = card.querySelector('nia-map');
+        if (host) return host;
+      }
+    }
+    return document.querySelector('nia-map.review-edit-info__map')
+      || document.querySelector('.review-edit-info__info nia-map')
+      || document.querySelector('.review-edit-info nia-map')
+      || null;
+  }
+
+  function waeFindReviewMapOnce() {
+    const host = waeFindReviewMapHost();
+    if (!host?.__ngContext__) return null;
+    return waeFindObjectDeep(host.__ngContext__, waeLooksLikeGoogleMap, { maxDepth: 9, maxItems: 5000 });
+  }
+
+  // Small standalone "Abuse report crosses" checkbox, injected right
+  // next to whichever map host was actually found -- see this section's
+  // own opening comment for why this exists instead of pointing at the
+  // native Layers checkbox. Re-injected whenever the host changes (the
+  // reviewer moving to a different candidate swaps in a whole new
+  // nia-map element, not just a repositioned one), tracked by host
+  // identity so it isn't rebuilt needlessly on every recheck tick.
+  let waeReviewToggleHost = null;
+  function waeEnsureReviewToggle(host) {
+    if (!host || host === waeReviewToggleHost) return;
+    waeReviewToggleHost = host;
+    document.querySelectorAll('.wae-review-toggle').forEach((el) => el.remove());
+    const ui = wfmmWindow.WFMM.ui;
+    const row = ui.checkboxRow({
+      label: 'Abuse report crosses',
+      checked: wfmmWindow.WFMM.layers.isEnabled(WAE_LAYER_ID),
+      onChange: (checked) => wfmmWindow.WFMM.layers.setEnabled(WAE_LAYER_ID, checked),
+    });
+    row.row.classList.add('wae-review-toggle');
+    host.insertAdjacentElement('beforebegin', row.row);
+  }
+
+  let waeReviewMapSearchTimer = null;
+  let waeReviewMapAttempts = 0;
+  let waeReviewPeriodicRecheckTimer = null;
+  let waeReviewRouteEnterUnsub = null;
+  let waeReviewRouteLeaveUnsub = null;
+  const WAE_REVIEW_PERIODIC_RECHECK_MS = 3000;
+
+  function waeTryFindReviewMap() {
+    waeReviewMapSearchTimer = null;
+    if (!waeIsReviewRoute()) return;
+    const host = waeFindReviewMapHost();
+    const found = host ? waeFindReviewMapOnce() : null;
+    if (found) {
+      waeSetCurrentMap(found, 'review');
+      if (isMapPulsesEnabled()) waeSafeRefreshPulses();
+      waeEnsureReviewToggle(host);
+      return;
+    }
+    waeReviewMapAttempts -= 1;
+    if (waeReviewMapAttempts > 0) {
+      waeReviewMapSearchTimer = setTimeout(waeTryFindReviewMap, 250);
+    }
+  }
+
+  function waeScheduleReviewMapFind() {
+    if (!waeIsReviewRoute() || waeReviewMapSearchTimer) return;
+    // Same 80 attempts * 250ms = ~20s budget review-map-enhancements'
+    // own scheduleFind() uses -- long enough to cover Angular still
+    // rendering the review page's first candidate.
+    waeReviewMapAttempts = 80;
+    waeTryFindReviewMap();
+  }
+
+  function waeHandleLeaveReviewRoute() {
+    clearTimeout(waeReviewMapSearchTimer);
+    waeReviewMapSearchTimer = null;
+    waeReviewToggleHost = null;
+    document.querySelectorAll('.wae-review-toggle').forEach((el) => el.remove());
+    if (WAE_PULSES.surface === 'review') waeSetCurrentMap(null, null);
+  }
+
+  function waeStartReviewMapTracking() {
+    if (waeReviewRouteEnterUnsub) return; // already subscribed
+    waeReviewRouteEnterUnsub = wfmmWindow.WFMM.routes.onEnter('review', waeScheduleReviewMapFind);
+    waeReviewRouteLeaveUnsub = wfmmWindow.WFMM.routes.onLeave('review', waeHandleLeaveReviewRoute);
+    if (waeIsReviewRoute()) waeScheduleReviewMapFind();
+    // The reviewer moving to a NEXT candidate swaps the map host in
+    // place without leaving/re-entering the "review" route at all (it's
+    // one persistent route, not one per candidate) -- onEnter/onLeave
+    // above only cover arriving at or leaving the review section as a
+    // whole, so this periodic recheck is what actually follows the
+    // reviewer between individual candidates. Only re-runs the expensive
+    // part -- walking __ngContext__ via waeFindReviewMapOnce() -- when
+    // the host element itself is a different DOM node than last tick;
+    // waeFindReviewMapHost() alone (a handful of querySelectors) is
+    // cheap enough to just always run.
+    waeReviewPeriodicRecheckTimer = setInterval(() => {
+      if (!waeIsReviewRoute()) return;
+      const host = waeFindReviewMapHost();
+      if (!host || host === waeReviewToggleHost) return;
+      const found = waeFindReviewMapOnce();
+      if (found) {
+        waeSetCurrentMap(found, 'review');
+        if (isMapPulsesEnabled()) waeSafeRefreshPulses();
+        waeEnsureReviewToggle(host);
+      }
+    }, WAE_REVIEW_PERIODIC_RECHECK_MS);
+  }
+
+  function waeStopReviewMapTracking() {
+    waeReviewRouteEnterUnsub?.();
+    waeReviewRouteEnterUnsub = null;
+    waeReviewRouteLeaveUnsub?.();
+    waeReviewRouteLeaveUnsub = null;
+    if (waeReviewPeriodicRecheckTimer) { clearInterval(waeReviewPeriodicRecheckTimer); waeReviewPeriodicRecheckTimer = null; }
+    waeHandleLeaveReviewRoute();
   }
 
   // ---------------------------------------------------------------------
@@ -2470,6 +2731,25 @@
   // state on, or to disable/re-enable around the attach.
   async function waeApplyLayerEnabled(enabled) {
     if (enabled) {
+      // On the review page, waeAttachToMapIfNeeded() below is the wrong
+      // tool -- it goes through WFMM.map.refresh(), which (see
+      // waeStartReviewMapTracking()'s own comment) doesn't cover this
+      // page at all, so it would either find nothing or reattach to a
+      // stale mapview/submit map left over from before. Re-run this
+      // plugin's own review-map search instead, which is what this
+      // page's own show/hide checkbox (waeEnsureReviewToggle()) is
+      // wired to actually flip.
+      if (waeIsReviewRoute()) {
+        const host = waeFindReviewMapHost();
+        const found = host ? waeFindReviewMapOnce() : null;
+        if (found) {
+          waeSetCurrentMap(found, 'review');
+          waeSafeRefreshPulses();
+        } else if (waeUI) {
+          log(waeUI.logEl, '✗ Could not find the review map on this page yet -- try again in a moment.', 'err');
+        }
+        return;
+      }
       const attached = await waeAttachToMapIfNeeded();
       if (attached) {
         waeSafeRefreshPulses();
@@ -3981,6 +4261,11 @@
     // subscriptions themselves are cheap and their callbacks already
     // check isMapPulsesEnabled() before doing any real work.
     waeStartMapTracking();
+    // Review page (/new/review) support -- see its own section comment
+    // above waeIsReviewRoute() for the full explanation. Independent of
+    // waeStartMapTracking() above since WFMM.map doesn't cover this
+    // route at all; this plugin finds that page's map itself.
+    waeStartReviewMapTracking();
     // Unlike map pulses, this doesn't depend on "Show on Map" being
     // toggled at all -- it's a separate feature (see its own comment)
     // that should just always be live while the plugin itself is.
@@ -3998,6 +4283,7 @@
     waeCloseNearbyPopover();
     closePanel(); // no-op if the panel isn't open; openModal's own close() tears its DOM down
     waeStopMapTracking();
+    waeStopReviewMapTracking();
     waeStopSidePanelDetailsWatcher();
     waeClearPulses();
     waeUnregisterAppearance?.();
