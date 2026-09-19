@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Email Importer
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      4.8.2
+// @version      4.9.1
 // @description  Imports Niantic Support "Reporting Abuse in Wayfarer" tickets from Gmail via OAuth, or from .eml files -- using a port of bilde2910/OPR-Tools' email parser -- and stores them for the Abuse Report Extractor script (and other consumers) to search.
 // @author       Frankmans
 // @grant        GM_xmlhttpRequest
@@ -26,6 +26,44 @@
 // exception, not an oversight.
 
 /*
+ * v4.9.1 CHANGE FROM v4.9.0: better-integration pass, part 2 --
+ * auto-sync's enabled/interval now live in WFMM.settings (registered
+ * under this plugin's own id in startPlugin(), see WEI_SETTINGS_DEFAULTS)
+ * instead of two raw localStorage keys (wei_autosync_enabled/
+ * wei_autosync_interval_min). Same reasoning as v4.9.0's settings-link
+ * fix: this is the same registry bundled plugins use, and it's what
+ * feeds WFMM's own Settings > Backups export/import -- this setting
+ * wasn't included in a backup before this. Existing values migrate
+ * automatically the first time this version runs (old keys are read
+ * once and removed); nothing to do manually. CLIENT_ID_KEY and
+ * LAST_SYNC_KEY are untouched -- see WEI_SETTINGS_DEFAULTS' own comment
+ * for why those two deliberately stay as they are.
+ *
+ * v4.9.0 CHANGE FROM v4.8.2: better-integration pass against WFMM's real
+ * public API, matching two fixes already made to the companion Abuse
+ * Report Extractor script (its own v1.35.0):
+ *
+ * (1) The settings-link insertion -- hand-rolled since v4.1.0 as a
+ * whole-document MutationObserver watching for ".wfmapmods-settings-
+ * links" to exist -- is now WFMM.sidePanel.appendSettingsAction(), the
+ * suite's own real, public mechanism for exactly this, with
+ * WFMM.sidePanel.onReady()/onCleared() re-adding the link whenever the
+ * side panel is actually rebuilt (Angular router navigation) rather
+ * than polling the entire document tree for it. v4.7.6's fix (leaving
+ * the observer running for the plugin's whole lifetime instead of
+ * disconnecting after first success) worked, but never actually moved
+ * off the hand-rolled approach underneath it -- this does.
+ *
+ * (2) isMapModsBaseActive() used to check for the #wfmapmods-side-panel
+ * DOM element directly -- an internal implementation detail, not a
+ * contract Base exposes. Now checks wfmmWindow.WFMM?.sidePanel, the
+ * suite's own real "am I here, and is the side-panel service up"
+ * signal, matching what this function actually gates (whether
+ * appendSettingsAction() above has anywhere to attach to).
+ *
+ * Everything else in this file -- Gmail OAuth/sync, the .eml import
+ * path, auto-sync, backup/restore -- is untouched.
+ *
  * v4.8.2 CHANGE FROM v4.8.1: v4.8.1's own error-sample logging did its
  * job -- surfaced the real text behind another "HTTP 403" case (3274/3274
  * fetches, confirmed real message: "Quota exceeded for quota metric
@@ -454,8 +492,6 @@
   ];
   const CLIENT_ID_KEY = 'wei_gmail_client_id';
   const LAST_SYNC_KEY = 'wei_gmail_last_sync_ms';
-  const AUTOSYNC_ENABLED_KEY = 'wei_autosync_enabled';
-  const AUTOSYNC_INTERVAL_KEY = 'wei_autosync_interval_min';
   const CONCURRENCY = 5;
 
   // Only what WFMM.ui's own base styles (injected via ui.injectStyle()/
@@ -768,15 +804,34 @@
   // UI
   // ---------------------------------------------------------------------
 
+  // BUGFIX (not upstream, better-integration pass): auto-sync's
+  // enabled/interval used to live in raw localStorage
+  // (wei_autosync_enabled/wei_autosync_interval_min) -- invisible to
+  // WFMM's own Settings > Backups export/import, unlike every setting a
+  // bundled plugin registers through WFMM.settings.registerPlugin().
+  // Moved into that same registry (see startPlugin(), which registers
+  // WEI_SETTINGS_DEFAULTS under this plugin's own id and migrates
+  // whatever was in the old keys the first time this runs) so it's
+  // backed up/restored the same way. CLIENT_ID_KEY deliberately stays in
+  // localStorage -- see its own comment further up; it's a per-browser
+  // OAuth client id, not really a "preference" in the sense Backups is
+  // for, and LAST_SYNC_KEY is internal sync bookkeeping, not a setting
+  // at all.
+  const WEI_SETTINGS_DEFAULTS = Object.freeze({
+    autoSync: { enabled: false, intervalMin: 15 },
+  });
   function loadAutoSyncSettings() {
+    const saved = wfmmWindow.WFMM.settings.get(PLUGIN_ID, 'autoSync', WEI_SETTINGS_DEFAULTS.autoSync) || {};
     return {
-      enabled: localStorage.getItem(AUTOSYNC_ENABLED_KEY) === 'true',
-      intervalMin: Number(localStorage.getItem(AUTOSYNC_INTERVAL_KEY)) || 15,
+      enabled: typeof saved.enabled === 'boolean' ? saved.enabled : WEI_SETTINGS_DEFAULTS.autoSync.enabled,
+      intervalMin: Number(saved.intervalMin) || WEI_SETTINGS_DEFAULTS.autoSync.intervalMin,
     };
   }
   function saveAutoSyncSettings(enabled, intervalMin) {
-    localStorage.setItem(AUTOSYNC_ENABLED_KEY, String(enabled));
-    localStorage.setItem(AUTOSYNC_INTERVAL_KEY, String(intervalMin));
+    wfmmWindow.WFMM.settings.set(PLUGIN_ID, 'autoSync', {
+      enabled: !!enabled,
+      intervalMin: Number(intervalMin) || WEI_SETTINGS_DEFAULTS.autoSync.intervalMin,
+    });
   }
 
   // WFMM.ui, set while the panel is open, and the currently-open panel's
@@ -1277,16 +1332,19 @@
   // extraction plugin to use instead of re-deriving/reimplementing this.
   // ---------------------------------------------------------------------
   function isMapModsBaseActive() {
-    // v4.0.0 of the consolidated wayfarer-map-mods.user.js suite removed
-    // the #wfmapmods-poi-bridge/#wfmapmods-submit-bridge DOM elements this
-    // used to check for entirely (confirmed against its real source --
-    // zero matches for either id; replaced internally with a private
-    // "component bridge" abstraction that isn't exposed via any stable
-    // public DOM contract). #wfmapmods-side-panel is still created the
-    // same way, so that's the reliable "is Base loaded and running here"
-    // signal now -- the same element this script's own settings-link
-    // watcher already depends on.
-    return !!document.getElementById('wfmapmods-side-panel');
+    // BUGFIX (not upstream, better-integration pass): this used to sniff
+    // for the #wfmapmods-side-panel DOM element directly -- an internal
+    // implementation detail of Base's own side panel, not anything it
+    // exposes as a contract. Base's real, public "am I here" signal is
+    // window.WFMM itself (assigned once Base's core has bootstrapped,
+    // confirmed against its source -- this same wfmmWindow.WFMM is what
+    // registerOrSelfStart() below already polls for). Checking for
+    // WFMM.sidePanel specifically -- rather than just truthy WFMM --
+    // matches what this function is actually used to gate (whether
+    // appendSettingsAction()/onReady()/onCleared() below have anything to
+    // attach to), and stays accurate even in the hypothetical case where
+    // WFMM exists but hasn't populated sidePanel yet.
+    return !!wfmmWindow.WFMM?.sidePanel;
   }
 
   let poiBridgeWarned = false;
@@ -1362,79 +1420,69 @@
   }
 
   // ---------------------------------------------------------------------
-  // Map Mods - Base side panel integration -- same pattern as the Abuse
-  // Report Extractor script (and Report Wayspots' real
-  // insertReportingHistoryLinkIfReady()/insertReportingSettingsLinkIfReady()):
-  // appendChild a plain <a> into ".wfmapmods-settings-links" the first time
-  // it exists, found via a debounced MutationObserver gated on
-  // "#wfmapmods-side-panel". Replaces the old standalone floating button --
-  // the panel now opens from this link instead.
-  //
-  // BUGFIX (not upstream, matching the extractor's own fix): the observer
-  // used to disconnect itself the moment the link was first inserted,
-  // on the assumption the settings section persists for the rest of the
-  // SPA session -- see the extractor's own copy of this comment for the
-  // full "swapping between pages can make the plugin unavailable"
-  // explanation. Left running indefinitely now (only actually
-  // disconnected in stopPlugin()) so a side panel that gets torn down
-  // and rebuilt by Angular's router on navigation gets the link
-  // re-inserted the same way the first appearance did.
+  // BUGFIX (not upstream, better-integration pass) + refactor: this used
+  // to hand-roll its own side-panel integration -- appendChild a plain
+  // <a> into ".wfmapmods-settings-links" the first time it exists, found
+  // via a whole-document MutationObserver (childList+subtree, debounced
+  // 50ms) -- exact same pattern as the Abuse Report Extractor script had
+  // until its own v1.35.0, including the same real bug: an observer
+  // that, in an earlier version, disconnected itself after first success
+  // had no way to notice the link is gone and never re-add it if Base's
+  // side panel gets torn down and rebuilt by Angular's router (fixed
+  // here in v4.7.6 by just leaving the observer running indefinitely,
+  // which worked but never adopted the real API underneath). Replaced
+  // now with what WFMM.sidePanel actually offers for exactly this:
+  // appendSettingsAction(element, options) drops an element into the
+  // real settings-actions slot and hands back an unsubscribe function,
+  // while WFMM.sidePanel.onReady()/onCleared() fire every time that slot
+  // is actually rebuilt -- the real, public replacement for the
+  // MutationObserver above, and the same one the extractor script now
+  // uses for this same link.
   // ---------------------------------------------------------------------
 
-  const SETTINGS_LINK_ID = 'wei-settings-link';
-  let sidePanelObserver = null;
-  let sidePanelMutationScheduled = false;
+  let weiSettingsActionCleanup = null;
+  let weiSidePanelReadyUnsub = null;
+  let weiSidePanelClearedUnsub = null;
 
-  function insertSettingsLinkIfReady() {
-    const settingsBody = document.querySelector('.wfmapmods-settings-links');
-    if (!settingsBody) return false;
-    if (document.getElementById(SETTINGS_LINK_ID)) return true;
-
+  function attachSettingsAction() {
+    weiSettingsActionCleanup?.();
     const link = document.createElement('a');
-    link.id = SETTINGS_LINK_ID;
     link.textContent = 'Import Abuse Report Emails';
     link.style.cursor = 'pointer';
-
-    settingsBody.appendChild(link);
-
     link.addEventListener('click', (ev) => {
       ev.preventDefault();
       togglePanel();
     });
-
-    return true;
+    weiSettingsActionCleanup = wfmmWindow.WFMM.sidePanel.appendSettingsAction(link);
   }
 
-  function sidePanelMutationHandler() {
-    if (!document.querySelector('#wfmapmods-side-panel')) return;
-    insertSettingsLinkIfReady();
+  function detachSettingsAction() {
+    weiSettingsActionCleanup?.();
+    weiSettingsActionCleanup = null;
   }
 
-  function startSidePanelWatcher() {
-    if (sidePanelObserver) return;
-
-    sidePanelMutationHandler(); // covers the case it's already there
-
-    sidePanelObserver = new MutationObserver(() => {
-      if (sidePanelMutationScheduled) return;
-      sidePanelMutationScheduled = true;
-      setTimeout(() => {
-        sidePanelMutationScheduled = false;
-        sidePanelMutationHandler();
-      }, 50);
+  // One-time migration from the old raw-localStorage keys (removed from
+  // this file as of v4.9.1, see WEI_SETTINGS_DEFAULTS' own comment) into
+  // WFMM.settings -- only runs if this plugin id has genuinely never been
+  // registered with WFMM.settings before (get() with no fallback comes
+  // back undefined only in that case; registerPlugin() itself always
+  // leaves AT LEAST {} behind after the first call, so this can't
+  // accidentally re-run and clobber a real choice made after upgrading).
+  // Old keys are removed once migrated so this doesn't leave two sources
+  // of truth lying around, silently disagreeing, forever.
+  function weiMigrateLegacySettingsIfNeeded() {
+    if (wfmmWindow.WFMM.settings.get(PLUGIN_ID) !== undefined) return; // already registered -- nothing to migrate
+    const legacyEnabled = localStorage.getItem('wei_autosync_enabled');
+    const legacyIntervalMin = localStorage.getItem('wei_autosync_interval_min');
+    if (legacyEnabled === null && legacyIntervalMin === null) return; // fresh install -- defaults are already correct
+    wfmmWindow.WFMM.settings.setPlugin(PLUGIN_ID, {
+      autoSync: {
+        enabled: legacyEnabled === 'true',
+        intervalMin: Number(legacyIntervalMin) || WEI_SETTINGS_DEFAULTS.autoSync.intervalMin,
+      },
     });
-
-    sidePanelObserver.observe(document.documentElement || document.body, {
-      childList: true,
-      subtree: true,
-    });
-  }
-
-  function stopSidePanelWatcher() {
-    if (sidePanelObserver) {
-      sidePanelObserver.disconnect();
-      sidePanelObserver = null;
-    }
+    localStorage.removeItem('wei_autosync_enabled');
+    localStorage.removeItem('wei_autosync_interval_min');
   }
 
   function startPlugin() {
@@ -1443,7 +1491,20 @@
     // see wae.js's own startPlugin() comment for why. injectStyle() is
     // idempotent (replaces by id), safe to call on every startPlugin().
     wfmmWindow.WFMM.ui.injectStyle('wei-extra-styles', STYLE);
-    startSidePanelWatcher();
+    // Migrate BEFORE registering defaults -- registerPlugin() itself is
+    // what makes get(PLUGIN_ID) stop looking "never registered" to the
+    // check above, so migration has to run against whatever's already
+    // there first.
+    weiMigrateLegacySettingsIfNeeded();
+    wfmmWindow.WFMM.settings.registerPlugin(PLUGIN_ID, WEI_SETTINGS_DEFAULTS);
+    // attachSettingsAction() once immediately -- covers the side panel
+    // already being up right now -- then subscribed to onReady()/
+    // onCleared() for later side-panel rebuilds (Angular router
+    // navigation). See attachSettingsAction()'s own comment above for why
+    // this replaced the old MutationObserver.
+    attachSettingsAction();
+    weiSidePanelReadyUnsub = wfmmWindow.WFMM.sidePanel.onReady(attachSettingsAction);
+    weiSidePanelClearedUnsub = wfmmWindow.WFMM.sidePanel.onCleared(detachSettingsAction);
     // Auto-sync used to only start the first time buildPanel() ever ran
     // (which happened here too, since startPlugin() called it eagerly).
     // Now that the panel's DOM is only built on open, this has moved out
@@ -1454,8 +1515,11 @@
   }
 
   function stopPlugin() {
-    stopSidePanelWatcher();
-    document.getElementById('wei-settings-link')?.remove();
+    weiSidePanelReadyUnsub?.();
+    weiSidePanelReadyUnsub = null;
+    weiSidePanelClearedUnsub?.();
+    weiSidePanelClearedUnsub = null;
+    detachSettingsAction();
     closePanel(); // no-op if the panel isn't open; openModal's own close() tears its DOM down
     stopAutoSync();
   }

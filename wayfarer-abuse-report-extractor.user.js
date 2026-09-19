@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Report Extractor
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.34.4
+// @version      1.38.1
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -15,6 +15,131 @@
 // ==/UserScript==
 
 /*
+ * v1.38.1 CHANGE FROM v1.38.0: crosses/clusters now sit BELOW real
+ * markers in stacking order (Wayspot/Pok\u00e9stop/Gym/Power Spot markers,
+ * WFMM's own submission-pin/draft markers), instead of on top of them.
+ * v1.38.0's rewrite placed WaePulseOverlay's divs in the overlayMouseTarget
+ * pane, reasoning that "clickable" meant it belonged in the pane meant
+ * for mouse events -- but MapPanes' documented stacking order is
+ * mapPane < overlayLayer < markerLayer < overlayMouseTarget < floatPane,
+ * and overlayMouseTarget sits ABOVE markerLayer, where every real marker
+ * actually lives. That meant a cross or cluster could visually cover a
+ * real marker underneath it. Moved to overlayLayer (matching WFMM's own
+ * pulse-layer.js, which was already there) -- below markerLayer, so real
+ * markers stay visually on top and clickable through this layer
+ * wherever the two overlap. Explicit pointer-events CSS (unchanged) is
+ * what keeps a cross/cluster clickable in the areas no real marker
+ * covers it; that doesn't depend on which pane it's in. See
+ * waeEnsurePulseOverlayCtor()'s own comment for the full reasoning.
+ *
+ * v1.38.0 CHANGE FROM v1.37.0: fixes crosses/clusters loading noticeably
+ * slower on Firefox than Chrome once a dataset grew into the hundreds.
+ * Every marker used to be a real google.maps.Marker with its icon set
+ * as a data: URI SVG -- fine on Chrome, but a Marker's .icon is
+ * fundamentally an <img>, decoded through the browser's image pipeline,
+ * and that pipeline is measurably heavier in Firefox than Chrome for
+ * many small repeated data: URIs specifically. Compared against WFMM's
+ * own actual source: its directly analogous "Report History" pulse
+ * layer (src/plugins/report-history/pulse-layer.js, PulseOverlay) never
+ * used Marker for this at all, for exactly this reason -- it positions
+ * a plain CSS-styled <div> per point via a custom google.maps.OverlayView
+ * subclass, with the shape as real DOM/SVG content rather than an icon
+ * image (DOM/SVG rendering doesn't go through image decoding, in either
+ * browser). WaePulseOverlay (see waeEnsurePulseOverlayCtor()) is that
+ * same pattern, adapted for this plugin's own needs -- clickable, with
+ * a cluster-count label, backing a real InfoWindow / recenter-and-zoom,
+ * none of which pulse-layer.js's own deliberately non-interactive
+ * pulses need. waeGetMarkerIcon()/waeGetClusterIcon() are renamed
+ * waeGetMarkerSvgMarkup()/waeGetClusterSvgMarkup() and now return the
+ * raw <svg> markup itself (still cached/invalidated the same way as
+ * before) instead of a Marker icon descriptor. Also corrects v1.12.0's
+ * own reasoning for why Marker was chosen over OverlayView in the first
+ * place -- see the "Map plotting" section comment above
+ * waeEnsurePulseOverlayCtor() for the full explanation; the short
+ * version is that the per-frame-repositioning concern it raised was
+ * never actually the bottleneck; the icon-decode cost was.
+ *
+ * Everything else -- clustering, the diffing loop in waeRefreshPulses(),
+ * waeClearPulses(), click behavior, Marker Style settings (still applies
+ * live, still the same fields) -- is unchanged; OverlayView instances
+ * support the same .setMap(map)/.setMap(null) calls a Marker does, so
+ * none of the surrounding code needed to change to accommodate this.
+ *
+ * v1.37.0 CHANGE FROM v1.36.0: better-integration pass, part 2 --
+ * Marker Style's appearance settings and the "close panel on navigate"
+ * toggle now live in WFMM.settings (registered under this plugin's own
+ * id in startPlugin(), see WAE_SETTINGS_DEFAULTS) instead of two raw
+ * localStorage keys (wae_marker_appearance/wae_autoclose_on_navigate).
+ * Same reasoning as the settings-link fix in v1.35.0: this is the same
+ * registry bundled plugins use, and it's what feeds WFMM's own Settings
+ * > Backups export/import -- neither setting was included in a backup
+ * before this. Existing values migrate automatically the first time
+ * this version runs (old keys are read once and removed); nothing to
+ * do manually. WAE_MAP_VISIBLE_KEY is untouched -- it was already a
+ * one-time seed straight into WFMM.layers.register(), not an ongoing
+ * raw-storage dependency, so there was nothing left to migrate there.
+ *
+ * v1.36.0 CHANGE FROM v1.35.1: cluster ("heatmap") marker size is now
+ * decoupled from the single-report cross marker size, with its own
+ * "Cluster size" control in Marker Style settings -- previously
+ * waeGetClusterIcon() just multiplied the cross's markerSize by a fixed
+ * 1.15, so the two could never be sized independently. New
+ * WAE_APPEARANCE_DEFAULTS.clusterMarkerSize field, defaulted to 10 (==
+ * 9 * 1.15, rounded) so anyone with an already-customized cross size
+ * sees no visual change until they touch the new control themselves.
+ *
+ * Also: cluster markers now render visibly bigger (WAE_CLUSTER_EXPAND_
+ * FACTOR, 1.5x) specifically at the lowest zoom level they're shown at
+ * (WAE_MIN_SHOW_ZOOM, now a named constant instead of a bare "8" in
+ * waeShouldShowPulses()) -- at that floor zoom a cluster represents far
+ * more ground (and often far more reports) per pixel than it does once
+ * you're zoomed in, so the same fixed size under-emphasized exactly the
+ * view where it matters most. waeGetClusterIcon() now caches two
+ * variants (normal/expanded) rather than one, and waeRefreshPulses()
+ * picks whichever the current (floor()'d, to avoid flicker across
+ * fractional zoom) zoom level calls for.
+ *
+ * v1.35.1 CHANGE FROM v1.35.0: fixes crosses sometimes not appearing
+ * when the map first opens, only showing up once you click an abuse
+ * report (which recenters/zooms the map). Root cause: v1.34.1 added
+ * try/catch + a retry to waeRefreshPulses()'s debounced 'idle' caller,
+ * but every OTHER caller -- the initial WFMM.map.onReady() render,
+ * waeResyncMapIfVisible() at bootstrap, waeApplyLayerEnabled()'s
+ * toggle-on path, and a live appearance-color redraw -- still called it
+ * raw. Those load-time callers run at precisely the moment the map's
+ * projection/bounds are least likely to be fully settled, so a
+ * transient throw there had no retry and nothing else would re-render
+ * until an actual map interaction (pan/zoom) fired 'idle' and landed on
+ * the one already-protected path -- e.g. clicking a report. The retry
+ * logic is now one shared waeSafeRefreshPulses() helper, and every
+ * caller (the idle handler included) goes through it, so all of them
+ * get the same resilience.
+ *
+ * v1.35.0 CHANGE FROM v1.34.4: Marker Style settings (color, size,
+ * opacity, ring, clickable) moved out of the bottom of the main
+ * "Extract Wayspots" tool panel into their own modal, reachable from a
+ * new "Abuse Report Extractor - Marker Style" entry in the native
+ * Settings side-panel list, alongside the existing "Abuse Report
+ * Extractor" entry that still opens the main tool panel. See
+ * waeRenderMarkerStyleSection()'s own comment for why a literal new tab
+ * inside WFMM's own native Settings window (Markers/Map/Planner/...)
+ * isn't something a plugin outside the suite's own bundle can add
+ * (confirmed against Base's own settings-hub source: a frozen list of
+ * sections, each one hardcoded by bundled-plugin id) and why
+ * WFMM.sidePanel.appendSettingsAction() -- what Planner's own settings
+ * link relies on too, once you look past its extra settings-hub
+ * shortcut -- is the actual public mechanism this uses instead.
+ *
+ * Also replaces the settings-link insertion itself: it used to hand-
+ * roll a whole-document MutationObserver watching for
+ * ".wfmapmods-settings-links" to exist (copied from Report Wayspots
+ * v3.3.0's own approach, bug included -- see the removed comment this
+ * replaced). Now uses WFMM.sidePanel.appendSettingsAction() directly,
+ * with WFMM.sidePanel.onReady()/onCleared() (already relied on
+ * elsewhere in this file, for the ticket-annotation feature) re-adding
+ * both links whenever the side panel is actually rebuilt, rather than
+ * polling the entire document tree for it.
+ *
  * v1.34.4 CHANGE FROM v1.34.3: Export CSV no longer repeats the raw
  * per-ticket text (Issue Type / Location Details / Report Details) on
  * every Wayspot row a ticket reported -- it's now written once, on the
@@ -1241,13 +1366,35 @@
   }
 
   // ---------------------------------------------------------------------
-  // Map plotting -- extracted locations as native google.maps.Marker
-  // objects, NOT a custom OverlayView (see v1.12.0 changelog note: an
-  // OverlayView with many instances forces a JS-driven DOM reposition on
-  // every single drag frame, for every marker, which is what made this
-  // laggy once there were more than a couple dozen -- native Markers are
-  // positioned by the Maps SDK itself, no per-frame JS callback involved,
-  // and don't need any pan/zoom listener at all to stay correctly placed.
+  // Map plotting -- extracted locations as a custom google.maps.OverlayView
+  // subclass (WaePulseOverlay, see waeEnsurePulseOverlayCtor() further
+  // down), NOT native google.maps.Marker objects, as of v1.38.0.
+  //
+  // v1.12.0's own note here (kept for the record, since the reasoning in
+  // it turned out to be the wrong half of the story) argued the opposite:
+  // that a custom OverlayView forces a JS-driven DOM reposition on every
+  // drag frame while native Markers are repositioned by the Maps SDK
+  // itself with "no per-frame JS callback involved." That's not actually
+  // true -- Marker's own positioning is internally driven by the exact
+  // same projection/frame-update mechanism an OverlayView's draw()
+  // subscribes to; there's no callback-free "native" path, just one
+  // hidden from userland instead of one written in this file. What
+  // v1.12.0 was actually seeing (or anticipating) was never confirmed
+  // against a real reposition-cost measurement either way.
+  //
+  // What v1.38.0 DID confirm, reported as "loads fine on Chrome, slow on
+  // Firefox" once a dataset grew into the hundreds: a Marker's .icon is
+  // fundamentally an <img>, decoded through the browser's image
+  // pipeline -- and that pipeline is measurably heavier in Firefox than
+  // Chrome for many small, repeated data: URIs specifically, independent
+  // of anything about per-frame positioning. WFMM's own directly
+  // analogous "Report History" pulse layer (pulse-layer.js) never used
+  // Marker at all, for exactly this reason: it's always been a plain
+  // CSS-styled <div> positioned by a custom OverlayView, with the shape
+  // as real DOM content rather than an icon image. WaePulseOverlay is
+  // that same pattern, adapted for this plugin's own needs (clickable,
+  // with a cluster-count label) -- see its own comment for the rest.
+  //
   // Own icon/color so this doesn't read as the same layer as Report
   // Wayspots' own reported-wayspot history markers -- this shows
   // *extracted* reports, not Report Wayspots' own submission history, and
@@ -1275,9 +1422,16 @@
   // (e.g. clicking through several rows in a row to compare locations)
   // and re-open it themselves when they're done looking, hence this
   // being a real setting rather than the one hardcoded behavior.
-  const WAE_AUTOCLOSE_ON_NAVIGATE_KEY = 'wae_autoclose_on_navigate';
+  //
+  // BUGFIX (not upstream, better-integration pass): used to be its own
+  // raw localStorage flag (wae_autoclose_on_navigate) -- moved into
+  // WFMM.settings (see startPlugin(), which registers WAE_SETTINGS_DEFAULTS
+  // under this plugin's own id and migrates whatever was in the old keys
+  // the first time this runs) alongside Marker Style's appearance
+  // settings just below, for the same reason: WFMM's own Settings >
+  // Backups export/import only sees what's registered there.
   function waeAutoCloseOnNavigateEnabled() {
-    return localStorage.getItem(WAE_AUTOCLOSE_ON_NAVIGATE_KEY) !== 'false';
+    return wfmmWindow.WFMM.settings.get(PLUGIN_ID, 'autoCloseOnNavigate', true) !== false;
   }
   const WAE_PULSES = { map: null, surface: null, markersById: new Map(), infoWindow: null };
   let waeAllRecords = [];
@@ -1337,15 +1491,32 @@
   // screens use. Same underlying engine, same look, own section -- not a
   // literal new row in that one hardcoded grid.
   const WAE_APPEARANCE_STYLE_KEY = 'wae:abuse-report';
-  const WAE_APPEARANCE_STORAGE_KEY = 'wae_marker_appearance';
   const WAE_APPEARANCE_DEFAULTS = Object.freeze({
     markerSize: 9,
+    // BUGFIX (not upstream, feature request): this used to be the ONLY
+    // size field -- waeGetClusterIcon() below multiplied it by a fixed
+    // 1.15 to get the cluster/"heatmap" circle's radius, so the two
+    // markers could never be sized independently; making the cross
+    // bigger always made clusters bigger too, in fixed lockstep. Decoupled
+    // now into its own field, defaulted to 10 (== 9 * 1.15, rounded) so
+    // anyone who already had a customized markerSize saved sees the same
+    // cluster size they always have, right up until they touch this new
+    // control for the first time.
+    clusterMarkerSize: 10,
     fillColor: '#dc2626',
     fillOpacity: 1,
     borderColor: '#ffffff',
     borderWidth: 2,
     borderOpacity: 1,
     clickable: true,
+  });
+  // Combined with autoCloseOnNavigate (see waeAutoCloseOnNavigateEnabled()
+  // above) under one WFMM.settings.registerPlugin() call in startPlugin()
+  // -- everything this plugin persists as a genuine user preference (as
+  // opposed to sync/bookkeeping state) lives under these two keys now.
+  const WAE_SETTINGS_DEFAULTS = Object.freeze({
+    appearance: WAE_APPEARANCE_DEFAULTS,
+    autoCloseOnNavigate: true,
   });
   // Set once at startPlugin() (WFMM.markerAppearance.registerStyle()'s
   // return value) and called at stopPlugin() -- registerStyle() throws
@@ -1366,6 +1537,7 @@
     const a = raw || {};
     return {
       markerSize: waeClampNumber(a.markerSize, 4, 24, WAE_APPEARANCE_DEFAULTS.markerSize),
+      clusterMarkerSize: waeClampNumber(a.clusterMarkerSize, 4, 24, WAE_APPEARANCE_DEFAULTS.clusterMarkerSize),
       fillColor: waeNormalizeHexColor(a.fillColor, WAE_APPEARANCE_DEFAULTS.fillColor),
       fillOpacity: waeClampNumber(a.fillOpacity, 0, 1, WAE_APPEARANCE_DEFAULTS.fillOpacity),
       borderColor: waeNormalizeHexColor(a.borderColor, WAE_APPEARANCE_DEFAULTS.borderColor),
@@ -1377,28 +1549,32 @@
       // since it's still a per-marker Google Maps option this same
       // Marker Style section is the natural place to expose, and it's
       // simplest to save/normalize/reset together with the rest rather
-      // than as a separate localStorage key.
+      // than as a separate WFMM.settings key.
       clickable: typeof a.clickable === 'boolean' ? a.clickable : WAE_APPEARANCE_DEFAULTS.clickable,
     };
   }
+  // BUGFIX (not upstream, better-integration pass): used to be its own
+  // raw localStorage key (wae_marker_appearance) -- moved into
+  // WFMM.settings, same registry (and same reasoning: WFMM's own
+  // Settings > Backups export/import) as waeAutoCloseOnNavigateEnabled()
+  // just above. See WAE_SETTINGS_DEFAULTS and startPlugin(), which
+  // registers it and migrates whatever was in the old keys the first
+  // time this runs.
   function waeLoadAppearance() {
-    try {
-      return waeNormalizeAppearance(JSON.parse(localStorage.getItem(WAE_APPEARANCE_STORAGE_KEY) || '{}'));
-    } catch (e) {
-      return { ...WAE_APPEARANCE_DEFAULTS };
-    }
+    return waeNormalizeAppearance(wfmmWindow.WFMM.settings.get(PLUGIN_ID, 'appearance', WAE_APPEARANCE_DEFAULTS));
   }
   function waeSaveAppearance(appearance) {
-    localStorage.setItem(WAE_APPEARANCE_STORAGE_KEY, JSON.stringify(appearance));
+    wfmmWindow.WFMM.settings.set(PLUGIN_ID, 'appearance', appearance);
     // Cached SVG icons (WAE_MARKER_ICON/WAE_CLUSTER_ICON, see below) are
     // built from these values -- stale otherwise until the next full page
     // load.
     WAE_MARKER_ICON = null;
-    WAE_CLUSTER_ICON = null;
+    WAE_CLUSTER_ICON.normal = null;
+    WAE_CLUSTER_ICON.expanded = null;
     // Only live-redraw if pulses are actually already visible -- editing
     // colors shouldn't be what makes the map attach/show pulses if the
     // user never turned "Show on Map" on.
-    if (WAE_PULSES.map && isMapPulsesEnabled()) waeRefreshPulses();
+    if (WAE_PULSES.map && isMapPulsesEnabled()) waeSafeRefreshPulses();
   }
 
   const WAE_PAGE_SIZE = 200;
@@ -1439,8 +1615,15 @@
   // Built lazily and cached -- same icon object reused for every marker
   // instead of rebuilt per-call. Invalidated (set back to null) by
   // waeSaveAppearance() whenever the user changes a marker-style setting.
+  // BUGFIX (not upstream): these two used to build a Marker "icon"
+  // descriptor ({url: 'data:image/svg+xml,...', scaledSize, anchor}) --
+  // see STYLE's own .wae-pulse-marker comment for why that's the actual
+  // source of the Chrome-vs-Firefox gap this was rewritten to fix. Now
+  // return the raw <svg>...</svg> markup itself (still cached exactly
+  // the same way, still invalidated by waeSaveAppearance() the same way)
+  // for WaePulseOverlay to drop straight into a div's innerHTML instead.
   let WAE_MARKER_ICON = null;
-  function waeGetMarkerIcon() {
+  function waeGetMarkerSvgMarkup() {
     if (WAE_MARKER_ICON) return WAE_MARKER_ICON;
     const a = waeLoadAppearance();
     // Kept as a distinct X glyph (not the same filled-circle look as a
@@ -1455,15 +1638,10 @@
     const half = size / 2;
     const arm = size * 0.35;
     const stroke = Math.max(2, Math.round(a.markerSize * 0.45));
-    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}">`
+    WAE_MARKER_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}">`
       + `<line x1="${half - arm}" y1="${half - arm}" x2="${half + arm}" y2="${half + arm}" stroke="${a.fillColor}" stroke-width="${stroke}" stroke-linecap="round"/>`
       + `<line x1="${half + arm}" y1="${half - arm}" x2="${half - arm}" y2="${half + arm}" stroke="${a.fillColor}" stroke-width="${stroke}" stroke-linecap="round"/>`
       + '</svg>';
-    WAE_MARKER_ICON = {
-      url: 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(svg),
-      scaledSize: new google.maps.Size(size, size),
-      anchor: new google.maps.Point(half, half),
-    };
     return WAE_MARKER_ICON;
   }
 
@@ -1471,25 +1649,169 @@
   // (matching WFMM's own "generic" POI marker shape) with room for a
   // count label -- reads as "many of the same thing" rather than a
   // different kind of marker. Every field here (fillColor/fillOpacity/
-  // borderColor/borderWidth/borderOpacity/markerSize) is user-
+  // borderColor/borderWidth/borderOpacity/clusterMarkerSize) is user-
   // configurable through the Marker Style section.
-  let WAE_CLUSTER_ICON = null;
-  function waeGetClusterIcon() {
-    if (WAE_CLUSTER_ICON) return WAE_CLUSTER_ICON;
+  //
+  // Two cached variants, not one -- see WAE_CLUSTER_EXPAND_ZOOM/
+  // WAE_CLUSTER_EXPAND_FACTOR just below for why: at the lowest zoom
+  // level these still show at, a cluster typically represents FAR more
+  // ground (and often far more reports) per pixel than it does once
+  // you're zoomed in, so the same fixed size reads as under-emphasized
+  // right when it matters most. Rendering it visibly bigger specifically
+  // at that floor zoom -- rather than one size for every zoom -- makes a
+  // wide-area glance actually draw the eye to where reports are
+  // concentrated, without changing anything about how it looks once
+  // you've zoomed in past that floor.
+  const WAE_CLUSTER_EXPAND_FACTOR = 1.5;
+  let WAE_CLUSTER_ICON = { normal: null, expanded: null };
+  function waeGetClusterSvgMarkup(expanded) {
+    const cacheKey = expanded ? 'expanded' : 'normal';
+    if (WAE_CLUSTER_ICON[cacheKey]) return WAE_CLUSTER_ICON[cacheKey];
     const a = waeLoadAppearance();
-    const r = a.markerSize * 1.15;
+    const r = a.clusterMarkerSize * (expanded ? WAE_CLUSTER_EXPAND_FACTOR : 1);
     const size = (r + a.borderWidth) * 2;
     const c = size / 2;
-    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}">`
+    WAE_CLUSTER_ICON[cacheKey] = `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}">`
       + `<circle cx="${c}" cy="${c}" r="${r}" fill="${a.fillColor}" fill-opacity="${a.fillOpacity}" stroke="${a.borderColor}" stroke-width="${a.borderWidth}" stroke-opacity="${a.borderOpacity}"/>`
       + '</svg>';
-    WAE_CLUSTER_ICON = {
-      url: 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(svg),
-      scaledSize: new google.maps.Size(size, size),
-      anchor: new google.maps.Point(c, c),
-      labelOrigin: new google.maps.Point(c, c),
+    return WAE_CLUSTER_ICON[cacheKey];
+  }
+
+  // ---------------------------------------------------------------------
+  // BUGFIX (not upstream): every single-report and cluster marker used
+  // to be a real google.maps.Marker, with the SVG above wrapped as a
+  // data: URI and handed in as its .icon -- reported as noticeably
+  // slower to load on Firefox than Chrome once a dataset grew into the
+  // hundreds, and confirmed (against WFMM's own actual source) to be
+  // the same class of problem the suite's own directly-analogous
+  // "Report History" pulse layer (pulse-layer.js, PulseOverlay) already
+  // avoids on purpose: a Marker's icon renders through the browser's
+  // IMAGE decode pipeline (it's fundamentally an <img>), and that
+  // pipeline is measurably heavier in Firefox than Chrome for many
+  // small, repeated data: URIs specifically -- worse the more markers
+  // there are, which is exactly when it'd matter most. WFMM's own pulse
+  // layer sidesteps this entirely by never using Marker's icon at all:
+  // each point is a plain <div>, styled with real CSS/DOM content,
+  // positioned by a custom google.maps.OverlayView subclass instead.
+  //
+  // WaePulseOverlay below is that same pattern, adapted for this
+  // plugin's needs -- clickable, with a cluster-count label, backing a
+  // real InfoWindow / recenter-and-zoom on click, none of which
+  // pulse-layer.js's own deliberately non-interactive pulses need. The
+  // SVG markup from waeGetMarkerSvgMarkup()/waeGetClusterSvgMarkup()
+  // above is inserted as real innerHTML now, not a data: URI -- that's
+  // the actual fix: DOM/SVG rendering doesn't go through image decoding
+  // at all, in either browser.
+  //
+  // BUGFIX (not upstream): also placed in the overlayLayer pane now
+  // (matching pulse-layer.js's own choice), not overlayMouseTarget --
+  // v1.38.0 originally used overlayMouseTarget on the assumption that
+  // "clickable" meant it belonged in the pane meant for mouse events,
+  // but MapPanes' documented stacking order is mapPane < overlayLayer <
+  // markerLayer < overlayMouseTarget < floatPane: overlayMouseTarget
+  // sits ABOVE markerLayer, which is where native google.maps.Marker
+  // instances (every real Wayspot/Pok\u00e9stop/Gym/Power Spot marker,
+  // and WFMM's own submission-pin/draft markers) actually live. That
+  // put every cross/cluster visually on top of real markers underneath
+  // it, capable of covering them, the opposite of the layering a
+  // "where are there abuse reports" overlay should have relative to the
+  // markers actually being reported on. overlayLayer sits BELOW
+  // markerLayer, so real markers now stay visually on top and remain
+  // clickable through this layer wherever the two overlap -- a cross is
+  // only clickable in the areas no real marker is covering it, which is
+  // the intended trade-off, not a bug: this is context for what's
+  // underneath, not itself the thing meant to take priority for clicks.
+  // Explicit pointer-events (see the CSS: base class none, the
+  // wae-pulse-clickable modifier auto) is still what makes the divs
+  // clickable at all in their own uncovered area -- overlayLayer being a
+  // lower, conventionally-non-interactive pane doesn't block that; CSS
+  // pointer-events on a specific element always overrides whatever an
+  // ancestor pane's own default is.
+  //
+  // Everything OUTSIDE this class -- the diffing loop in
+  // waeRefreshPulses(), waeClearPulses(), the WAE_PULSES.markersById Map
+  // itself -- is UNCHANGED: OverlayView instances support the exact same
+  // .setMap(map)/.setMap(null) calls a Marker does, so none of that
+  // surrounding code needed to know its "markers" aren't Markers anymore.
+  // ---------------------------------------------------------------------
+  let WaePulseOverlayCtor = null;
+  function waeEnsurePulseOverlayCtor() {
+    if (WaePulseOverlayCtor) return true;
+    if (typeof google === 'undefined' || !google.maps?.OverlayView) return false;
+    WaePulseOverlayCtor = class extends google.maps.OverlayView {
+      constructor() {
+        super();
+        this.div = null;
+        this.latLng = null;
+        this.cluster = null;
+        this._html = '';
+        this._title = '';
+        this._clickable = true;
+      }
+      onAdd() {
+        const div = document.createElement('div');
+        div.className = 'wae-pulse-marker';
+        div.addEventListener('click', (ev) => {
+          // Only actually reachable when this.div carries
+          // wae-pulse-clickable -- see applyToDiv() -- since the base
+          // class has pointer-events:none, so there's no need to
+          // separately re-check appearance.clickable in here: a click
+          // event on this div, at all, already implies it's on.
+          ev.stopPropagation();
+          const c = this.cluster;
+          if (!c) return;
+          if (c.records.length > 1) {
+            WAE_PULSES.map.setCenter(this.latLng);
+            WAE_PULSES.map.setZoom(Math.min((WAE_PULSES.map.getZoom() || 8) + 3, 21));
+          } else {
+            waeShowPulseInfoWindow(c.records[0], this.latLng);
+          }
+        });
+        this.div = div;
+        this.applyToDiv();
+        this.getPanes().overlayLayer.appendChild(div);
+        this.draw();
+      }
+      draw() {
+        if (!this.div || !this.latLng) return;
+        const point = this.getProjection()?.fromLatLngToDivPixel(this.latLng);
+        if (!point) return;
+        this.div.style.left = `${point.x}px`;
+        this.div.style.top = `${point.y}px`;
+      }
+      onRemove() {
+        this.div?.remove();
+        this.div = null;
+      }
+      getPosition() {
+        return this.latLng;
+      }
+      applyToDiv() {
+        if (!this.div) return;
+        this.div.innerHTML = this._html;
+        this.div.title = this._title;
+        this.div.classList.toggle('wae-pulse-clickable', this._clickable);
+      }
+      // Called every refresh pass, for both a brand-new overlay and one
+      // being reused for the same cluster key -- same "always reapply
+      // rather than diff what changed" approach waeRefreshPulses()'s own
+      // per-cluster loop already took with a Marker's
+      // setPosition()/setIcon()/setLabel()/etc, kept as-is here since
+      // none of this goes through image decoding anymore -- there's
+      // nothing left in it that was ever the expensive part.
+      setCluster(cluster, isExpanded, appearance) {
+        this.cluster = cluster;
+        this.latLng = new google.maps.LatLng(cluster.lat, cluster.lng);
+        const isClusterMarker = cluster.records.length > 1;
+        const shapeSvg = isClusterMarker ? waeGetClusterSvgMarkup(isExpanded) : waeGetMarkerSvgMarkup();
+        this._html = isClusterMarker ? `${shapeSvg}<span class="wae-pulse-count">${cluster.records.length}</span>` : shapeSvg;
+        this._title = isClusterMarker ? `${cluster.records.length} reports` : (cluster.records[0].wayspotName || '(unnamed report)');
+        this._clickable = !!appearance.clickable;
+        this.applyToDiv();
+        this.draw();
+      }
     };
-    return WAE_CLUSTER_ICON;
+    return true;
   }
 
   const WAE_CLUSTER_PIXEL_RADIUS = 45;
@@ -1624,8 +1946,8 @@
   }
 
   function waeClearPulses() {
-    for (const marker of WAE_PULSES.markersById.values()) {
-      try { marker.setMap(null); } catch (e) { /* ignore */ }
+    for (const overlay of WAE_PULSES.markersById.values()) {
+      try { overlay.setMap(null); } catch (e) { /* ignore */ }
     }
     WAE_PULSES.markersById.clear();
     if (WAE_PULSES.infoWindow) WAE_PULSES.infoWindow.close();
@@ -1648,11 +1970,20 @@
   // from WFMM.map's own context (`context.surface`, "mapview" or
   // "submit" -- see waeSetCurrentMap()) rather than anything this script
   // determines itself.
+  // Named rather than left as a bare literal below, since
+  // waeGetClusterSvgMarkup()'s "expand at the lowest zoom level" behavior
+  // (see WAE_CLUSTER_EXPAND_FACTOR) needs the exact same number: "the
+  // lowest zoom level" only has a well-defined floor on the general
+  // mapview, where this threshold is what defines that floor in the
+  // first place (the submit-Wayspot surface always shows pulses
+  // regardless of zoom -- see the surface==='submit' check right below
+  // -- so it has no floor of its own to expand at).
+  const WAE_MIN_SHOW_ZOOM = 8;
   function waeShouldShowPulses(map, surface) {
     if (surface === 'submit') return true;
     if (!map || typeof map.getZoom !== 'function') return true;
     const z = map.getZoom();
-    return (typeof z === 'number') && z >= 8;
+    return (typeof z === 'number') && z >= WAE_MIN_SHOW_ZOOM;
   }
 
   // Rebuilds the marker set from whatever's currently in waeAllRecords --
@@ -1709,7 +2040,8 @@
     // moment the suite's own map service considers it gone, so a non-null
     // value here can be trusted without re-checking it ourselves.
     if (!map) return;
-    if (typeof google === 'undefined' || !google.maps?.Marker) return;
+    if (typeof google === 'undefined' || !google.maps?.OverlayView) return;
+    if (!waeEnsurePulseOverlayCtor()) return;
 
     // BUGFIX (not upstream): this function never checked whether the
     // "Abuse Report Crosses" layer was actually enabled -- only whether
@@ -1739,10 +2071,16 @@
     const clusters = waeComputeClusters(map, wanted);
     const wantedKeys = new Set(clusters.map(waeClusterKey));
     const appearance = waeLoadAppearance();
+    // Floor()'d since Google Maps allows fractional zoom (smooth
+    // scroll-zoom) -- without this, a cluster mid-transition at e.g.
+    // 8.6 would flip in and out of "expanded" on every fractional tick
+    // rather than settling once it's genuinely left the lowest whole
+    // zoom level.
+    const isLowestZoom = Math.floor(map.getZoom() ?? WAE_MIN_SHOW_ZOOM) <= WAE_MIN_SHOW_ZOOM;
 
-    for (const [key, marker] of WAE_PULSES.markersById.entries()) {
+    for (const [key, overlay] of WAE_PULSES.markersById.entries()) {
       if (!wantedKeys.has(key)) {
-        try { marker.setMap(null); } catch (e) { /* ignore */ }
+        try { overlay.setMap(null); } catch (e) { /* ignore */ }
         WAE_PULSES.markersById.delete(key);
       }
     }
@@ -1765,37 +2103,13 @@
       if (!Number.isFinite(cluster.lat) || !Number.isFinite(cluster.lng)) continue;
       try {
         const key = waeClusterKey(cluster);
-        const isCluster = cluster.records.length > 1;
-        const position = { lat: cluster.lat, lng: cluster.lng };
-        let marker = WAE_PULSES.markersById.get(key);
-        if (!marker) {
-          marker = new google.maps.Marker({});
-          // Read from the marker itself, not a closed-over `cluster`, so a
-          // later re-render that rebuilds this same cluster's data is
-          // reflected even though the click listener below was only
-          // attached once at creation time.
-          marker.addListener('click', () => {
-            const c = marker.waeCluster;
-            if (c.records.length > 1) {
-              WAE_PULSES.map.setCenter(marker.getPosition());
-              WAE_PULSES.map.setZoom(Math.min((WAE_PULSES.map.getZoom() || 8) + 3, 21));
-            } else {
-              waeShowPulseInfoWindow(c.records[0], marker.getPosition());
-            }
-          });
-          WAE_PULSES.markersById.set(key, marker);
+        let overlay = WAE_PULSES.markersById.get(key);
+        if (!overlay) {
+          overlay = new WaePulseOverlayCtor();
+          WAE_PULSES.markersById.set(key, overlay);
         }
-        marker.waeCluster = cluster;
-        marker.setPosition(position);
-        marker.setIcon(isCluster ? waeGetClusterIcon() : waeGetMarkerIcon());
-        marker.setLabel(isCluster ? { text: String(cluster.records.length), color: '#ffffff', fontSize: '10px', fontWeight: '700' } : null);
-        marker.setTitle(isCluster ? `${cluster.records.length} reports` : (cluster.records[0].wayspotName || '(unnamed report)'));
-        // setClickable(false) doesn't just suppress the click listener above
-        // -- it also drops the pointer cursor and lets the click reach
-        // whatever's underneath (the map itself, or a Wayspot marker at the
-        // same spot), which is the point of turning this off.
-        marker.setClickable(appearance.clickable);
-        marker.setMap(map);
+        overlay.setCluster(cluster, isLowestZoom, appearance);
+        overlay.setMap(map);
       } catch (e) {
         console.warn('[Wayfarer Map Mods - Abuse Report Extractor] Skipped rendering one cluster:', e);
       }
@@ -1827,6 +2141,34 @@
   // comment for the other half of this fix (caching each record's
   // projected position, which zoom itself never actually changes).
   const WAE_ZOOM_DEBOUNCE_MS = 200;
+  // BUGFIX (not upstream): only the debounced 'idle' handler below used
+  // to have any error handling around waeRefreshPulses() -- every OTHER
+  // caller (the initial WFMM.map.onReady() render, waeResyncMapIfVisible()
+  // at bootstrap, waeApplyLayerEnabled()'s toggle-on path, and a live
+  // appearance-color redraw) called it raw. Reported as "the crosses
+  // sometimes don't load when you open the map, but do appear once you
+  // click an abuse report": the map's projection/bounds are least likely
+  // to be fully settled at the exact moment it first reports itself
+  // ready, which is precisely when these load-time callers run -- if
+  // that transient state made waeRefreshPulses() throw (see
+  // waeComputeClusters()'s own comment on non-finite projected points),
+  // the exception had nowhere to go on these paths, and nothing else
+  // re-triggers a refresh until the map's own 'idle' event fires from an
+  // actual interaction -- e.g. clicking a report, which recenters/zooms
+  // the map and lands on the one path that WAS already protected.
+  // Pulling that retry logic out into this one shared helper, and
+  // routing every caller through it instead of the raw function, gives
+  // all of them the same resilience the idle path already had.
+  function waeSafeRefreshPulses() {
+    try {
+      waeRefreshPulses();
+    } catch (e) {
+      console.warn('[Wayfarer Map Mods - Abuse Report Extractor] Pulse refresh failed, retrying shortly:', e);
+      setTimeout(() => {
+        try { waeRefreshPulses(); } catch (e2) { /* give up quietly -- next real map interaction will try again */ }
+      }, WAE_ZOOM_DEBOUNCE_MS);
+    }
+  }
   // BUGFIX (not upstream): this 'idle' listener is the ONLY thing that
   // keeps the crosses in sync with the map after the initial attach --
   // WFMM.map.refresh()'s own fast path (confirmed against the real
@@ -1844,9 +2186,9 @@
   // happened to be the last one in the gesture -- i.e. the user stopped
   // zooming right there -- the layer just stayed empty. Now: (1)
   // waeRefreshPulses() itself no longer lets one bad cluster take the
-  // whole redraw down (see its own comment), and (2) this listener
-  // catches anything that still gets through and retries once, shortly
-  // after, instead of leaving the layer to rot until another map
+  // whole redraw down (see its own comment), and (2) waeSafeRefreshPulses()
+  // above catches anything that still gets through and retries once,
+  // shortly after, instead of leaving the layer to rot until another map
   // interaction happens to come along.
   function waeSetCurrentMap(map, surface) {
     if (WAE_PULSES.map === map) return;
@@ -1855,19 +2197,9 @@
     WAE_PULSES.surface = map ? (surface || null) : null;
     if (map) {
       let debounceTimer = null;
-      const runRefresh = () => {
-        try {
-          waeRefreshPulses();
-        } catch (e) {
-          console.warn('[Wayfarer Map Mods - Abuse Report Extractor] Pulse refresh failed, retrying shortly:', e);
-          setTimeout(() => {
-            try { waeRefreshPulses(); } catch (e2) { /* give up quietly -- next real map interaction will try again */ }
-          }, WAE_ZOOM_DEBOUNCE_MS);
-        }
-      };
       map.addListener?.('idle', () => {
         clearTimeout(debounceTimer);
-        debounceTimer = setTimeout(runRefresh, WAE_ZOOM_DEBOUNCE_MS);
+        debounceTimer = setTimeout(waeSafeRefreshPulses, WAE_ZOOM_DEBOUNCE_MS);
       });
     }
   }
@@ -1964,7 +2296,7 @@
     waeMapReadyUnsub = WFMM.map.onReady(({ map, context }) => {
       waeMapRetriesLeft = 0; // a real map showed up -- nothing left to retry
       waeSetCurrentMap(map, context?.surface);
-      if (isMapPulsesEnabled()) waeRefreshPulses();
+      if (isMapPulsesEnabled()) waeSafeRefreshPulses();
     });
     waeMapClearedUnsub = WFMM.map.onCleared(() => {
       WAE_PULSES.map = null;
@@ -2140,7 +2472,7 @@
     if (enabled) {
       const attached = await waeAttachToMapIfNeeded();
       if (attached) {
-        waeRefreshPulses();
+        waeSafeRefreshPulses();
       } else {
         if (waeUI) log(waeUI.logEl, '✗ Could not find the Wayfarer map on this page -- try again from the mapview or the submit-Wayspot map.', 'err');
         // Couldn't actually attach -- don't leave the layer claiming to
@@ -2172,7 +2504,7 @@
     if (!isMapPulsesEnabled()) return;
     waeMapRetriesLeft = WAE_MAP_RETRY_LIMIT;
     const attached = await waeAttachToMapIfNeeded();
-    if (attached) waeRefreshPulses();
+    if (attached) waeSafeRefreshPulses();
   }
 
   // ---------------------------------------------------------------------
@@ -2529,6 +2861,29 @@
     #wae-panel .wfmapmods-modal-dialog{ width:600px; max-width:calc(100vw - 24px); }
     .wae-sub{ font-size:11px; color:var(--wfmm-muted-text, #667085); margin-bottom:8px; }
     .wae-csv-hint{ white-space:pre-line; font-family:ui-monospace, monospace; }
+    /* BUGFIX (not upstream): the crosses/clusters this plugin draws on the
+       map used to be google.maps.Marker instances with a data: URI SVG
+       as their icon -- fine on Chrome, but reported (and confirmed
+       against WFMM's own source: its directly analogous "Report History"
+       pulse layer, pulse-layer.js, deliberately avoids Marker + icon
+       images entirely) as considerably slower on Firefox once a dataset
+       grew into the hundreds. Marker's icon is an <img>, which goes
+       through the browser's IMAGE decode pipeline -- Firefox's is
+       measurably heavier than Chrome's for many small repeated data:
+       URIs specifically. WFMM's own pulse layer instead positions a
+       plain CSS-styled <div> per point via a custom
+       google.maps.OverlayView (see WaePulseOverlay in the script itself)
+       -- these two rules are that div's real content now: the SVG shape
+       is set as actual inline markup (real DOM/SVG rendering, the same
+       pipeline as any other on-page SVG, not the image pipeline), and
+       .wae-pulse-count is a plain positioned label over it for a
+       cluster's count, replacing what used to be a Marker's built-in
+       .setLabel().
+    */
+    .wae-pulse-marker{ position:absolute; transform:translate(-50%, -50%); pointer-events:none; line-height:0; }
+    .wae-pulse-marker.wae-pulse-clickable{ pointer-events:auto; cursor:pointer; }
+    .wae-pulse-marker svg{ display:block; }
+    .wae-pulse-count{ position:absolute; top:50%; left:50%; transform:translate(-50%, -50%); color:#ffffff; font-size:10px; font-weight:700; pointer-events:none; user-select:none; }
     .wae-progress{ font-size:11px; color:#2563eb; margin:4px 0; min-height:14px; }
     .wae-log{ margin-top:8px; max-height:110px; overflow-y:auto; font-size:11px; line-height:1.5; }
     .wae-log div.ok{ color:#16a34a; }
@@ -3040,6 +3395,156 @@
     waeRenderFilteredTable();
   }
 
+  // ---------------------------------------------------------------------
+  // Marker Style settings -- its own modal now, reachable from the
+  // native Settings side-panel list (see attachSettingsActions()
+  // further down) instead of living buried at the bottom of the main
+  // "Extract Wayspots" tool panel. Mirrors the shape the suite's own
+  // bundled Planner plugin uses for ITS settings: a renderXSection(body)
+  // function that builds controls directly into the handed-in body and
+  // returns {onOk} for openModal() to call -- see
+  // renderPlannerMarkerSettingsSection()/createPlannerSettingsModal()'s
+  // own openSettings() in Base's source. Unlike Planner's batched Save/
+  // Cancel flow, every control here still applies (and persists)
+  // immediately on change, matching how this section already behaved
+  // when it lived inline in the tool panel -- so onOk here is just a
+  // no-op to satisfy openModal()'s contentHooks contract, not a real
+  // save step.
+  //
+  // A literal new tab inside WFMM's own native Settings window (the
+  // Side Panels & UI / Markers / Map / Planner / ... tabbed modal opened
+  // from the gear icon) isn't something this plugin -- or any plugin
+  // outside the suite's own bundle -- can add: confirmed against Base's
+  // own settings-hub source, that modal's own SECTIONS list is an
+  // Object.freeze()'d array, and the function that renders a given
+  // section's body hardcodes each non-generic one to a specific bundled
+  // plugin by id (`if (sectionId === "planner") return
+  // WFMM.planner.renderSettingsSection(...)`, and so on for
+  // contributions/s2-cells/review-page/submissions-drafts) -- there's no
+  // registerSection()-style hook an externally-registered plugin like
+  // this one can call into. WFMM.sidePanel.appendSettingsAction() (see
+  // attachSettingsActions()) is the actual public, documented mechanism
+  // any plugin -- bundled or not -- uses to surface a settings entry,
+  // and it's what Planner's own settings link ultimately relies on too:
+  // its openSettings() only reaches WFMM.settingsHub because "planner"
+  // happens to be one of those hardcoded ids, but the settings UI itself
+  // is built with this same openModal()-wrapped, body-rendering pattern
+  // either way -- the hub embedding is just a second way in for the
+  // handful of ids that have one.
+  function waeRenderMarkerStyleSection(ui, body) {
+    function updateAppearance(partial) {
+      const next = waeNormalizeAppearance({ ...waeLoadAppearance(), ...partial });
+      waeSaveAppearance(next);
+      return next;
+    }
+    const initialAppearance = waeLoadAppearance();
+    const styleColorInput = ui.colorInput({
+      value: initialAppearance.fillColor,
+      onInput: (v) => updateAppearance({ fillColor: v }),
+    });
+    const styleSizeRange = ui.rangeInput({
+      min: 4, max: 24, step: 1, value: initialAppearance.markerSize,
+      formatValue: (v) => `${v}px`,
+      onInput: (v) => updateAppearance({ markerSize: Number(v) }),
+    });
+    // BUGFIX (not upstream, feature request): this used to be the same
+    // markerSize as the cross above (waeGetClusterIcon() just multiplied
+    // it by a fixed 1.15) -- decoupled into its own field/control, see
+    // WAE_APPEARANCE_DEFAULTS.clusterMarkerSize's own comment. Cluster
+    // markers ALSO get bigger automatically at the lowest zoom level
+    // (see WAE_CLUSTER_EXPAND_FACTOR) -- that expansion isn't a separate
+    // control here, it's a fixed multiplier applied on top of whatever
+    // size is set below, only while zoomed all the way out.
+    const styleClusterSizeRange = ui.rangeInput({
+      min: 4, max: 24, step: 1, value: initialAppearance.clusterMarkerSize,
+      formatValue: (v) => `${v}px`,
+      onInput: (v) => updateAppearance({ clusterMarkerSize: Number(v) }),
+    });
+    const styleFillOpacityRange = ui.rangeInput({
+      min: 0, max: 1, step: 0.05, value: initialAppearance.fillOpacity,
+      formatValue: (v) => `${Math.round(Number(v) * 100)}%`,
+      onInput: (v) => updateAppearance({ fillOpacity: Number(v) }),
+    });
+    const styleBorderColorInput = ui.colorInput({
+      value: initialAppearance.borderColor,
+      onInput: (v) => updateAppearance({ borderColor: v }),
+    });
+    const styleBorderWidthRange = ui.rangeInput({
+      min: 0, max: 8, step: 1, value: initialAppearance.borderWidth,
+      formatValue: (v) => `${v}px`,
+      onInput: (v) => updateAppearance({ borderWidth: Number(v) }),
+    });
+    const styleBorderOpacityRange = ui.rangeInput({
+      min: 0, max: 1, step: 0.05, value: initialAppearance.borderOpacity,
+      formatValue: (v) => `${Math.round(Number(v) * 100)}%`,
+      onInput: (v) => updateAppearance({ borderOpacity: Number(v) }),
+    });
+    const resetStyleBtn = ui.button({
+      text: 'Reset to default',
+      onClick: () => {
+        const d = waeNormalizeAppearance(WAE_APPEARANCE_DEFAULTS);
+        waeSaveAppearance(d);
+        styleColorInput.value = d.fillColor;
+        styleBorderColorInput.value = d.borderColor;
+        styleSizeRange.input.value = String(d.markerSize);
+        styleSizeRange.valueEl.textContent = `${d.markerSize}px`;
+        styleClusterSizeRange.input.value = String(d.clusterMarkerSize);
+        styleClusterSizeRange.valueEl.textContent = `${d.clusterMarkerSize}px`;
+        styleFillOpacityRange.input.value = String(d.fillOpacity);
+        styleFillOpacityRange.valueEl.textContent = `${Math.round(d.fillOpacity * 100)}%`;
+        styleBorderWidthRange.input.value = String(d.borderWidth);
+        styleBorderWidthRange.valueEl.textContent = `${d.borderWidth}px`;
+        styleBorderOpacityRange.input.value = String(d.borderOpacity);
+        styleBorderOpacityRange.valueEl.textContent = `${Math.round(d.borderOpacity * 100)}%`;
+        styleClickableToggle.input.checked = d.clickable;
+      },
+    });
+    const styleClickableToggle = ui.checkboxRow({
+      label: 'Clickable markers',
+      checked: initialAppearance.clickable,
+      onChange: (checked) => updateAppearance({ clickable: checked }),
+    });
+    const styleSection = ui.section({
+      title: 'Marker Style',
+      hint: 'Color/size for the map markers this plugin draws (single reports and clusters). Changes apply immediately.',
+      children: [
+        ui.fieldRow({ label: 'Color', input: styleColorInput }),
+        ui.fieldRow({ label: 'Cross size', input: styleSizeRange.row, help: 'Single-report \u201cX\u201d markers.' }),
+        ui.fieldRow({ label: 'Cluster size', input: styleClusterSizeRange.row, help: `Multi-report \u201cheatmap\u201d markers. Automatically shown ${WAE_CLUSTER_EXPAND_FACTOR}\u00d7 bigger at the lowest zoom level.` }),
+        ui.fieldRow({ label: 'Fill opacity', input: styleFillOpacityRange.row, help: 'Only visible on cluster markers -- a single X marker is always fully opaque.' }),
+        ui.fieldRow({ label: 'Ring color', input: styleBorderColorInput, help: 'Cluster markers only.' }),
+        ui.fieldRow({ label: 'Ring width', input: styleBorderWidthRange.row }),
+        ui.fieldRow({ label: 'Ring opacity', input: styleBorderOpacityRange.row }),
+        styleClickableToggle.row,
+        ui.buttonRow([resetStyleBtn]),
+      ],
+    });
+    body.append(styleSection);
+    return {
+      onOk() { return true; }, // no-op -- every control above already saved on its own onInput/onChange
+    };
+  }
+
+  let waeMarkerSettingsController = null;
+  function waeOpenMarkerSettingsModal() {
+    if (waeMarkerSettingsController) return; // already open
+    waeMarkerSettingsController = wfmmWindow.WFMM.ui.openModal({
+      id: 'wae-marker-settings',
+      title: 'Abuse Report Extractor - Marker Style',
+      className: 'wae-dialog',
+      showFooterButtons: false,
+      ownerPluginId: PLUGIN_ID,
+      desktopInteractions: { minWidth: 360, minHeight: 280 },
+      buildContent(modal) {
+        return waeRenderMarkerStyleSection(modal.ui, modal.body);
+      },
+      onClose() {
+        waeMarkerSettingsController = null;
+      },
+    });
+  }
+  // ---------------------------------------------------------------------
+
   // Builds the panel's BODY content into an already-open WFMM.ui modal --
   // called as openModal()'s buildContent(modalController). The modal
   // itself (backdrop, dialog, header/title, close button, Escape/
@@ -3087,95 +3592,29 @@
     const autoCloseToggle = ui.checkboxRow({
       label: 'Close this panel when a row jumps the map to its location',
       checked: waeAutoCloseOnNavigateEnabled(),
-      onChange: (checked) => localStorage.setItem(WAE_AUTOCLOSE_ON_NAVIGATE_KEY, String(checked)),
+      onChange: (checked) => wfmmWindow.WFMM.settings.set(PLUGIN_ID, 'autoCloseOnNavigate', checked),
     });
 
     const tableContainer = ui.createElement('div', { className: 'wae-table-container' });
     const logEl = ui.createElement('div', { className: 'wae-log' });
 
     // ---- Marker Style ----
-    // See the WAE_APPEARANCE_* block up top for why this is its own
-    // section here rather than a literal new entry in Wayspot Overlay's
-    // built-in Wayspots/Pok\u00e9stops/Gyms/Power Spots grid (not
-    // possible -- that grid is hardcoded to those four kinds). This uses
-    // the same generic-style shape and the same colorInput/rangeInput
-    // controls the suite's own settings screens use, and is backed by a
-    // real WFMM.markerAppearance.registerStyle() registration (see
-    // startPlugin()) so it's genuinely part of that engine, just
-    // surfaced through this panel instead of that one fixed grid.
-    function updateAppearance(partial) {
-      const next = waeNormalizeAppearance({ ...waeLoadAppearance(), ...partial });
-      waeSaveAppearance(next);
-      return next;
-    }
-    const initialAppearance = waeLoadAppearance();
-    const styleColorInput = ui.colorInput({
-      value: initialAppearance.fillColor,
-      onInput: (v) => updateAppearance({ fillColor: v }),
-    });
-    const styleSizeRange = ui.rangeInput({
-      min: 4, max: 24, step: 1, value: initialAppearance.markerSize,
-      formatValue: (v) => `${v}px`,
-      onInput: (v) => updateAppearance({ markerSize: Number(v) }),
-    });
-    const styleFillOpacityRange = ui.rangeInput({
-      min: 0, max: 1, step: 0.05, value: initialAppearance.fillOpacity,
-      formatValue: (v) => `${Math.round(Number(v) * 100)}%`,
-      onInput: (v) => updateAppearance({ fillOpacity: Number(v) }),
-    });
-    const styleBorderColorInput = ui.colorInput({
-      value: initialAppearance.borderColor,
-      onInput: (v) => updateAppearance({ borderColor: v }),
-    });
-    const styleBorderWidthRange = ui.rangeInput({
-      min: 0, max: 8, step: 1, value: initialAppearance.borderWidth,
-      formatValue: (v) => `${v}px`,
-      onInput: (v) => updateAppearance({ borderWidth: Number(v) }),
-    });
-    const styleBorderOpacityRange = ui.rangeInput({
-      min: 0, max: 1, step: 0.05, value: initialAppearance.borderOpacity,
-      formatValue: (v) => `${Math.round(Number(v) * 100)}%`,
-      onInput: (v) => updateAppearance({ borderOpacity: Number(v) }),
-    });
-    const resetStyleBtn = ui.button({
-      text: 'Reset to default',
-      onClick: () => {
-        const d = waeNormalizeAppearance(WAE_APPEARANCE_DEFAULTS);
-        waeSaveAppearance(d);
-        styleColorInput.value = d.fillColor;
-        styleBorderColorInput.value = d.borderColor;
-        styleSizeRange.input.value = String(d.markerSize);
-        styleSizeRange.valueEl.textContent = `${d.markerSize}px`;
-        styleFillOpacityRange.input.value = String(d.fillOpacity);
-        styleFillOpacityRange.valueEl.textContent = `${Math.round(d.fillOpacity * 100)}%`;
-        styleBorderWidthRange.input.value = String(d.borderWidth);
-        styleBorderWidthRange.valueEl.textContent = `${d.borderWidth}px`;
-        styleBorderOpacityRange.input.value = String(d.borderOpacity);
-        styleBorderOpacityRange.valueEl.textContent = `${Math.round(d.borderOpacity * 100)}%`;
-        styleClickableToggle.input.checked = d.clickable;
-      },
-    });
-    const styleClickableToggle = ui.checkboxRow({
-      label: 'Clickable markers',
-      checked: initialAppearance.clickable,
-      onChange: (checked) => updateAppearance({ clickable: checked }),
-    });
-    const styleSection = ui.section({
-      title: 'Marker Style',
-      hint: 'Color/size for the map markers this plugin draws (single reports and clusters).',
-      children: [
-        ui.fieldRow({ label: 'Color', input: styleColorInput }),
-        ui.fieldRow({ label: 'Size', input: styleSizeRange.row }),
-        ui.fieldRow({ label: 'Fill opacity', input: styleFillOpacityRange.row, help: 'Only visible on cluster markers -- a single X marker is always fully opaque.' }),
-        ui.fieldRow({ label: 'Ring color', input: styleBorderColorInput, help: 'Cluster markers only.' }),
-        ui.fieldRow({ label: 'Ring width', input: styleBorderWidthRange.row }),
-        ui.fieldRow({ label: 'Ring opacity', input: styleBorderOpacityRange.row }),
-        styleClickableToggle.row,
-        ui.buttonRow([resetStyleBtn]),
-      ],
+    // Moved out to its own dedicated settings modal (see
+    // waeOpenMarkerSettingsModal()/waeRenderMarkerStyleSection() further
+    // down) so it's reachable the same way the suite's own bundled
+    // plugins expose their settings -- a dedicated entry in the native
+    // Settings side-panel list (see attachSettingsActions()) -- instead
+    // of being buried at the bottom of this tool's own working panel.
+    // See waeRenderMarkerStyleSection()'s own comment for why a literal
+    // new tab inside WFMM's native Settings window (Markers/Map/
+    // Planner/...) isn't something a plugin outside the suite's own
+    // bundle can add, and why this is the actual public alternative.
+    const markerStyleBtn = ui.button({
+      text: 'Marker Style Settings\u2026',
+      onClick: () => waeOpenMarkerSettingsModal(),
     });
 
-    modal.body.append(countEl, buttonRowEl, csvHint, csvFileInput, progressEl, searchInput, autoCloseToggle.row, tableContainer, logEl, styleSection);
+    modal.body.append(countEl, buttonRowEl, csvHint, csvFileInput, progressEl, searchInput, autoCloseToggle.row, tableContainer, logEl, ui.buttonRow([markerStyleBtn]));
 
     waeUI = { countEl, tableContainer, logEl, scanBtn, exportBtn, clearBtn, searchInput };
 
@@ -3376,96 +3815,101 @@
   }
 
   // ---------------------------------------------------------------------
-  // Map Mods - Base side panel integration -- confirmed against Report
-  // Wayspots v3.3.0's own insertReportingHistoryLinkIfReady() /
-  // insertReportingSettingsLinkIfReady(): both just appendChild a plain
-  // <a> into ".wfmapmods-settings-links" the first time it exists, found
-  // via a MutationObserver on document.documentElement (childList+subtree,
-  // debounced 50ms) that fires until "#wfmapmods-side-panel" is present.
+  // BUGFIX (not upstream) + refactor: this used to hand-roll its own
+  // side-panel integration -- confirmed against Report Wayspots v3.3.0's
+  // own insertReportingHistoryLinkIfReady()/
+  // insertReportingSettingsLinkIfReady(): appendChild a plain <a> into
+  // ".wfmapmods-settings-links" the first time it exists, found via a
+  // whole-document MutationObserver (childList+subtree, debounced 50ms).
+  // That copied a real bug from that other script (an observer that
+  // disconnects itself after first success has no way to notice the
+  // link is gone and never re-add it if Base's side panel gets torn
+  // down and rebuilt by Angular's router -- reported as the plugin going
+  // completely unreachable after navigating between routed views) and,
+  // separately, never used the mechanism WFMM.sidePanel actually offers
+  // for exactly this: appendSettingsAction(element, options) drops an
+  // element into the real settings-actions slot and hands back an
+  // unsubscribe function, while WFMM.sidePanel.onReady()/onCleared()
+  // (already relied on elsewhere in this file -- see
+  // waeStartSidePanelDetailsWatcher()) fire every time that slot is
+  // actually rebuilt, which is the real, public replacement for the
+  // MutationObserver above: re-adding through onReady() covers the
+  // Angular-router case the old code was trying to patch over, without
+  // watching the entire document tree to do it.
   //
-  // BUGFIX (not upstream): that other script's own observer disconnects
-  // itself once its links are in, and this one used to copy that exactly
-  // on the assumption that the settings section persists for the rest of
-  // the SPA session once Base has rendered it once -- reported as the
-  // plugin becoming completely unreachable ("unavailable") after
-  // swapping between different pages on the same domain, since Wayfarer
-  // being an Angular app means most navigation between its own routed
-  // views (mapview, submit-new, etc.) is client-side, not a real page
-  // load this script would ever re-run for. If Base's own side panel (or
-  // just the .wfmapmods-settings-links section within it) gets torn down
-  // and rebuilt by Angular's router on one of those navigations -- not
-  // confirmed against Base's own source, but consistent with ordinary
-  // Angular router behavior and with what was actually reported -- an
-  // observer that already disconnected itself the first time would have
-  // no way to notice the link is gone and never re-add it, permanently
-  // losing the only way to reach this plugin's panel even though its own
-  // background logic (map tracking, etc.) keeps running the whole time.
-  // Left running indefinitely now instead (only actually disconnected in
-  // stopPlugin()) so a rebuilt side panel gets the link re-inserted the
-  // same way the very first appearance did. The observer's own handler
-  // is already a cheap early-return once the link exists, so leaving it
-  // attached for the rest of the page's lifetime rather than a one-shot
-  // "until inserted" watch isn't a meaningfully heavier cost, just a more
-  // correct one for an SPA.
+  // Two links now (see waeRenderMarkerStyleSection()'s own comment for
+  // why this is the right way in rather than a WFMM.settingsHub tab):
+  // the original tool-panel link, plus a new one straight to Marker
+  // Style settings, so that setting is reachable from the native
+  // Settings list the same way the suite's own bundled plugins' settings
+  // are, not just from inside the tool panel.
   // ---------------------------------------------------------------------
 
-  const SETTINGS_LINK_ID = 'wae-settings-link';
-  let sidePanelObserver = null;
-  let sidePanelMutationScheduled = false;
+  let waeSettingsActionCleanup = null;
+  let waeMarkerSettingsActionCleanup = null;
+  let waeSidePanelReadyUnsub = null;
+  let waeSidePanelClearedUnsub = null;
 
-  function insertSettingsLinkIfReady() {
-    const settingsBody = document.querySelector('.wfmapmods-settings-links');
-    if (!settingsBody) return false;
-    if (document.getElementById(SETTINGS_LINK_ID)) return true;
-
-    const link = document.createElement('a');
-    link.id = SETTINGS_LINK_ID;
-    link.textContent = 'Abuse Report Extractor';
-    link.style.cursor = 'pointer';
-
-    settingsBody.appendChild(link);
-
-    link.addEventListener('click', (ev) => {
+  function attachSettingsActions() {
+    waeSettingsActionCleanup?.();
+    const toolLink = document.createElement('a');
+    toolLink.textContent = 'Abuse Report Extractor';
+    toolLink.style.cursor = 'pointer';
+    toolLink.addEventListener('click', (ev) => {
       ev.preventDefault();
       togglePanel();
     });
+    waeSettingsActionCleanup = wfmmWindow.WFMM.sidePanel.appendSettingsAction(toolLink);
 
-    return true;
-  }
-
-  function sidePanelMutationHandler() {
-    if (!document.querySelector('#wfmapmods-side-panel')) return;
-    insertSettingsLinkIfReady();
-  }
-
-  function startSidePanelWatcher() {
-    if (sidePanelObserver) return;
-
-    sidePanelMutationHandler(); // covers the case it's already there
-
-    sidePanelObserver = new MutationObserver(() => {
-      if (sidePanelMutationScheduled) return;
-      sidePanelMutationScheduled = true;
-      setTimeout(() => {
-        sidePanelMutationScheduled = false;
-        sidePanelMutationHandler();
-      }, 50);
+    waeMarkerSettingsActionCleanup?.();
+    const styleLink = document.createElement('a');
+    styleLink.textContent = 'Abuse Report Extractor \u2013 Marker Style';
+    styleLink.style.cursor = 'pointer';
+    styleLink.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      waeOpenMarkerSettingsModal();
     });
-
-    sidePanelObserver.observe(document.documentElement || document.body, {
-      childList: true,
-      subtree: true,
-    });
+    waeMarkerSettingsActionCleanup = wfmmWindow.WFMM.sidePanel.appendSettingsAction(styleLink);
   }
 
-  function stopSidePanelWatcher() {
-    if (sidePanelObserver) {
-      sidePanelObserver.disconnect();
-      sidePanelObserver = null;
-    }
+  function detachSettingsActions() {
+    waeSettingsActionCleanup?.();
+    waeSettingsActionCleanup = null;
+    waeMarkerSettingsActionCleanup?.();
+    waeMarkerSettingsActionCleanup = null;
   }
+
 
   function startPlugin() {
+    // One-time migration from the old raw-localStorage keys (removed
+    // from this file as of v1.37.0, see WAE_SETTINGS_DEFAULTS' own
+    // comment) into WFMM.settings -- only runs if this plugin id has
+    // genuinely never been registered with WFMM.settings before (get()
+    // with no fallback comes back undefined only in that case;
+    // registerPlugin() itself always leaves AT LEAST {} behind after the
+    // first call, so this can't accidentally re-run and clobber a real
+    // choice made after upgrading). Must run BEFORE registerPlugin()
+    // just below -- that's what makes get(PLUGIN_ID) stop looking "never
+    // registered" to this check. Old keys are removed once migrated so
+    // this doesn't leave two sources of truth lying around, silently
+    // disagreeing, forever. WAE_MAP_VISIBLE_KEY is deliberately NOT part
+    // of this -- see its own comment for why that one's already handled,
+    // as a one-time seed straight into WFMM.layers.register() instead.
+    if (wfmmWindow.WFMM.settings.get(PLUGIN_ID) === undefined) {
+      const legacyAppearanceRaw = localStorage.getItem('wae_marker_appearance');
+      const legacyAutoClose = localStorage.getItem('wae_autoclose_on_navigate');
+      if (legacyAppearanceRaw !== null || legacyAutoClose !== null) {
+        let legacyAppearance;
+        try { legacyAppearance = JSON.parse(legacyAppearanceRaw || '{}'); } catch (e) { legacyAppearance = {}; }
+        wfmmWindow.WFMM.settings.setPlugin(PLUGIN_ID, {
+          appearance: waeNormalizeAppearance(legacyAppearance),
+          autoCloseOnNavigate: legacyAutoClose !== 'false',
+        });
+        localStorage.removeItem('wae_marker_appearance');
+        localStorage.removeItem('wae_autoclose_on_navigate');
+      }
+    }
+    wfmmWindow.WFMM.settings.registerPlugin(PLUGIN_ID, WAE_SETTINGS_DEFAULTS);
     // Registering as an external plugin (the only path startPlugin() is
     // reached from -- see registerOrSelfStart() below) already implies
     // WFMM.plugins exists, which per the real v4.0.0+ source means
@@ -3514,7 +3958,22 @@
       defaultEnabled: localStorage.getItem(WAE_MAP_VISIBLE_KEY) === 'true',
       onChange: (enabled) => { waeApplyLayerEnabled(enabled); },
     });
-    startSidePanelWatcher();
+    // Subscribes to the real WFMM.sidePanel.onReady()/onCleared() events
+    // (see attachSettingsActions()'s own comment for why this replaced
+    // the old whole-document MutationObserver) rather than a one-shot
+    // call, so a side panel rebuilt later in the SPA session -- Angular
+    // router navigation, same case the old code was patching around --
+    // gets both settings-actions links re-added the same way they
+    // appeared the first time. onReady() itself only fires for FUTURE
+    // rebuilds (confirmed against every other plugin's own use of it,
+    // e.g. Web Reports' attachSettingsAction() call site: each calls its
+    // attach function once immediately, THEN subscribes for later) --
+    // so the immediate call below covers the side panel already being
+    // up right now, same as this plugin's own
+    // waeStartSidePanelDetailsWatcher() does for its own subscription.
+    attachSettingsActions();
+    waeSidePanelReadyUnsub = wfmmWindow.WFMM.sidePanel.onReady(attachSettingsActions);
+    waeSidePanelClearedUnsub = wfmmWindow.WFMM.sidePanel.onCleared(detachSettingsActions);
     // Subscribes to WFMM.map/WFMM.routes for this plugin's whole
     // lifetime (see waeStartMapTracking()'s own comment for why this
     // replaced the old setInterval-based stale watch) -- started here
@@ -3530,8 +3989,12 @@
   }
 
   function stopPlugin() {
-    stopSidePanelWatcher();
-    document.getElementById('wae-settings-link')?.remove();
+    waeSidePanelReadyUnsub?.();
+    waeSidePanelReadyUnsub = null;
+    waeSidePanelClearedUnsub?.();
+    waeSidePanelClearedUnsub = null;
+    detachSettingsActions();
+    waeMarkerSettingsController?.close();
     waeCloseNearbyPopover();
     closePanel(); // no-op if the panel isn't open; openModal's own close() tears its DOM down
     waeStopMapTracking();
