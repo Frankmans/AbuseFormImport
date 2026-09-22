@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Report Extractor
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.42.0
-// @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map, and exports as CSV.
+// @version      1.43.2
+// @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
 // @match        https://wayfarer.scopely.com/*
@@ -15,6 +15,56 @@
 // ==/UserScript==
 
 /*
+ * v1.43.2 CHANGE FROM v1.43.1: fixes the review-page toggle bar being
+ * unreadable (dark text on a dark background) with Wayfarer's own dark
+ * mode on -- v1.43.1's color-flip keyed off prefers-color-scheme, the
+ * OS/browser's own light/dark setting, but Wayfarer's in-app dark mode is
+ * a separate, independent toggle (confirmed against Map Mods' own source:
+ * every one of Base's own dark-mode-aware styles keys off a ".dark"
+ * ancestor class instead, e.g. ".dark .wfmm-contribution-tags-section").
+ * The two can disagree -- reported as exactly that: OS in light mode,
+ * Wayfarer's own dark mode on, text rendering in the light-mode black
+ * against the page's actual dark background. Added plain ".dark
+ * .wae-review-toggle-bar" etc. rules (this bar is a DOM descendant of the
+ * review page itself, so the same cascade Base's own styles rely on
+ * applies here too) -- these now do the real work, with the
+ * prefers-color-scheme block kept only as a fallback for no ".dark"
+ * ancestor being present at all.
+ *
+ * v1.43.1 CHANGE FROM v1.43.0: the review-page toggle bar (v1.43.0) no
+ * longer sits on its own opaque white/dark plate -- dropped the
+ * background/border/shadow entirely and just color-flips plain text via
+ * prefers-color-scheme instead (black on light, white on dark), since the
+ * filled box read as an odd white slab sitting on the page. The on/off
+ * button keeps a plain currentColor outline (black/white to match) and
+ * still turns solid green only once it's toggled on.
+ *
+ * v1.43.0 CHANGE FROM v1.42.0: re-adds review-page (/new/review) support --
+ * crosses/clusters now also render on the review page's own map (whichever
+ * <nia-map> Angular is currently showing there: the check-duplicates map,
+ * the edit-location/edit-info map, etc.), which v1.40.0 fully reverted
+ * after its own Settings-side-panel-entry-disappearing bug was never
+ * root-caused. This is a from-scratch reimplementation, not a re-apply of
+ * the reverted v1.39.x code, and is built to structurally avoid repeating
+ * that bug rather than just hoping it doesn't recur: it uses its own
+ * completely separate state (WAE_REVIEW_PULSES), its own map-discovery
+ * (WFMM.map/WFMM.routes.onEnterMapRoute() never fire for review at all --
+ * Map Mods' own ROUTES table marks it hasMap:false -- so this walks
+ * <nia-map>'s own Angular __ngContext__ directly instead, the same
+ * general technique Map Mods' own bundled review-map-enhancements plugin
+ * uses internally), its own lifecycle (WFMM.routes.onEnter('review')/
+ * onLeave('review'), not WAE_LAYER_ID/WFMM.layers), and its own on/off
+ * toggle -- a small bar injected directly above the review page's map,
+ * NOT a checkbox in the Settings side panel. That last point is also a
+ * hard requirement, not just an implementation detail: this plugin's
+ * tool panel and its Settings-side-panel entry (attachSettingsActions())
+ * stay exclusive to the mapview/submit pages and are never touched by
+ * any review-page code in either direction, so whatever else does or
+ * doesn't go wrong with review support, it structurally cannot be what
+ * makes that entry disappear again. See the "Review page support"
+ * section (right after waeStopMapTracking()) for the full implementation
+ * and its own more detailed reasoning.
+ *
  * v1.42.0 CHANGE FROM v1.41.0: crosses/clusters now render at every
  * zoom level, 1 through 21, on every surface -- reported as "no markers
  * show from zoom 1 through 8, they should render up to and including
@@ -1489,6 +1539,23 @@
     return wfmmWindow.WFMM.settings.get(PLUGIN_ID, 'autoCloseOnNavigate', true) !== false;
   }
   const WAE_PULSES = { map: null, surface: null, markersById: new Map(), infoWindow: null };
+
+  // Review page (/new/review) crosses -- deliberately a WHOLE SEPARATE
+  // state object/overlay class/toggle from WAE_PULSES above, not a third
+  // surface folded into it. Two reasons: (1) WFMM.map/WFMM.routes'
+  // onEnterMapRoute/onChangeMapRoute -- everything WAE_PULSES' lifecycle
+  // runs on -- never fire for the review route at all (see ROUTES in the
+  // Map Mods source: the "review" entry is hasMap:false, "WFMM does not
+  // currently interact with the review duplicates map"), so this can't
+  // piggyback on that tracking and needs its own map-discovery entirely;
+  // (2) the requirement this exists to satisfy is that the Settings
+  // side-panel entry and this plugin's own tool panel stay exclusive to
+  // the mapview/submit pages and never appear on review -- easiest to
+  // guarantee by never letting review-page code touch WAE_LAYER_ID,
+  // WFMM.layers, or attachSettingsActions() at all, in either direction.
+  // See the "Review page support" section (right after waeStopMapTracking())
+  // for the map-discovery/toggle/refresh logic itself.
+  const WAE_REVIEW_PULSES = { map: null, host: null, markersById: new Map(), infoWindow: null };
   let waeAllRecords = [];
   let waeRecordsById = new Map();
   let waeNearbyMap = new Map();
@@ -1874,6 +1941,81 @@
     return true;
   }
 
+  // Same shape/draw/click logic as WaePulseOverlayCtor above, just wired
+  // to WAE_REVIEW_PULSES instead of WAE_PULSES -- kept as a genuinely
+  // separate class (not a parameterized shared one) because the two
+  // surfaces' lifecycles never overlap in practice (you're either on the
+  // review page or you're not) and duplicating this one small class is
+  // simpler than threading a "which state object" parameter through
+  // every method for a class this size.
+  let WaeReviewPulseOverlayCtor = null;
+  function waeEnsureReviewPulseOverlayCtor() {
+    if (WaeReviewPulseOverlayCtor) return true;
+    if (typeof google === 'undefined' || !google.maps?.OverlayView) return false;
+    WaeReviewPulseOverlayCtor = class extends google.maps.OverlayView {
+      constructor() {
+        super();
+        this.div = null;
+        this.latLng = null;
+        this.cluster = null;
+        this._html = '';
+        this._title = '';
+        this._clickable = true;
+      }
+      onAdd() {
+        const div = document.createElement('div');
+        div.className = 'wae-pulse-marker';
+        div.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          const c = this.cluster;
+          if (!c) return;
+          if (c.records.length > 1) {
+            WAE_REVIEW_PULSES.map.setCenter(this.latLng);
+            WAE_REVIEW_PULSES.map.setZoom(Math.min((WAE_REVIEW_PULSES.map.getZoom() || 8) + 3, 21));
+          } else {
+            waeShowReviewPulseInfoWindow(c.records[0], this.latLng);
+          }
+        });
+        this.div = div;
+        this.applyToDiv();
+        this.getPanes().overlayLayer.appendChild(div);
+        this.draw();
+      }
+      draw() {
+        if (!this.div || !this.latLng) return;
+        const point = this.getProjection()?.fromLatLngToDivPixel(this.latLng);
+        if (!point) return;
+        this.div.style.left = `${point.x}px`;
+        this.div.style.top = `${point.y}px`;
+      }
+      onRemove() {
+        this.div?.remove();
+        this.div = null;
+      }
+      getPosition() {
+        return this.latLng;
+      }
+      applyToDiv() {
+        if (!this.div) return;
+        this.div.innerHTML = this._html;
+        this.div.title = this._title;
+        this.div.classList.toggle('wae-pulse-clickable', this._clickable);
+      }
+      setCluster(cluster, isExpanded, appearance) {
+        this.cluster = cluster;
+        this.latLng = new google.maps.LatLng(cluster.lat, cluster.lng);
+        const isClusterMarker = cluster.records.length > 1;
+        const shapeSvg = isClusterMarker ? waeGetClusterSvgMarkup(isExpanded) : waeGetMarkerSvgMarkup();
+        this._html = isClusterMarker ? `${shapeSvg}<span class="wae-pulse-count">${cluster.records.length}</span>` : shapeSvg;
+        this._title = isClusterMarker ? `${cluster.records.length} reports` : (cluster.records[0].wayspotName || '(unnamed report)');
+        this._clickable = !!appearance.clickable;
+        this.applyToDiv();
+        this.draw();
+      }
+    };
+    return true;
+  }
+
   const WAE_CLUSTER_PIXEL_RADIUS = 45;
 
   // Groups records into clusters based on screen-pixel distance at the
@@ -2011,6 +2153,32 @@
     }
     WAE_PULSES.markersById.clear();
     if (WAE_PULSES.infoWindow) WAE_PULSES.infoWindow.close();
+  }
+
+  // Review-page counterparts of the two functions just above -- same
+  // body, WAE_REVIEW_PULSES instead of WAE_PULSES. See WAE_REVIEW_PULSES'
+  // own comment for why this stays a parallel copy rather than a shared,
+  // parameterized function.
+  function waeShowReviewPulseInfoWindow(record, latLng) {
+    if (typeof google === 'undefined' || !google.maps?.InfoWindow || !WAE_REVIEW_PULSES.map) return;
+    if (!WAE_REVIEW_PULSES.infoWindow) WAE_REVIEW_PULSES.infoWindow = new google.maps.InfoWindow();
+    const name = escapeHtml(record.wayspotName || '(unnamed report)');
+    const parts = [`<div style="font-size:12px;max-width:260px;"><strong>${name}</strong>`];
+    parts.push(`<div>${latLng.lat().toFixed(6)}, ${latLng.lng().toFixed(6)}</div>`);
+    if (record.comment) parts.push(`<div style="margin-top:4px;color:#6b7280;word-break:break-all;">${escapeHtml(record.comment)}</div>`);
+    if (record.conversationId) parts.push(`<div style="margin-top:4px;color:#9ca3af;">Ticket ${escapeHtml(record.conversationId)}</div>`);
+    parts.push('</div>');
+    WAE_REVIEW_PULSES.infoWindow.setContent(parts.join(''));
+    WAE_REVIEW_PULSES.infoWindow.setPosition(latLng);
+    WAE_REVIEW_PULSES.infoWindow.open(WAE_REVIEW_PULSES.map);
+  }
+
+  function waeClearReviewPulses() {
+    for (const overlay of WAE_REVIEW_PULSES.markersById.values()) {
+      try { overlay.setMap(null); } catch (e) { /* ignore */ }
+    }
+    WAE_REVIEW_PULSES.markersById.clear();
+    if (WAE_REVIEW_PULSES.infoWindow) WAE_REVIEW_PULSES.infoWindow.close();
   }
 
   // BUGFIX (not upstream, feature request): this used to hide crosses
@@ -2164,6 +2332,67 @@
       } catch (e) {
         console.warn('[Wayfarer Map Mods - Abuse Report Extractor] Skipped rendering one cluster:', e);
       }
+    }
+  }
+
+  // Review-page counterpart of waeRefreshPulses() above -- same
+  // filter/cluster/diff logic (waeGetPaddedBounds()/waeWithinPaddedBounds()/
+  // waeComputeClusters()/waeClusterKey() are all already generic, just
+  // take a map + records and hand back plain data, so they're reused
+  // as-is here), just reading/writing WAE_REVIEW_PULSES and gated on the
+  // review toggle (waeReviewPulsesEnabled(), see the "Review page
+  // support" section) instead of isMapPulsesEnabled()/WFMM.layers --
+  // this surface's on/off state is deliberately its own thing, never
+  // wired through WFMM.layers, so it can never touch the Settings
+  // side-panel list the way WAE_LAYER_ID does.
+  function waeRefreshReviewPulses() {
+    const map = WAE_REVIEW_PULSES.map;
+    if (!map) return;
+    if (!waeReviewPulsesEnabled()) {
+      waeClearReviewPulses();
+      return;
+    }
+    if (!waeEnsureReviewPulseOverlayCtor()) return;
+
+    const paddedBounds = waeGetPaddedBounds(map);
+    const wanted = waeAllRecords.filter((r) => Number.isFinite(r.latitude) && Number.isFinite(r.longitude) && waeWithinPaddedBounds(r, paddedBounds));
+    const clusters = waeComputeClusters(map, wanted);
+    const wantedKeys = new Set(clusters.map(waeClusterKey));
+    const appearance = waeLoadAppearance();
+    const isLowestZoom = Math.floor(map.getZoom() ?? WAE_MIN_SHOW_ZOOM) <= WAE_MIN_SHOW_ZOOM;
+
+    for (const [key, overlay] of WAE_REVIEW_PULSES.markersById.entries()) {
+      if (!wantedKeys.has(key)) {
+        try { overlay.setMap(null); } catch (e) { /* ignore */ }
+        WAE_REVIEW_PULSES.markersById.delete(key);
+      }
+    }
+
+    for (const cluster of clusters) {
+      if (!Number.isFinite(cluster.lat) || !Number.isFinite(cluster.lng)) continue;
+      try {
+        const key = waeClusterKey(cluster);
+        let overlay = WAE_REVIEW_PULSES.markersById.get(key);
+        if (!overlay) {
+          overlay = new WaeReviewPulseOverlayCtor();
+          WAE_REVIEW_PULSES.markersById.set(key, overlay);
+        }
+        overlay.setCluster(cluster, isLowestZoom, appearance);
+        overlay.setMap(map);
+      } catch (e) {
+        console.warn('[Wayfarer Map Mods - Abuse Report Extractor] Skipped rendering one review cluster:', e);
+      }
+    }
+  }
+
+  function waeSafeRefreshReviewPulses() {
+    try {
+      waeRefreshReviewPulses();
+    } catch (e) {
+      console.warn('[Wayfarer Map Mods - Abuse Report Extractor] Review pulse refresh failed, retrying shortly:', e);
+      setTimeout(() => {
+        try { waeRefreshReviewPulses(); } catch (e2) { /* give up quietly -- next idle/search will try again */ }
+      }, WAE_ZOOM_DEBOUNCE_MS);
     }
   }
 
@@ -2387,6 +2616,327 @@
     waeRouteChangeUnsub = null;
     waeMapNotFoundUnsub = null;
     waeMapRetriesLeft = 0;
+  }
+
+  // ---------------------------------------------------------------------
+  // Review page (/new/review) support.
+  //
+  // Deliberately independent of everything above: WFMM.map/WAE_LAYER_ID/
+  // WFMM.layers/attachSettingsActions() are never touched by anything in
+  // this section, and nothing above ever touches WAE_REVIEW_PULSES or
+  // WAE_REVIEW_TOGGLE_KEY either. That separation is the point, not an
+  // accident -- an earlier attempt at review-page support (reverted in
+  // v1.40.0, see that changelog entry) tangled review handling into the
+  // same map/route tracking this plugin already used for mapview/submit,
+  // and the "Abuse Report Extractor" entry disappearing from the Settings
+  // side-panel list on every page load was never actually root-caused
+  // before the whole feature was pulled. Keeping this surface's own
+  // on/off state, map lookup, and UI entirely apart from that machinery
+  // means review-page code literally cannot be what breaks the Settings
+  // link this time, whatever else does or doesn't go wrong here -- and
+  // it directly satisfies the actual requirement besides: this plugin's
+  // tool panel and its Settings side-panel entry stay exclusive to the
+  // mapview/submit pages, never on review, so review support gets its
+  // OWN small toggle instead, rendered directly above the review page's
+  // own map.
+  //
+  // Map discovery: WFMM.map / WFMM.routes.onEnterMapRoute() never fire
+  // for review at all (Map Mods' own ROUTES table marks "review" as
+  // hasMap:false -- "WFMM does not currently interact with the review
+  // duplicates map"), so there's no suite-provided map to ask for here.
+  // Map Mods' OWN bundled review-map-enhancements plugin has to solve the
+  // exact same problem internally (see createReviewMapController() in its
+  // source) by querying the <nia-map> custom element Angular renders for
+  // whichever review card is showing a map, then walking its
+  // __ngContext__ (Angular's internal component-instance tree) looking
+  // for something that looks like a real google.maps.Map -- but it only
+  // exposes getSettings()/renderSettingsSection() on WFMM.reviewMapEnhancements,
+  // not the map instance itself, so external plugins can't reuse it
+  // directly. waeFindReviewMapOnce() below is this plugin's own from-
+  // scratch version of that same technique (the file used to have a
+  // comparable hand-rolled __ngContext__ reflection for mapview/submit
+  // too, before WFMM.map replaced it in v1.26.0 -- see that changelog
+  // entry) -- deliberately NOT narrowed to one specific review mode
+  // (duplicates-check vs edit-location vs edit-info vs photo): it just
+  // checks every <nia-map> currently in the DOM and uses whichever one
+  // actually yields a map object, which is simpler and more robust to
+  // Wayfarer's own markup changing than mirroring Map Mods' own mode
+  // branching would be, at the cost of harmlessly checking one or two
+  // extra elements when only one is really present.
+  const WAE_REVIEW_TOGGLE_KEY = 'wae_review_pulses_visible';
+  const WAE_REVIEW_TOGGLE_ID = 'wae-review-toggle-bar';
+  // Defaults ON (unlike WAE_LAYER_ID's mapview/submit crosses, which
+  // default off via the native Layers menu) -- this is the one thing the
+  // whole feature exists to show, and it's opt-OUT via the toggle bar
+  // right above the map rather than opt-in via a menu the reviewer would
+  // have to already know to look for.
+  function waeReviewPulsesEnabled() {
+    return localStorage.getItem(WAE_REVIEW_TOGGLE_KEY) !== 'false';
+  }
+  function waeSetReviewPulsesEnabled(enabled) {
+    localStorage.setItem(WAE_REVIEW_TOGGLE_KEY, enabled ? 'true' : 'false');
+  }
+
+  function waeReviewLooksLikeGoogleMap(value) {
+    return !!value && typeof value === 'object'
+      && typeof value.getDiv === 'function'
+      && typeof value.getZoom === 'function'
+      && typeof value.setCenter === 'function'
+      && typeof value.getProjection === 'function'
+      && typeof value.addListener === 'function';
+  }
+
+  // Bounded breadth-first walk of an Angular __ngContext__ array/object
+  // tree looking for a value waeReviewLooksLikeGoogleMap() accepts.
+  // maxDepth/maxItems keep this from ever doing unbounded work against
+  // whatever unrelated component state happens to be reachable from the
+  // same context -- matches the caution Map Mods' own equivalent
+  // (findObjectDeep(), maxDepth 9 / maxItems 5000) takes for the same
+  // reason. Explicitly refuses to descend into DOM nodes/Window (both
+  // reachable from a component context, both huge and cyclic) since
+  // neither can ever itself be the map object we're looking for.
+  function waeReviewFindObjectDeep(root, predicate, { maxDepth = 9, maxItems = 5000 } = {}) {
+    if (!root || typeof root !== 'object') return null;
+    const seen = new Set();
+    const queue = [[root, 0]];
+    let visited = 0;
+    while (queue.length) {
+      const [node, depth] = queue.shift();
+      if (!node || typeof node !== 'object' || seen.has(node)) continue;
+      seen.add(node);
+      visited += 1;
+      if (visited > maxItems) return null;
+      try {
+        if (predicate(node)) return node;
+      } catch (e) { /* a weird getter threw -- skip this node, keep walking */ }
+      if (depth >= maxDepth) continue;
+      if ((typeof Node !== 'undefined' && node instanceof Node) || (typeof Window !== 'undefined' && node instanceof Window)) continue;
+      let keys;
+      try { keys = Object.keys(node); } catch (e) { continue; }
+      for (const key of keys) {
+        let val;
+        try { val = node[key]; } catch (e) { continue; } // some Angular/Maps getters throw outside their normal call context
+        if (val && typeof val === 'object') queue.push([val, depth + 1]);
+      }
+    }
+    return null;
+  }
+
+  function waeFindReviewMapHosts() {
+    return Array.from(document.querySelectorAll('nia-map'));
+  }
+
+  function waeFindReviewMapOnce() {
+    for (const host of waeFindReviewMapHosts()) {
+      const ctx = host.__ngContext__;
+      if (!ctx) continue;
+      const map = waeReviewFindObjectDeep(ctx, waeReviewLooksLikeGoogleMap, { maxDepth: 9, maxItems: 5000 });
+      if (map) return { map, host };
+    }
+    return null;
+  }
+
+  // Polling search, same shape as Map Mods' own review-map-enhancements
+  // scheduleFind()/tryFind() (80 attempts * 250ms = 20s ceiling) --
+  // Angular doesn't emit anything this plugin can listen for the moment
+  // its map component finishes constructing, so a short poll after
+  // entering/changing within the review route is the same approach the
+  // suite's own equivalent feature already relies on.
+  const WAE_REVIEW_MAP_SEARCH_INTERVAL_MS = 250;
+  const WAE_REVIEW_MAP_SEARCH_MAX_ATTEMPTS = 80;
+  let waeReviewMapSearchTimer = null;
+  let waeReviewMapSearchAttempts = 0;
+  // /new/review is a single route across every ticket a reviewer works
+  // through, the same "one route, map swapped out underneath it"
+  // situation v1.29.3 already had to add a periodic safety-net refresh
+  // for on the submit-Wayspot page (see WAE_MAP_PERIODIC_RECHECK_MS
+  // above) -- nothing here would otherwise notice the review map going
+  // stale between one ticket and the next, since that's not a route
+  // change and there's no WFMM.map staleness check backing this surface.
+  // A cheap "is the attached map's own div still in the document"
+  // check, polled the same way, covers it the same way.
+  const WAE_REVIEW_PERIODIC_RECHECK_MS = 3000;
+  let waeReviewPeriodicRecheckTimer = null;
+
+  function waeReviewIsOnRoute() {
+    return wfmmWindow.WFMM.routes.is('review');
+  }
+
+  function waeStopReviewMapSearch() {
+    if (waeReviewMapSearchTimer) { clearTimeout(waeReviewMapSearchTimer); waeReviewMapSearchTimer = null; }
+  }
+
+  function waeScheduleReviewMapSearch() {
+    if (waeReviewMapSearchTimer || WAE_REVIEW_PULSES.map) return;
+    const tick = () => {
+      waeReviewMapSearchTimer = null;
+      if (!waeReviewIsOnRoute()) return; // left the review page before this fired
+      const found = waeFindReviewMapOnce();
+      if (found) {
+        waeReviewMapSearchAttempts = 0;
+        waeSetReviewMap(found.map, found.host);
+        return;
+      }
+      waeReviewMapSearchAttempts += 1;
+      if (waeReviewMapSearchAttempts < WAE_REVIEW_MAP_SEARCH_MAX_ATTEMPTS) {
+        waeReviewMapSearchTimer = setTimeout(tick, WAE_REVIEW_MAP_SEARCH_INTERVAL_MS);
+      }
+    };
+    waeReviewMapSearchTimer = setTimeout(tick, WAE_REVIEW_MAP_SEARCH_INTERVAL_MS);
+  }
+
+  function waeReviewMapStillValid() {
+    const map = WAE_REVIEW_PULSES.map;
+    if (!map) return false;
+    try {
+      const div = map.getDiv?.();
+      return !!(div && div.isConnected);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // Called from the panel's own scan/import/clear handlers (see
+  // waeResyncMapIfVisible()'s call sites) alongside that function -- the
+  // panel itself only ever shows on mapview/submit, but waeAllRecords is
+  // a shared module-level cache, so a scan done there should be
+  // reflected on the review map too if it's the one currently attached,
+  // not just on the next incidental idle/pan. A no-op whenever no review
+  // map is attached.
+  function waeResyncReviewIfVisible() {
+    if (WAE_REVIEW_PULSES.map) waeSafeRefreshReviewPulses();
+  }
+
+  // Doesn't reset waeReviewMapSearchAttempts here -- only
+  // waeReviewOnRouteEnter does that, for a genuine fresh 20s burst on
+  // actually entering the route. Leaving the counter alone means once a
+  // burst exhausts itself (a review card with no map at all, e.g. a
+  // report with no location), each subsequent periodic tick here does
+  // exactly one more retry (waeScheduleReviewMapSearch() no-ops while a
+  // search is already in flight, and a single retry from an exhausted
+  // counter doesn't re-arm a whole new 80-attempt burst) rather than
+  // resetting the counter and re-triggering a fresh 20-second busy-poll
+  // burst every single 3-second tick forever.
+  function waeReviewPeriodicRecheck() {
+    if (!waeReviewIsOnRoute()) return;
+    if (!waeReviewMapStillValid()) {
+      waeSetReviewMap(null, null);
+      waeScheduleReviewMapSearch();
+    }
+  }
+
+  let waeReviewMapIdleListener = null;
+  let waeReviewIdleDebounceTimer = null;
+
+  function waeSetReviewMap(map, host) {
+    if (WAE_REVIEW_PULSES.map === map) {
+      if (map && host) waeInjectReviewToggle(host); // same map, host element got re-rendered -- keep the toggle bar anchored to it
+      return;
+    }
+    waeClearReviewPulses();
+    if (waeReviewMapIdleListener) {
+      try { google.maps.event.removeListener(waeReviewMapIdleListener); } catch (e) { /* ignore */ }
+      waeReviewMapIdleListener = null;
+    }
+    clearTimeout(waeReviewIdleDebounceTimer);
+    WAE_REVIEW_PULSES.map = map;
+    WAE_REVIEW_PULSES.host = host || null;
+    if (map) {
+      waeReviewMapIdleListener = map.addListener?.('idle', () => {
+        clearTimeout(waeReviewIdleDebounceTimer);
+        waeReviewIdleDebounceTimer = setTimeout(waeSafeRefreshReviewPulses, WAE_ZOOM_DEBOUNCE_MS);
+      });
+      waeInjectReviewToggle(host);
+      waeSafeRefreshReviewPulses();
+    } else {
+      waeRemoveReviewToggle();
+    }
+  }
+
+  // Toggle bar injected directly above whichever <nia-map> element the
+  // currently-attached review map came from (host.parentElement.insertBefore),
+  // rather than into Map Mods' own Settings side panel -- see this
+  // section's own top comment for why the side panel specifically stays
+  // off-limits here. Self-contained, opaque background (not inherited/
+  // transparent) so it reads clearly against both Wayfarer's light and
+  // dark page themes rather than depending on knowing which CSS class or
+  // media feature the site itself uses for dark mode -- see the STYLE
+  // block's own ".wae-review-toggle-bar" rules for the light/dark pair.
+  function waeInjectReviewToggle(host) {
+    if (!host || !host.parentElement) return;
+    let bar = document.getElementById(WAE_REVIEW_TOGGLE_ID);
+    if (!bar) {
+      bar = document.createElement('div');
+      bar.id = WAE_REVIEW_TOGGLE_ID;
+      bar.className = 'wae-review-toggle-bar';
+      const label = document.createElement('span');
+      label.className = 'wae-review-toggle-label';
+      label.textContent = 'Abuse report markers';
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'wae-review-toggle-btn';
+      btn.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        waeSetReviewPulsesEnabled(!waeReviewPulsesEnabled());
+        waeUpdateReviewToggleUi();
+        waeSafeRefreshReviewPulses();
+      });
+      bar.appendChild(label);
+      bar.appendChild(btn);
+    }
+    if (bar.parentElement !== host.parentElement || bar.nextSibling !== host) {
+      host.parentElement.insertBefore(bar, host);
+    }
+    waeUpdateReviewToggleUi();
+  }
+
+  function waeRemoveReviewToggle() {
+    document.getElementById(WAE_REVIEW_TOGGLE_ID)?.remove();
+  }
+
+  function waeUpdateReviewToggleUi() {
+    const bar = document.getElementById(WAE_REVIEW_TOGGLE_ID);
+    if (!bar) return;
+    const btn = bar.querySelector('.wae-review-toggle-btn');
+    if (!btn) return;
+    const on = waeReviewPulsesEnabled();
+    btn.textContent = on ? 'On' : 'Off';
+    btn.classList.toggle('wae-review-toggle-on', on);
+    btn.setAttribute('aria-pressed', String(on));
+  }
+
+  let waeReviewRouteEnterUnsub = null;
+  let waeReviewRouteLeaveUnsub = null;
+
+  function waeReviewOnRouteEnter() {
+    waeReviewMapSearchAttempts = 0;
+    waeScheduleReviewMapSearch();
+    if (!waeReviewPeriodicRecheckTimer) {
+      waeReviewPeriodicRecheckTimer = setInterval(waeReviewPeriodicRecheck, WAE_REVIEW_PERIODIC_RECHECK_MS);
+    }
+  }
+
+  function waeReviewOnRouteLeave() {
+    waeStopReviewMapSearch();
+    if (waeReviewPeriodicRecheckTimer) { clearInterval(waeReviewPeriodicRecheckTimer); waeReviewPeriodicRecheckTimer = null; }
+    waeSetReviewMap(null, null);
+  }
+
+  function waeStartReviewTracking() {
+    if (waeReviewRouteEnterUnsub) return; // already subscribed
+    const WFMM = wfmmWindow.WFMM;
+    waeReviewRouteEnterUnsub = WFMM.routes.onEnter('review', waeReviewOnRouteEnter);
+    waeReviewRouteLeaveUnsub = WFMM.routes.onLeave('review', waeReviewOnRouteLeave);
+    if (waeReviewIsOnRoute()) waeReviewOnRouteEnter(); // this version can load while already sitting on /new/review
+  }
+
+  function waeStopReviewTracking() {
+    waeReviewRouteEnterUnsub?.();
+    waeReviewRouteLeaveUnsub?.();
+    waeReviewRouteEnterUnsub = null;
+    waeReviewRouteLeaveUnsub = null;
+    waeReviewOnRouteLeave();
   }
 
   // ---------------------------------------------------------------------
@@ -3031,6 +3581,49 @@
       white-space:normal;
     }
     .wae-nearby-item:hover{ background:#fffbeb; }
+
+    /* Review page (/new/review) toggle bar -- see waeInjectReviewToggle()'s
+       own comment. Color-flipped by Wayfarer's own ".dark" ancestor class
+       (confirmed against Map Mods' own source -- e.g. its
+       ".dark .wfmm-contribution-tags-section" rules etc. -- every one of
+       Base's own dark-mode-aware styles keys off that same class on a
+       page-level ancestor, not the OS-level prefers-color-scheme media
+       feature) -- BUGFIX: this used to key off prefers-color-scheme
+       instead, which reads the OS/browser's own light/dark setting, NOT
+       Wayfarer's own in-app dark mode toggle -- the two can (and did, in
+       the field) disagree, leaving black-on-dark, unreadable text
+       whenever the browser was in light mode but the reviewer had
+       Wayfarer's own dark mode on. Since this bar is inserted as a
+       descendant of the review page's own DOM (right before whichever
+       <nia-map> it's anchored to), plain descendant selectors here work
+       the same way Base's own ".dark ..." rules do -- no separate
+       detection needed. The prefers-color-scheme block stays too, purely
+       as a fallback for the (currently unobserved) case of no ".dark"
+       ancestor at all; ".dark" always wins when both could apply, since
+       its selector is more specific either way. */
+    .wae-review-toggle-bar{
+      display:flex; align-items:center; justify-content:space-between; gap:10px;
+      margin:0 0 6px; padding:2px 2px;
+      color:#111827;
+      font-family:Roboto, Arial, sans-serif; font-size:12px; font-weight:600;
+    }
+    .wae-review-toggle-label{ white-space:nowrap; }
+    .wae-review-toggle-btn{
+      min-width:44px; padding:3px 10px; border-radius:9999px; cursor:pointer;
+      font-size:11px; font-weight:700; line-height:1.4;
+      background:transparent; color:#111827; border:1px solid currentColor;
+    }
+    .wae-review-toggle-btn.wae-review-toggle-on{
+      background:#16a34a; color:#ffffff; border-color:#15803d;
+    }
+    @media (prefers-color-scheme: dark){
+      .wae-review-toggle-bar{ color:#f9fafb; }
+      .wae-review-toggle-btn{ color:#f9fafb; }
+      .wae-review-toggle-btn.wae-review-toggle-on{ background:#22c55e; color:#052e16; border-color:#16a34a; }
+    }
+    .dark .wae-review-toggle-bar{ color:#f9fafb; }
+    .dark .wae-review-toggle-btn{ color:#f9fafb; }
+    .dark .wae-review-toggle-btn.wae-review-toggle-on{ background:#22c55e; color:#052e16; border-color:#16a34a; }
   `;
 
   function log(container, msg, cls) {
@@ -3738,6 +4331,7 @@
         waeCurrentPage = 1;
         refreshPanel();
         waeResyncMapIfVisible();
+        waeResyncReviewIfVisible();
       }
     });
 
@@ -3765,6 +4359,7 @@
         waeCurrentPage = 1;
         refreshPanel();
         waeResyncMapIfVisible();
+        waeResyncReviewIfVisible();
       }
     });
 
@@ -3813,6 +4408,7 @@
         waeCurrentPage = 1;
         refreshPanel();
         waeResyncMapIfVisible();
+        waeResyncReviewIfVisible();
       }
     });
 
@@ -4028,6 +4624,11 @@
     waeStartMapTracking();
     waeStartSidePanelDetailsWatcher();
     waeResyncMapIfVisible();
+    // Review-page (/new/review) crosses -- see that section's own top
+    // comment (right after waeStopMapTracking()) for why this is a
+    // wholly separate subscription from waeStartMapTracking() above,
+    // deliberately never touching WFMM.layers/attachSettingsActions().
+    waeStartReviewTracking();
   }
 
   function stopPlugin() {
@@ -4042,6 +4643,7 @@
     waeStopMapTracking();
     waeStopSidePanelDetailsWatcher();
     waeClearPulses();
+    waeStopReviewTracking();
     waeUnregisterAppearance?.();
     waeUnregisterAppearance = null;
     wfmmWindow.WFMM.layers.unregister(WAE_LAYER_ID);
