@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Report Extractor
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.43.2
+// @version      1.44.0
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -15,6 +15,24 @@
 // ==/UserScript==
 
 /*
+ * v1.44.0 CHANGE FROM v1.43.2: the companion Abuse Email Importer script
+ * is now reached from a small envelope icon right here in this panel's
+ * own header row, next to the existing Marker Style cog, instead of
+ * having its own separate entry in Base's native Settings side-panel
+ * list. Clicking it calls window.WayfarerAbuseEmailImporter.togglePanel()
+ * (that script's own v4.10.0 exposes openPanel()/closePanel()/
+ * togglePanel()/isPanelOpen() for exactly this) to open ITS panel --
+ * still a fully separate script under the hood (it needs
+ * GM_xmlhttpRequest for Gmail OAuth, a sandbox-only API this script's
+ * own @inject-into page can't use, so the two can't actually be merged
+ * into one file), just with one shared entry point now instead of two
+ * separate ones a reviewer would have to know to look for individually.
+ * If the importer script isn't installed/enabled, the icon logs a plain
+ * message saying so instead of silently doing nothing. See
+ * buildPanelContent()'s own comment on emailImporterBtn for the full
+ * reasoning, and the importer script's own v4.10.0 changelog entry for
+ * its side of this change.
+ *
  * v1.43.2 CHANGE FROM v1.43.1: fixes the review-page toggle bar being
  * unreadable (dark text on a dark background) with Wayfarer's own dark
  * mode on -- v1.43.1's color-flip keyed off prefers-color-scheme, the
@@ -3462,12 +3480,15 @@
     #wae-panel .wfmapmods-modal-dialog{ width:600px; max-width:calc(100vw - 24px); }
     .wae-sub{ font-size:11px; color:var(--wfmm-muted-text, #667085); margin-bottom:8px; }
     /* Holds the panel's summary line (countEl, "N reports across M tickets"
-       or similar) and the cog button that opens Marker Style settings --
-       see buildPanelContent()'s own comment on markerStyleBtn for why
-       that button lives here (tucked next to this line) rather than as
-       a labeled button of its own. */
+       or similar) on the left, and -- grouped together on the right, via
+       .wae-panel-header-actions -- the small envelope + cog icon buttons
+       that open the Email Importer panel and Marker Style settings. See
+       buildPanelContent()'s own comments on emailImporterBtn/
+       markerStyleBtn for why both live here (tucked next to this line)
+       rather than as labeled buttons of their own. */
     .wae-panel-header-row{ display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:8px; }
     .wae-panel-header-row .wae-sub{ margin-bottom:0; }
+    .wae-panel-header-actions{ display:flex; align-items:center; gap:4px; flex-shrink:0; }
     .wae-csv-hint{ white-space:pre-line; font-family:ui-monospace, monospace; }
     /* BUGFIX (not upstream): the crosses/clusters this plugin draws on the
        map used to be google.maps.Marker instances with a data: URI SVG
@@ -4257,8 +4278,45 @@
       title: 'Marker Style Settings',
       onClick: () => waeOpenMarkerSettingsModal(),
     });
+
+    // ---- Email Importer ----
+    // Same treatment as markerStyleBtn just above, for the same reason:
+    // the companion Abuse Email Importer script (a separate userscript --
+    // it needs GM_xmlhttpRequest for Gmail OAuth, a sandbox-only API, so
+    // it can't run @inject-into page the way this script does, and so
+    // can't just be merged into this file outright) used to add its own
+    // separate "Import Abuse Report Emails" entry to Base's Settings
+    // side-panel list -- removed as of its own v4.10.0, in favor of this
+    // one small envelope icon here instead, so there's exactly one entry
+    // in that list ("Abuse Report Extractor") rather than two separate
+    // ones a reviewer would have to know to look for individually.
+    // Both scripts run in the same page-context window (this script via
+    // @inject-into page; the importer's own wfmmWindow resolves to
+    // unsafeWindow, which IS that same window -- see its own comment on
+    // that declaration), so window.WayfarerAbuseEmailImporter is a plain,
+    // synchronously-available object here, not something that needs
+    // fetching or waiting on -- checked fresh on every click (not just
+    // once at panel-build time) since the two scripts' own startup timing
+    // relative to each other isn't guaranteed, and the importer script
+    // being missing/not-yet-loaded is a perfectly normal state (it's an
+    // optional companion script, not a dependency) rather than an error.
+    const emailImporterBtn = ui.iconButton({
+      iconSvg: '<svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"></path><polyline points="22 6 12 13 2 6"></polyline></svg>',
+      title: 'Import Abuse Report Emails',
+      onClick: () => {
+        const wei = window.WayfarerAbuseEmailImporter;
+        if (wei && typeof wei.togglePanel === 'function') {
+          wei.togglePanel();
+        } else {
+          log(logEl, '\u2717 Abuse Email Importer script not detected -- install/enable it to import from Gmail or .eml files.', 'err');
+        }
+      },
+    });
+
     const panelHeaderRow = ui.createElement('div', { className: 'wae-panel-header-row' });
-    panelHeaderRow.append(countEl, markerStyleBtn);
+    const panelHeaderActions = ui.createElement('div', { className: 'wae-panel-header-actions' });
+    panelHeaderActions.append(emailImporterBtn, markerStyleBtn);
+    panelHeaderRow.append(countEl, panelHeaderActions);
 
     modal.body.append(panelHeaderRow, buttonRowEl, csvHint, csvFileInput, progressEl, searchInput, autoCloseToggle.row, tableContainer, logEl);
 

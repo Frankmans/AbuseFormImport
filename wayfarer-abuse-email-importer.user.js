@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Email Importer
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      4.9.1
+// @version      4.10.1
 // @description  Imports Niantic Support "Reporting Abuse in Wayfarer" tickets from Gmail via OAuth, or from .eml files -- using a port of bilde2910/OPR-Tools' email parser -- and stores them for the Abuse Report Extractor script (and other consumers) to search.
 // @author       Frankmans
 // @grant        GM_xmlhttpRequest
@@ -26,6 +26,40 @@
 // exception, not an oversight.
 
 /*
+ * v4.10.1 CHANGE FROM v4.10.0: fixes window.WayfarerAbuseEmailImporter
+ * being invisible to the real page (and so to the Abuse Report
+ * Extractor's own envelope-icon integration, added in its v1.44.0 --
+ * reported in the field as "Abuse Email Importer script not detected"
+ * even with this script loaded and running with no errors) -- the
+ * assignment used bare `window.WayfarerAbuseEmailImporter = ...`, but
+ * this whole script is sandboxed (@grant GM_xmlhttpRequest/unsafeWindow),
+ * so its own `window` is a separate sandbox object, not the real page
+ * window -- the exact distinction wfmmWindow's own comment (right after
+ * `(function () {` near the top of this file) already exists to explain
+ * for WFMM.* calls, just not applied to this particular assignment. Now
+ * publishes on wfmmWindow instead, same as everything else in this file.
+ * getAbuseReportRecords/publishPoiToMap/isMapModsBaseActive were exposed
+ * the same broken way before this fix too -- just never actually
+ * consumed by anything outside this script until now, so nothing had
+ * surfaced it. See wfmmWindow.WayfarerAbuseEmailImporter's own comment
+ * (right above the assignment) for the fuller explanation.
+ *
+ * v4.10.0 CHANGE FROM v4.9.1: no more separate "Import Abuse Report
+ * Emails" entry in Base's Settings side-panel list -- removed outright
+ * (attachSettingsAction()/detachSettingsAction() and their onReady()/
+ * onCleared() subscriptions in startPlugin()/stopPlugin() are gone).
+ * window.WayfarerAbuseEmailImporter now also exposes openPanel()/
+ * closePanel()/togglePanel()/isPanelOpen(), and the companion Abuse
+ * Report Extractor script (its own v1.44.0) calls togglePanel() directly
+ * from a small envelope icon next to its own Marker Style cog, inside
+ * its own panel -- so there's exactly one entry in the native Settings
+ * list ("Abuse Report Extractor") instead of two separate ones. This
+ * script's actual functionality (Gmail OAuth/sync, .eml import, auto-
+ * sync, backup/restore, the panel itself) is completely unchanged --
+ * this is purely about how the panel gets opened, not what's in it.
+ * See the comment right above registerWithMapModsBase() for the full
+ * reasoning.
+ *
  * v4.9.1 CHANGE FROM v4.9.0: better-integration pass, part 2 --
  * auto-sync's enabled/interval now live in WFMM.settings (registered
  * under this plugin's own id in startPlugin(), see WEI_SETTINGS_DEFAULTS)
@@ -1395,10 +1429,37 @@
     return out;
   }
 
-  window.WayfarerAbuseEmailImporter = {
+  // BUGFIX (v4.10.1, not caught in the v4.10.0 pass that added
+  // openPanel/closePanel/togglePanel/isPanelOpen to this object): this
+  // used bare `window.WayfarerAbuseEmailImporter = ...` here, but this
+  // whole script is sandboxed (@grant GM_xmlhttpRequest/unsafeWindow --
+  // see wfmmWindow's own comment near the top of this file), so its own
+  // `window` is NOT the real page window, the same distinction that
+  // comment already exists to explain for reading wfmmWindow.WFMM. The
+  // assignment was landing on this script's own sandbox object the whole
+  // time -- invisible to the real page, and so invisible to the
+  // Abuse Report Extractor's own page-context @inject-into page code
+  // (confirmed in the field: its panel showed "Abuse Email Importer
+  // script not detected" even with this script loaded and running with
+  // no errors of its own). getAbuseReportRecords/publishPoiToMap/
+  // isMapModsBaseActive were exposed the same broken way before this
+  // version too -- just never actually consumed by anything external
+  // until the extractor's own v1.44.0 tried to call in, which is what
+  // surfaced it. Fixed by publishing on wfmmWindow instead, the same
+  // object every WFMM.* call in this file already goes through.
+  wfmmWindow.WayfarerAbuseEmailImporter = {
     getAbuseReportRecords,
     publishPoiToMap,
     isMapModsBaseActive,
+    // Added so the Abuse Report Extractor's own panel can open this
+    // script's panel directly -- see the removed attachSettingsAction()/
+    // detachSettingsAction() section below (right after
+    // registerWithMapModsBase()) for why that's now the only entry point
+    // into this UI.
+    openPanel,
+    closePanel,
+    togglePanel,
+    isPanelOpen: () => !!weiPanelController,
   };
 
   function registerWithMapModsBase() {
@@ -1420,46 +1481,25 @@
   }
 
   // ---------------------------------------------------------------------
-  // BUGFIX (not upstream, better-integration pass) + refactor: this used
-  // to hand-roll its own side-panel integration -- appendChild a plain
-  // <a> into ".wfmapmods-settings-links" the first time it exists, found
-  // via a whole-document MutationObserver (childList+subtree, debounced
-  // 50ms) -- exact same pattern as the Abuse Report Extractor script had
-  // until its own v1.35.0, including the same real bug: an observer
-  // that, in an earlier version, disconnected itself after first success
-  // had no way to notice the link is gone and never re-add it if Base's
-  // side panel gets torn down and rebuilt by Angular's router (fixed
-  // here in v4.7.6 by just leaving the observer running indefinitely,
-  // which worked but never adopted the real API underneath). Replaced
-  // now with what WFMM.sidePanel actually offers for exactly this:
-  // appendSettingsAction(element, options) drops an element into the
-  // real settings-actions slot and hands back an unsubscribe function,
-  // while WFMM.sidePanel.onReady()/onCleared() fire every time that slot
-  // is actually rebuilt -- the real, public replacement for the
-  // MutationObserver above, and the same one the extractor script now
-  // uses for this same link.
+  // BUGFIX (not upstream, feature request): this used to have its own
+  // separate "Import Abuse Report Emails" entry in Base's Settings side-
+  // panel list (appendSettingsAction(), replacing an even older hand-
+  // rolled MutationObserver version -- see the v4.9.0 changelog note at
+  // the top for that whole history). Removed outright, not just hidden:
+  // the companion Abuse Report Extractor script now has its own small
+  // envelope icon, next to its Marker Style cog, in its own panel's
+  // header row -- calling window.WayfarerAbuseEmailImporter.togglePanel()
+  // (exposed above) directly -- so there is exactly one entry in the
+  // native Settings list ("Abuse Report Extractor") rather than two
+  // separate ones a reviewer would have to already know to look for
+  // individually. Same reasoning the extractor's own v1.x applied when
+  // its Marker Style settings dropped their own separate Settings entry
+  // in favor of a cog button inside its panel (see that script's
+  // buildPanelContent(), the comment on its own markerStyleBtn).
+  // openPanel()/closePanel()/togglePanel() themselves are unchanged --
+  // still this script's own real panel, just no longer self-adding a
+  // second link to reach it from.
   // ---------------------------------------------------------------------
-
-  let weiSettingsActionCleanup = null;
-  let weiSidePanelReadyUnsub = null;
-  let weiSidePanelClearedUnsub = null;
-
-  function attachSettingsAction() {
-    weiSettingsActionCleanup?.();
-    const link = document.createElement('a');
-    link.textContent = 'Import Abuse Report Emails';
-    link.style.cursor = 'pointer';
-    link.addEventListener('click', (ev) => {
-      ev.preventDefault();
-      togglePanel();
-    });
-    weiSettingsActionCleanup = wfmmWindow.WFMM.sidePanel.appendSettingsAction(link);
-  }
-
-  function detachSettingsAction() {
-    weiSettingsActionCleanup?.();
-    weiSettingsActionCleanup = null;
-  }
 
   // One-time migration from the old raw-localStorage keys (removed from
   // this file as of v4.9.1, see WEI_SETTINGS_DEFAULTS' own comment) into
@@ -1497,14 +1537,9 @@
     // there first.
     weiMigrateLegacySettingsIfNeeded();
     wfmmWindow.WFMM.settings.registerPlugin(PLUGIN_ID, WEI_SETTINGS_DEFAULTS);
-    // attachSettingsAction() once immediately -- covers the side panel
-    // already being up right now -- then subscribed to onReady()/
-    // onCleared() for later side-panel rebuilds (Angular router
-    // navigation). See attachSettingsAction()'s own comment above for why
-    // this replaced the old MutationObserver.
-    attachSettingsAction();
-    weiSidePanelReadyUnsub = wfmmWindow.WFMM.sidePanel.onReady(attachSettingsAction);
-    weiSidePanelClearedUnsub = wfmmWindow.WFMM.sidePanel.onCleared(detachSettingsAction);
+    // No more attachSettingsAction()/onReady()/onCleared() here -- see
+    // the comment right above registerWithMapModsBase() for why this no
+    // longer adds its own Settings side-panel entry at all.
     // Auto-sync used to only start the first time buildPanel() ever ran
     // (which happened here too, since startPlugin() called it eagerly).
     // Now that the panel's DOM is only built on open, this has moved out
@@ -1515,11 +1550,6 @@
   }
 
   function stopPlugin() {
-    weiSidePanelReadyUnsub?.();
-    weiSidePanelReadyUnsub = null;
-    weiSidePanelClearedUnsub?.();
-    weiSidePanelClearedUnsub = null;
-    detachSettingsAction();
     closePanel(); // no-op if the panel isn't open; openModal's own close() tears its DOM down
     stopAutoSync();
   }
