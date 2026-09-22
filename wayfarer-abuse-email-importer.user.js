@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Email Importer
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      4.10.1
+// @version      4.10.2
 // @description  Imports Niantic Support "Reporting Abuse in Wayfarer" tickets from Gmail via OAuth, or from .eml files -- using a port of bilde2910/OPR-Tools' email parser -- and stores them for the Abuse Report Extractor script (and other consumers) to search.
 // @author       Frankmans
 // @grant        GM_xmlhttpRequest
@@ -26,6 +26,12 @@
 // exception, not an oversight.
 
 /*
+ * v4.10.2 CHANGE FROM v4.10.1: one wording update to match the companion
+ * script's own rename (its v1.45.0): "Open the Abuse Report Extractor to
+ * scan them." -> "Open Abuse Reports to scan them." in the .eml-import
+ * count line. Purely cosmetic, nothing functional -- this script's own
+ * name, PLUGIN_ID, and everything else are unchanged.
+ *
  * v4.10.1 CHANGE FROM v4.10.0: fixes window.WayfarerAbuseEmailImporter
  * being invisible to the real page (and so to the Abuse Report
  * Extractor's own envelope-icon integration, added in its v1.44.0 --
@@ -904,7 +910,7 @@
     if (!weiUI) return;
     try {
       const n = await WSTStorage.countEmails();
-      weiUI.countEl.textContent = `${n} email(s) stored. Open the Abuse Report Extractor to scan them.`;
+      weiUI.countEl.textContent = `${n} email(s) stored. Open Abuse Reports to scan them.`;
     } catch (e) {
       weiUI.countEl.textContent = 'Could not read the email store.';
     }

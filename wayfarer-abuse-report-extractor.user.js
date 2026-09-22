@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Wayfarer Map Mods - Abuse Report Extractor
+// @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.44.0
+// @version      1.45.0
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -15,6 +15,19 @@
 // ==/UserScript==
 
 /*
+ * v1.45.0 CHANGE FROM v1.44.0: display name shortened from "Abuse Report
+ * Extractor" to "Abuse Reports" -- the @name header, the Settings side-
+ * panel link text, the main panel's and Marker Style sub-panel's modal
+ * titles, the Plugin Manager listing name (PLUGIN_DEFINITION.name's own
+ * GM_info fallback), and every console.warn() prefix in this file all
+ * changed to match. Cosmetic only -- PLUGIN_ID ('wayfarer-abuse-report-
+ * extractor', unchanged) is what WFMM.settings/WFMM.plugins actually key
+ * on, so this doesn't reset or orphan any saved settings, Plugin Manager
+ * enable/disable state, or Marker Style appearance. Historical changelog
+ * entries above that quote the old name (describing what a given past
+ * version actually said/did at the time) are left as written, not
+ * retroactively renamed.
+ *
  * v1.44.0 CHANGE FROM v1.43.2: the companion Abuse Email Importer script
  * is now reached from a small envelope icon right here in this panel's
  * own header row, next to the existing Marker Style cog, instead of
@@ -2348,7 +2361,7 @@
         overlay.setCluster(cluster, isLowestZoom, appearance);
         overlay.setMap(map);
       } catch (e) {
-        console.warn('[Wayfarer Map Mods - Abuse Report Extractor] Skipped rendering one cluster:', e);
+        console.warn('[Wayfarer Map Mods - Abuse Reports] Skipped rendering one cluster:', e);
       }
     }
   }
@@ -2398,7 +2411,7 @@
         overlay.setCluster(cluster, isLowestZoom, appearance);
         overlay.setMap(map);
       } catch (e) {
-        console.warn('[Wayfarer Map Mods - Abuse Report Extractor] Skipped rendering one review cluster:', e);
+        console.warn('[Wayfarer Map Mods - Abuse Reports] Skipped rendering one review cluster:', e);
       }
     }
   }
@@ -2407,7 +2420,7 @@
     try {
       waeRefreshReviewPulses();
     } catch (e) {
-      console.warn('[Wayfarer Map Mods - Abuse Report Extractor] Review pulse refresh failed, retrying shortly:', e);
+      console.warn('[Wayfarer Map Mods - Abuse Reports] Review pulse refresh failed, retrying shortly:', e);
       setTimeout(() => {
         try { waeRefreshReviewPulses(); } catch (e2) { /* give up quietly -- next idle/search will try again */ }
       }, WAE_ZOOM_DEBOUNCE_MS);
@@ -2461,7 +2474,7 @@
     try {
       waeRefreshPulses();
     } catch (e) {
-      console.warn('[Wayfarer Map Mods - Abuse Report Extractor] Pulse refresh failed, retrying shortly:', e);
+      console.warn('[Wayfarer Map Mods - Abuse Reports] Pulse refresh failed, retrying shortly:', e);
       setTimeout(() => {
         try { waeRefreshPulses(); } catch (e2) { /* give up quietly -- next real map interaction will try again */ }
       }, WAE_ZOOM_DEBOUNCE_MS);
@@ -4195,7 +4208,7 @@
     if (waeMarkerSettingsController) return; // already open
     waeMarkerSettingsController = wfmmWindow.WFMM.ui.openModal({
       id: 'wae-marker-settings',
-      title: 'Abuse Report Extractor - Marker Style',
+      title: 'Abuse Reports - Marker Style',
       className: 'wae-dialog',
       showFooterButtons: false,
       ownerPluginId: PLUGIN_ID,
@@ -4288,7 +4301,7 @@
     // separate "Import Abuse Report Emails" entry to Base's Settings
     // side-panel list -- removed as of its own v4.10.0, in favor of this
     // one small envelope icon here instead, so there's exactly one entry
-    // in that list ("Abuse Report Extractor") rather than two separate
+    // in that list ("Abuse Reports") rather than two separate
     // ones a reviewer would have to know to look for individually.
     // Both scripts run in the same page-context window (this script via
     // @inject-into page; the importer's own wfmmWindow resolves to
@@ -4491,7 +4504,7 @@
     if (waePanelController) return; // already open
     waePanelController = wfmmWindow.WFMM.ui.openModal({
       id: 'wae-panel',
-      title: 'Wayfarer Map Mods - Abuse Report Extractor',
+      title: 'Wayfarer Map Mods - Abuse Reports',
       className: 'wae-dialog',
       showFooterButtons: false,
       ownerPluginId: PLUGIN_ID,
@@ -4564,7 +4577,7 @@
   function attachSettingsActions() {
     waeSettingsActionCleanup?.();
     const toolLink = document.createElement('a');
-    toolLink.textContent = 'Abuse Report Extractor';
+    toolLink.textContent = 'Abuse Reports';
     toolLink.style.cursor = 'pointer';
     toolLink.addEventListener('click', (ev) => {
       ev.preventDefault();
@@ -4719,7 +4732,7 @@
   const PLUGIN_ID = 'wayfarer-abuse-report-extractor';
   const PLUGIN_DEFINITION = {
     id: PLUGIN_ID,
-    name: (typeof GM_info !== 'undefined' && GM_info.script?.name) || 'Wayfarer Map Mods - Abuse Report Extractor',
+    name: (typeof GM_info !== 'undefined' && GM_info.script?.name) || 'Wayfarer Map Mods - Abuse Reports',
     description: 'Scans imported abuse-report emails for reported Wayspot names/coordinates, flags nearby duplicates, and plots them on the map.',
     source: 'external',
     requirement: 'optional',
@@ -4741,7 +4754,7 @@
         plugins.registerExternal(PLUGIN_DEFINITION);
         return; // registered -- WFMM owns calling start()/stop() from here
       } catch (e) {
-        console.warn('[Wayfarer Map Mods - Abuse Report Extractor] Plugin Manager registration failed, self-starting instead:', e);
+        console.warn('[Wayfarer Map Mods - Abuse Reports] Plugin Manager registration failed, self-starting instead:', e);
         startPlugin();
         return;
       }
@@ -4750,7 +4763,7 @@
       setTimeout(() => registerOrSelfStart(attemptsLeft - 1), 250);
       return;
     }
-    console.warn('[Wayfarer Map Mods - Abuse Report Extractor] Map Mods plugin manager not detected after 5s -- self-starting instead.');
+    console.warn('[Wayfarer Map Mods - Abuse Reports] Map Mods plugin manager not detected after 5s -- self-starting instead.');
     startPlugin();
   }
 
