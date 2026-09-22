@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Report Extractor
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.38.1
+// @version      1.42.0
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -15,6 +15,61 @@
 // ==/UserScript==
 
 /*
+ * v1.42.0 CHANGE FROM v1.41.0: crosses/clusters now render at every
+ * zoom level, 1 through 21, on every surface -- reported as "no markers
+ * show from zoom 1 through 8, they should render up to and including
+ * the highest zoom level." waeShouldShowPulses() used to hide them
+ * below zoom 8 on the general mapview specifically (matching how the
+ * submit-Wayspot page already always showed them regardless of zoom,
+ * since v1.33.0); it's now an always-true stub for all surfaces, kept
+ * (rather than removing the function and its call site entirely) so
+ * the reasoning stays documented in one place if zoom-gating is ever
+ * wanted back. Clustering itself is unchanged -- a fully zoomed-out
+ * view still collapses nearby reports into one circle with a count
+ * rather than showing hundreds of individual markers, this only
+ * stopped hiding that circle outright below a fixed zoom.
+ * WAE_MIN_SHOW_ZOOM stays as the reference floor for the unrelated
+ * "expand cluster size at the lowest zoom" feature (WAE_CLUSTER_EXPAND_FACTOR),
+ * which never controlled visibility, only size.
+ *
+ * v1.41.0 CHANGE FROM v1.40.1: standard Marker Style defaults changed --
+ * markerSize/clusterMarkerSize both now 12px (previously 9/10), ring
+ * width 1px (previously 2), cluster fill opacity 50% (previously fully
+ * opaque). Only affects anyone who's never touched Marker Style
+ * settings before -- see WAE_APPEARANCE_DEFAULTS' own comment for why
+ * an existing customized value is never overwritten by this.
+ *
+ * v1.40.1 CHANGE FROM v1.40.0: Marker Style settings no longer have
+ * their own entry in the native Settings side-panel list -- a whole
+ * separate entry for what's really one small piece of this plugin's
+ * own tool panel was more than that one setting needed. Reachable now
+ * from a small cog button next to the panel's own summary line
+ * (countEl) instead, tucked out of the way until clicked rather than
+ * sitting in the panel as a labeled button by default -- same modal,
+ * same fields, same live-apply behavior, just one way in instead of
+ * two, and that one way lives where the rest of this plugin's own UI
+ * does.
+ *
+ * v1.40.0 CHANGE FROM v1.38.1: reverts ALL review-page (/new/review)
+ * support added across v1.39.0-v1.39.4 -- the whole feature, its
+ * WFMM.routes.onEnter()/onLeave()-based map discovery, the injected
+ * show/hide checkbox, and every touch point it added elsewhere in this
+ * file (waeShouldShowPulses(), the overlay's clickable check,
+ * waeApplyLayerEnabled(), the WFMM.map.onCleared() handler). Despite
+ * several attempted fixes across v1.39.1-v1.39.4 -- reordering
+ * startPlugin(), wrapping the review code in try/catch, moving
+ * attachSettingsActions() to run first -- the "Abuse Report Extractor"
+ * entry disappearing from the Settings side-panel list on every page
+ * load was never actually resolved, and continuing to guess at fixes
+ * for a diagnosis that was never confirmed wasn't a responsible way to
+ * keep going. This restores the file to exactly its v1.38.1 behavior:
+ * crosses/clusters render on the general mapview and the submit-Wayspot
+ * map only, the same as before the review page was ever attempted.
+ * Nothing about map rendering itself (the OverlayView-based Marker
+ * replacement from v1.38.0, its stacking-order fix in v1.38.1) is
+ * touched -- this is specifically an undo of the review-page work, not
+ * a broader rollback.
+ *
  * v1.38.1 CHANGE FROM v1.38.0: crosses/clusters now sit BELOW real
  * markers in stacking order (Wayspot/Pok\u00e9stop/Gym/Power Spot markers,
  * WFMM's own submission-pin/draft markers), instead of on top of them.
@@ -1492,21 +1547,26 @@
   // literal new row in that one hardcoded grid.
   const WAE_APPEARANCE_STYLE_KEY = 'wae:abuse-report';
   const WAE_APPEARANCE_DEFAULTS = Object.freeze({
-    markerSize: 9,
-    // BUGFIX (not upstream, feature request): this used to be the ONLY
-    // size field -- waeGetClusterIcon() below multiplied it by a fixed
-    // 1.15 to get the cluster/"heatmap" circle's radius, so the two
-    // markers could never be sized independently; making the cross
-    // bigger always made clusters bigger too, in fixed lockstep. Decoupled
-    // now into its own field, defaulted to 10 (== 9 * 1.15, rounded) so
-    // anyone who already had a customized markerSize saved sees the same
-    // cluster size they always have, right up until they touch this new
-    // control for the first time.
-    clusterMarkerSize: 10,
+    // BUGFIX (not upstream, feature request): standard defaults as of
+    // v1.41.0 -- markerSize/clusterMarkerSize both 12px (previously 9/10
+    // respectively -- see clusterMarkerSize's own comment for why they
+    // used to differ at all), borderWidth 1px (previously 2), fillOpacity
+    // 0.5 (previously 1, fully opaque). fillOpacity/borderWidth only
+    // ever render on the cluster circle -- a single-report X marker has
+    // no fill region or ring to apply them to (see waeGetMarkerSvgMarkup()'s
+    // own comment) -- so in practice this reads as "cluster circles are
+    // now half-opacity with a thinner ring," with both marker types
+    // sized the same. Only takes effect for anyone who hasn't customized
+    // these already -- WFMM.settings.registerPlugin() (see startPlugin())
+    // only ever fills in values that aren't already saved, so an
+    // existing customized value here is left exactly as that person set
+    // it.
+    markerSize: 12,
+    clusterMarkerSize: 12,
     fillColor: '#dc2626',
-    fillOpacity: 1,
+    fillOpacity: 0.5,
     borderColor: '#ffffff',
-    borderWidth: 2,
+    borderWidth: 1,
     borderOpacity: 1,
     clickable: true,
   });
@@ -1953,37 +2013,28 @@
     if (WAE_PULSES.infoWindow) WAE_PULSES.infoWindow.close();
   }
 
-  // Hide below this zoom level so a fully zoomed-out view of the
-  // Netherlands doesn't try to show every marker/cluster at once -- but
-  // ONLY on the general mapview. BUGFIX (not upstream): this was applied
-  // unconditionally, including on the submit-Wayspot map (see v1.26.0's
-  // WFMM.map integration), which reported as "crosses don't show on the
-  // submit map AT ALL" -- that page commonly lands on a wide default
-  // view (below zoom 8) before the user has picked a location, and this
-  // check silently hid every marker there too, for exactly the same
-  // "avoid overwhelming a world-zoomed-out view" reason that makes sense
-  // on the country/region-wide mapview but not on a page whose whole
-  // point is narrowing in on one precise spot -- abuse-report context is
-  // arguably MORE useful there at a wide zoom, not less, since that's
-  // exactly when a user hasn't yet zoomed in enough to notice a cluster
-  // of prior reports near where they're about to submit. `surface` comes
-  // from WFMM.map's own context (`context.surface`, "mapview" or
-  // "submit" -- see waeSetCurrentMap()) rather than anything this script
-  // determines itself.
-  // Named rather than left as a bare literal below, since
-  // waeGetClusterSvgMarkup()'s "expand at the lowest zoom level" behavior
-  // (see WAE_CLUSTER_EXPAND_FACTOR) needs the exact same number: "the
-  // lowest zoom level" only has a well-defined floor on the general
-  // mapview, where this threshold is what defines that floor in the
-  // first place (the submit-Wayspot surface always shows pulses
-  // regardless of zoom -- see the surface==='submit' check right below
-  // -- so it has no floor of its own to expand at).
+  // BUGFIX (not upstream, feature request): this used to hide crosses
+  // below zoom level 8 on the general mapview (still zoom-gated, per a
+  // now-removed comment, to avoid a fully zoomed-out view trying to show
+  // every marker/cluster at once) -- reported as "no markers show from
+  // zoom 1 through 8, they should render at every zoom level up to and
+  // including the highest one." Crosses/clusters now always show
+  // regardless of zoom, on every surface -- matching how the
+  // submit-Wayspot page already behaved (see v1.26.0/v1.33.0's own
+  // history with that page for why zoom-gating there specifically was
+  // already recognized as wrong). Clustering (see waeComputeClusters())
+  // still keeps a fully zoomed-out view from turning into hundreds of
+  // individual markers -- nearby reports still collapse into one circle
+  // with a count, this just stopped hiding that circle outright below a
+  // fixed zoom.
+  //
+  // WAE_MIN_SHOW_ZOOM itself stays -- waeGetClusterSvgMarkup()'s "expand
+  // at the lowest zoom level" behavior (see WAE_CLUSTER_EXPAND_FACTOR)
+  // still needs a reference floor to compare the current zoom against,
+  // it just no longer doubles as a visibility cutoff.
   const WAE_MIN_SHOW_ZOOM = 8;
-  function waeShouldShowPulses(map, surface) {
-    if (surface === 'submit') return true;
-    if (!map || typeof map.getZoom !== 'function') return true;
-    const z = map.getZoom();
-    return (typeof z === 'number') && z >= WAE_MIN_SHOW_ZOOM;
+  function waeShouldShowPulses() {
+    return true;
   }
 
   // Rebuilds the marker set from whatever's currently in waeAllRecords --
@@ -2045,7 +2096,7 @@
 
     // BUGFIX (not upstream): this function never checked whether the
     // "Abuse Report Crosses" layer was actually enabled -- only whether
-    // a map existed and waeShouldShowPulses() (zoom/surface) allowed it.
+    // a map existed and waeShouldShowPulses() allowed it.
     // waeApplyLayerEnabled(false) calls waeClearPulses() exactly once
     // when the checkbox is switched off, but the debounced 'idle'
     // listener set up in waeSetCurrentMap() stays attached to the map
@@ -2860,6 +2911,13 @@
   const STYLE = `
     #wae-panel .wfmapmods-modal-dialog{ width:600px; max-width:calc(100vw - 24px); }
     .wae-sub{ font-size:11px; color:var(--wfmm-muted-text, #667085); margin-bottom:8px; }
+    /* Holds the panel's summary line (countEl, "N reports across M tickets"
+       or similar) and the cog button that opens Marker Style settings --
+       see buildPanelContent()'s own comment on markerStyleBtn for why
+       that button lives here (tucked next to this line) rather than as
+       a labeled button of its own. */
+    .wae-panel-header-row{ display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:8px; }
+    .wae-panel-header-row .wae-sub{ margin-bottom:0; }
     .wae-csv-hint{ white-space:pre-line; font-family:ui-monospace, monospace; }
     /* BUGFIX (not upstream): the crosses/clusters this plugin draws on the
        map used to be google.maps.Marker instances with a data: URI SVG
@@ -3396,41 +3454,34 @@
   }
 
   // ---------------------------------------------------------------------
-  // Marker Style settings -- its own modal now, reachable from the
-  // native Settings side-panel list (see attachSettingsActions()
-  // further down) instead of living buried at the bottom of the main
-  // "Extract Wayspots" tool panel. Mirrors the shape the suite's own
-  // bundled Planner plugin uses for ITS settings: a renderXSection(body)
-  // function that builds controls directly into the handed-in body and
-  // returns {onOk} for openModal() to call -- see
-  // renderPlannerMarkerSettingsSection()/createPlannerSettingsModal()'s
-  // own openSettings() in Base's source. Unlike Planner's batched Save/
-  // Cancel flow, every control here still applies (and persists)
+  // Marker Style settings -- its own modal, opened from a small cog
+  // button next to the tool panel's title (see buildPanelContent()),
+  // rather than living inline at the bottom of the panel where it used
+  // to. Kept as a separate modal (not folded back into the main panel)
+  // because the {onOk}-returning renderXSection(body) shape -- same
+  // pattern the suite's own bundled Planner plugin uses for its own
+  // settings, see renderPlannerMarkerSettingsSection()/
+  // createPlannerSettingsModal()'s own openSettings() in Base's source
+  // -- is what waeOpenMarkerSettingsModal() below wraps with
+  // WFMM.ui.openModal(). Every control here still applies (and persists)
   // immediately on change, matching how this section already behaved
-  // when it lived inline in the tool panel -- so onOk here is just a
-  // no-op to satisfy openModal()'s contentHooks contract, not a real
-  // save step.
+  // when it lived inline -- so onOk here is just a no-op to satisfy
+  // openModal()'s contentHooks contract, not a real save step.
   //
-  // A literal new tab inside WFMM's own native Settings window (the
-  // Side Panels & UI / Markers / Map / Planner / ... tabbed modal opened
-  // from the gear icon) isn't something this plugin -- or any plugin
-  // outside the suite's own bundle -- can add: confirmed against Base's
-  // own settings-hub source, that modal's own SECTIONS list is an
+  // This used to also get its own entry in the native Settings side-
+  // panel list (WFMM.sidePanel.appendSettingsAction(), see
+  // attachSettingsActions()) -- removed as more than this one small
+  // setting needed: it's a once-in-a-while adjustment, not something
+  // that belongs competing for attention in the Settings list the way a
+  // whole plugin's own entry point does. A literal new tab inside
+  // WFMM's own native Settings window (the Side Panels & UI / Markers /
+  // Map / Planner / ... tabbed modal opened from the gear icon) was
+  // never an option regardless -- confirmed against Base's own
+  // settings-hub source, that modal's own SECTIONS list is an
   // Object.freeze()'d array, and the function that renders a given
   // section's body hardcodes each non-generic one to a specific bundled
-  // plugin by id (`if (sectionId === "planner") return
-  // WFMM.planner.renderSettingsSection(...)`, and so on for
-  // contributions/s2-cells/review-page/submissions-drafts) -- there's no
-  // registerSection()-style hook an externally-registered plugin like
-  // this one can call into. WFMM.sidePanel.appendSettingsAction() (see
-  // attachSettingsActions()) is the actual public, documented mechanism
-  // any plugin -- bundled or not -- uses to surface a settings entry,
-  // and it's what Planner's own settings link ultimately relies on too:
-  // its openSettings() only reaches WFMM.settingsHub because "planner"
-  // happens to be one of those hardcoded ids, but the settings UI itself
-  // is built with this same openModal()-wrapped, body-rendering pattern
-  // either way -- the hub embedding is just a second way in for the
-  // handful of ids that have one.
+  // plugin by id, with no registerSection()-style hook an externally-
+  // registered plugin like this one can call into.
   function waeRenderMarkerStyleSection(ui, body) {
     function updateAppearance(partial) {
       const next = waeNormalizeAppearance({ ...waeLoadAppearance(), ...partial });
@@ -3599,22 +3650,24 @@
     const logEl = ui.createElement('div', { className: 'wae-log' });
 
     // ---- Marker Style ----
-    // Moved out to its own dedicated settings modal (see
-    // waeOpenMarkerSettingsModal()/waeRenderMarkerStyleSection() further
-    // down) so it's reachable the same way the suite's own bundled
-    // plugins expose their settings -- a dedicated entry in the native
-    // Settings side-panel list (see attachSettingsActions()) -- instead
-    // of being buried at the bottom of this tool's own working panel.
-    // See waeRenderMarkerStyleSection()'s own comment for why a literal
-    // new tab inside WFMM's native Settings window (Markers/Map/
-    // Planner/...) isn't something a plugin outside the suite's own
-    // bundle can add, and why this is the actual public alternative.
-    const markerStyleBtn = ui.button({
-      text: 'Marker Style Settings\u2026',
+    // BUGFIX (not upstream, feature request): used to also have its own
+    // entry in the native Settings side-panel list -- see
+    // attachSettingsActions()'s own comment for why that was more than
+    // this one setting needed. This cog button is now the only way in:
+    // tucked out of the way next to the panel's own summary line rather
+    // than sitting in the panel as a labeled button by default, so it
+    // doesn't compete for attention with the table/export/scan controls
+    // every time the panel opens -- the same reasoning as it having its
+    // own modal at all (see waeRenderMarkerStyleSection()'s own comment).
+    const markerStyleBtn = ui.iconButton({
+      iconSvg: '<svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>',
+      title: 'Marker Style Settings',
       onClick: () => waeOpenMarkerSettingsModal(),
     });
+    const panelHeaderRow = ui.createElement('div', { className: 'wae-panel-header-row' });
+    panelHeaderRow.append(countEl, markerStyleBtn);
 
-    modal.body.append(countEl, buttonRowEl, csvHint, csvFileInput, progressEl, searchInput, autoCloseToggle.row, tableContainer, logEl, ui.buttonRow([markerStyleBtn]));
+    modal.body.append(panelHeaderRow, buttonRowEl, csvHint, csvFileInput, progressEl, searchInput, autoCloseToggle.row, tableContainer, logEl);
 
     waeUI = { countEl, tableContainer, logEl, scanBtn, exportBtn, clearBtn, searchInput };
 
@@ -3837,16 +3890,20 @@
   // Angular-router case the old code was trying to patch over, without
   // watching the entire document tree to do it.
   //
-  // Two links now (see waeRenderMarkerStyleSection()'s own comment for
-  // why this is the right way in rather than a WFMM.settingsHub tab):
-  // the original tool-panel link, plus a new one straight to Marker
-  // Style settings, so that setting is reachable from the native
-  // Settings list the same way the suite's own bundled plugins' settings
-  // are, not just from inside the tool panel.
+  // Just the one link now -- Marker Style settings used to also get a
+  // second entry here of its own ("Abuse Report Extractor \u2013 Marker
+  // Style"), but a whole separate Settings-list entry for what's really
+  // one small piece of this plugin's own panel was more than it needed
+  // to be. It's reachable from inside the tool panel itself instead now
+  // (see the cog button next to its title, in buildPanelContent()) --
+  // tucked behind a click rather than sitting in the panel by default,
+  // same reasoning as it having its own modal at all: it's a
+  // once-in-a-while adjustment, not something that should compete for
+  // attention with the table/export/scan controls every time the panel
+  // opens.
   // ---------------------------------------------------------------------
 
   let waeSettingsActionCleanup = null;
-  let waeMarkerSettingsActionCleanup = null;
   let waeSidePanelReadyUnsub = null;
   let waeSidePanelClearedUnsub = null;
 
@@ -3860,23 +3917,11 @@
       togglePanel();
     });
     waeSettingsActionCleanup = wfmmWindow.WFMM.sidePanel.appendSettingsAction(toolLink);
-
-    waeMarkerSettingsActionCleanup?.();
-    const styleLink = document.createElement('a');
-    styleLink.textContent = 'Abuse Report Extractor \u2013 Marker Style';
-    styleLink.style.cursor = 'pointer';
-    styleLink.addEventListener('click', (ev) => {
-      ev.preventDefault();
-      waeOpenMarkerSettingsModal();
-    });
-    waeMarkerSettingsActionCleanup = wfmmWindow.WFMM.sidePanel.appendSettingsAction(styleLink);
   }
 
   function detachSettingsActions() {
     waeSettingsActionCleanup?.();
     waeSettingsActionCleanup = null;
-    waeMarkerSettingsActionCleanup?.();
-    waeMarkerSettingsActionCleanup = null;
   }
 
 
@@ -3981,9 +4026,6 @@
     // subscriptions themselves are cheap and their callbacks already
     // check isMapPulsesEnabled() before doing any real work.
     waeStartMapTracking();
-    // Unlike map pulses, this doesn't depend on "Show on Map" being
-    // toggled at all -- it's a separate feature (see its own comment)
-    // that should just always be live while the plugin itself is.
     waeStartSidePanelDetailsWatcher();
     waeResyncMapIfVisible();
   }
