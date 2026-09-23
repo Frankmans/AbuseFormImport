@@ -3,12 +3,23 @@
 Two companion Tampermonkey userscripts that pull Niantic Support's
 "Reporting Abuse in Wayfarer" Helpshift ticket emails out of Gmail (or
 `.eml` files), and extract a best-guess Wayspot name + coordinates from
-each one into an exportable CSV. As of v4.7.2/v1.26.0 their display names
-are **Wayfarer Map Mods - Abuse Email Importer** and **Wayfarer Map Mods
-- Abuse Report Extractor**, so it's clear they're WFMM-affiliated
-wherever they show up standalone — Tampermonkey's dashboard, Plugin
-Manager's own list, devtools console — though the underlying filenames
-(and their `@downloadURL`s below) are unchanged.
+each one into an exportable CSV. Their Tampermonkey/Plugin Manager
+display names are **Wayfarer Map Mods - Abuse Email Importer** and
+**Wayfarer Map Mods - Abuse Reports** (shortened from "Abuse Report
+Extractor" as of extractor v1.45.0), so it's clear they're
+WFMM-affiliated wherever they show up standalone — Tampermonkey's
+dashboard, Plugin Manager's own list, devtools console — though the
+underlying filenames (and their `@downloadURL`s below) are unchanged.
+
+As of extractor v1.44.0, only **Abuse Reports** has its own entry in the
+suite's native Settings side panel — the Email Importer's panel opens
+from a small envelope icon inside that one instead, right next to the
+Marker Style cog. They're still two genuinely separate scripts under the
+hood (the importer needs `GM_xmlhttpRequest`, a sandbox-only API, for
+Gmail OAuth — see "Why no `@require` for the suite" below for the
+related, and more general, reason they can't just be merged into one
+file), just with one shared entry point now instead of two. See "Where
+to find things" for exactly where all of this sits.
 
 Both hook into [Tntnnbltn's wayfarer-map-mods suite][base]'s own UI
 service (`WFMM.ui`) for their panels — real, suite-native modals
@@ -35,18 +46,49 @@ what's an abuse-report ticket and pulls a location out of it. Splitting
 them this way means you can re-run extraction as the parsing logic
 improves without re-importing anything.
 
+## Where to find things
+
+The diagrams below are illustrative mockups, not literal screenshots —
+they exist to show *where* each control lives, not to exactly match
+Wayfarer's current visual styling.
+
+**Settings side panel.** Open Base's side panel and there's exactly one
+entry for both scripts now: **Abuse Reports**.
+
+![The Settings side panel showing a single "Abuse Reports" entry](docs/images/settings-side-panel.svg)
+
+**Inside the Abuse Reports panel.** Two small icons sit next to the
+summary line, top-right: an envelope (opens the Email Importer's own
+panel) and a cog (opens Marker Style settings, see below).
+
+![The Abuse Reports panel header with envelope and cog icons](docs/images/panel-header-icons.svg)
+
+**Showing crosses on the map.** This plugin has no "Show on Map" button
+of its own anymore (see "Plotting on the map" below for why) — it's the
+**Abuse Report Crosses** entry in Base's native Layers menu instead,
+same place every other map layer is toggled.
+
+![The native Layers menu with the Abuse Report Crosses checkbox](docs/images/layers-menu.svg)
+
+**On the review page.** A separate small on/off bar sits directly above
+whichever map the review page itself is showing — not the Layers menu,
+not the Settings panel. See "On the review page" below for why it's kept
+apart.
+
+![The toggle bar above the review page's map](docs/images/review-toggle-bar.svg)
+
 ## Requirements
 
 - A userscript manager (Tampermonkey or compatible).
 - **[Tntnnbltn's wayfarer-map-mods suite][base] (v4.0.0+) installed
-  separately, on its own.** Both scripts add a link into its side panel
-  settings section (`Import Abuse Report Emails` / `Abuse Report
-  Extractor`) — without it running, there's nowhere for those links or
-  panels to appear. Don't `@require` it into anything else; see the "Why
-  no `@require` for the suite" note below. Earlier versions of both
-  scripts targeted the old separate `wayfarer-map-mods-base.user.js` —
-  if you're still on that, update it to the consolidated v4.0.0+ suite
-  first.
+  separately, on its own.** The extractor adds a link into its side panel
+  settings section (`Abuse Reports`) — without it running, there's
+  nowhere for that link, or the small envelope icon inside its panel
+  that opens the importer, to appear. Don't `@require` it into anything
+  else; see the "Why no `@require` for the suite" note below. Earlier
+  versions of both scripts targeted the old separate
+  `wayfarer-map-mods-base.user.js` — if you're still on that, update it
+  to the consolidated v4.0.0+ suite first.
 - A Google Cloud OAuth Client ID, **only** if you want Gmail sync. The
   `.eml` drop path works with no setup at all.
 
@@ -92,27 +134,31 @@ time the page loads and kept in memory only, for the session.
 ## Using it
 
 1. On `https://wayfarer.scopely.com/new/mapview`, open the suite's side
-   panel and click **Import Abuse Report Emails**.
-2. Either **Sync new emails** (after connecting Gmail) or drop `.eml`
-   files into the dropzone. Turn on auto-sync if you want it to check
-   periodically without you opening the panel.
-3. Click **Abuse Report Extractor** in the side panel, then **Scan
-   Imported Emails**.
+   panel and click **Abuse Reports**.
+2. Inside that panel, click the small envelope icon next to the summary
+   line to open the Email Importer's own panel. Either **Sync new
+   emails** (after connecting Gmail) or drop `.eml` files into the
+   dropzone. Turn on auto-sync if you want it to check periodically
+   without you opening the panel. Close it to land back on Abuse
+   Reports.
+3. Back in the Abuse Reports panel, click **Scan Imported Emails**.
 4. Review the table — one row per reported Wayspot, so a ticket that
    reports several (or has more added in a later reply) shows several
    rows sharing the same `Conversation ID`. Rows missing a name or
    coordinates are flagged so you can check the raw `Location Details` /
-   `Report Details` columns by hand — then **Export CSV**, or click
-   **Show on Map** to see them plotted directly on the map instead (see
+   `Report Details` columns by hand — then **Export CSV**, or turn on
+   **Abuse Report Crosses** in the native Layers menu to see them
+   plotted directly on the map instead (see "Plotting on the map"
    below).
 
 The **Conversation** and **Status** column headers are clickable to sort
 — click again to flip ascending/descending, click the other header to
 switch columns; Status sorts by pipeline stage (Received → Pending Review
 → a settled state), not alphabetically. Your chosen sort is remembered
-across sessions. The extractor panel also has its own **Marker Style**
-section — color, size, opacity, and a clickable-markers toggle for the
-map markers it draws (see "Plotting on the map" below).
+across sessions. The small cog icon next to the same summary line opens
+this panel's own **Marker Style** section — color, size, opacity, and a
+clickable-markers toggle for the map markers it draws (see "Plotting on
+the map" below).
 
 Both scripts also show up as their own entries — with a name,
 description, and enable/disable toggle — in the wayfarer-map-mods
@@ -336,8 +382,9 @@ name, conversation ID, comment, issue type, both raw text fields, and the
 source filename/email ID — not just what's shown in the columns, since a
 query is more likely to hit the raw `Location Details`/`Report Details`
 text than the best-guess name. It only changes what's *displayed* —
-**Export CSV**, **Show on Map**, and the summary counts above the table
-all still reflect everything, not just the currently-filtered rows.
+**Export CSV**, the map crosses (Layers menu), and the summary counts
+above the table all still reflect everything, not just the
+currently-filtered rows.
 Typing is debounced (200ms) rather than filtering on every keystroke.
 
 ## Large histories (thousands of rows)
@@ -362,19 +409,25 @@ stored, not what any part of the panel shows.
 
 ## Plotting on the map
 
-Click **Show on Map** in the extractor panel to plot every extracted
-location directly on the Wayfarer map — the same idea as Report
-Wayspots' own reported-wayspot history markers, but for what this script
-extracted from imported emails, and without needing Report Wayspots
-installed. Nearby locations cluster into a single numbered badge when
-zoomed out, splitting apart into individual X markers as you zoom in
-close enough to tell them apart — clustering is based on actual on-screen
-distance at the current zoom, not a fixed real-world radius, so it
-adapts correctly whether you're looking at the whole country or one
-neighborhood. Click an individual marker for its name, coordinates,
-comment, and ticket ID; click a cluster to zoom in on it. The toggle's
-state is remembered (`localStorage`) and re-attaches automatically next
-time a map-having page loads if you left it on; markers stay in sync
+Turn on **Abuse Report Crosses** in the native **Layers** menu (see
+"Where to find things" above) to plot every extracted location directly
+on the Wayfarer map — the same idea as Report Wayspots' own
+reported-wayspot history markers, but for what this script extracted
+from imported emails, and without needing Report Wayspots installed.
+This used to be its own "Show on Map"/"Hide from Map" button inside the
+extractor panel; that was removed once the same on/off state got
+registered as a real Layers-menu entry instead, since keeping both would
+just have been two controls doing the same thing. Nearby locations
+cluster into a single numbered badge when zoomed out, splitting apart
+into individual X markers as you zoom in close enough to tell them apart
+— clustering is based on actual on-screen distance at the current zoom,
+not a fixed real-world radius, so it adapts correctly whether you're
+looking at the whole country or one neighborhood. Click an individual
+marker for its name, coordinates, comment, and ticket ID; click a
+cluster to zoom in on it. The layer's on/off state is remembered by the
+suite itself and re-attaches automatically next time a map-having page
+loads if you left it on — including right away on a fresh page load, no
+need to open the panel or touch the toggle first; markers stay in sync
 automatically after every scan or clear while it's on.
 
 Works on **both** the general mapview and the zoomed-in submit/edit view
@@ -392,16 +445,37 @@ straight to that location (centering and zooming in) and show the same
 info popup there. Since the panel is a full-screen backdrop, clicking a
 row also closes it, so the map you just navigated to is actually visible.
 
+### On the review page
+
+Crosses also plot on `https://wayfarer.scopely.com/new/review` — the
+duplicate-check map (and the edit-location/edit-info maps that page can
+show too), so you can see nearby prior abuse reports right while
+reviewing a nomination. This is deliberately **not** the same on/off
+switch as the Layers-menu checkbox above, and it's **not** reachable from
+the Settings side panel either — see "Where to find things" for the
+small toggle bar that sits directly above the review page's own map
+instead. Two reasons for the separation: Base's own map-tracking
+(`WFMM.map`) never covers the review route in the first place, so this
+needed its own map lookup regardless; and keeping the Settings side
+panel and this plugin's own tool panel exclusive to the mapview/submit
+pages was a deliberate requirement, not an oversight, so review support
+gets its own small toggle rather than adding a second checkbox to a menu
+that otherwise doesn't apply there. The toggle defaults on, and — same
+as the mapview/submit crosses — its color follows Wayfarer's own dark
+mode correctly, not just your OS/browser's light-dark setting.
+
 ### Marker Style
 
-The extractor panel has its own **Marker Style** section: color, size,
-fill opacity, ring color/width/opacity for the cluster badges, and a
-**Clickable markers** toggle (turn it off to let clicks pass through to
+Opened via the small cog icon next to the Abuse Reports panel's summary
+line (see "Where to find things" above), this section covers: color,
+size, fill opacity, ring color/width/opacity for the cluster badges, and
+a **Clickable markers** toggle (turn it off to let clicks pass through to
 whatever's underneath — the map itself, or a Wayspot marker at the same
 spot — instead of opening this plugin's own popup). Changes apply live if
-markers are already showing. The individual-report X shape itself stays
-fixed by design — it's meant to read as "a problem here," distinct from
-an ordinary POI dot — only its color and size are adjustable; the cluster
+markers are already showing (both mapview/submit crosses and the
+review-page markers). The individual-report X shape itself stays fixed
+by design — it's meant to read as "a problem here," distinct from an
+ordinary POI dot — only its color and size are adjustable; the cluster
 badge, already a filled circle, gets the full set of controls.
 
 These settings are also registered with `WFMM.markerAppearance` (the
@@ -427,7 +501,11 @@ element for the suite's own side-panel selection (never a map marker,
 even before this), but that bridge was removed entirely in the suite's
 v4.0.0; the function is now a documented no-op kept only for API
 compatibility. Real map-plotting has only ever been this script's own
-"Show on Map".
+Layers-menu crosses (see "Plotting on the map" above). That same
+`window.WayfarerAbuseEmailImporter` object is also what the extractor's
+own envelope icon calls into as of the importer's v4.10.0 —
+`openPanel()`/`closePanel()`/`togglePanel()`/`isPanelOpen()`, alongside
+`publishPoiToMap()` and `getAbuseReportRecords()`.
 
 Markers reposition themselves via the Maps SDK on pan with no app code
 involved, but a full re-render (recomputing clusters) does run on every
@@ -499,10 +577,17 @@ needed since it's plain `@require`-able JS.
 
 ## Versions covered by this README
 
-- `wayfarer-abuse-email-importer.user.js` — v4.7.4
-- `wayfarer-abuse-report-extractor.user.js` — v1.26.1
-- Verified against `wayfarer-map-mods.user.js` v4.0.0 (the consolidated
+- `wayfarer-abuse-email-importer.user.js` — v4.10.2
+- `wayfarer-abuse-report-extractor.user.js` — v1.46.0
+- Verified against `wayfarer-map-mods.user.js` v4.3.0 (the consolidated
   suite both scripts depend on — see Requirements above).
 
 Full version-by-version detail lives in the changelog comment block at
-the top of each `.user.js` file.
+the top of each `.user.js` file. This README was last brought fully up
+to date at extractor v1.46.0 — the display-name shortening (v1.45.0), the
+first-page-load crosses fix (v1.46.0), review-page support (v1.43.0+),
+and the Email Importer's envelope-icon integration (v1.44.0, importer
+v4.10.0+) are all reflected above. Versions between v1.26.1 and v1.42.0
+predate this pass and may include smaller fixes/features not yet
+described here — check that changelog block for anything not covered
+above.
