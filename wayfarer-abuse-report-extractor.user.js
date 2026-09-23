@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.45.0
+// @version      1.46.0
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -15,6 +15,32 @@
 // ==/UserScript==
 
 /*
+ * v1.46.0 CHANGE FROM v1.45.0: fixes crosses not appearing on first page
+ * load -- reported in the field as: nothing shows until the panel is
+ * opened AND THEN the map is panned/zoomed, and toggling the "Abuse
+ * Report Crosses" layer off/on didn't help either. Root cause:
+ * waeAllRecords (the in-memory cache everything actually draws from)
+ * used to only ever get populated inside refreshPanel(), itself a no-op
+ * unless the tool panel is open -- so on a fresh page load, with the
+ * layer already on from a previous session, the map attached with
+ * genuinely nothing loaded to draw, and nothing re-populated
+ * waeAllRecords afterward except opening the panel, which didn't itself
+ * trigger a redraw either (only the next pan/zoom's 'idle' event did,
+ * by which point data happened to already be loaded). Toggling the
+ * layer hit that same empty cache every time, for the same reason.
+ * Fixed with one shared, cached loader, waeEnsureRecordsLoaded() --
+ * fired eagerly at startPlugin(), and awaited by every real draw
+ * trigger (waeResyncMapIfVisible()'s bootstrap path, waeApplyLayerEnabled()'s
+ * toggle-on path, and the review-page map-attach path in
+ * waeSetReviewMap()) before that trigger's first draw, so real data is
+ * there by the time anything first tries to show it -- whether or not
+ * the panel has ever been opened. refreshPanel() also now nudges
+ * whichever surface (mapview/submit, review) is currently attached to
+ * redraw once it loads fresher data of its own, closing a related gap
+ * where opening the panel alone didn't refresh an already-visible map.
+ * See waeEnsureRecordsLoaded()'s own comment (right after WAE_REVIEW_PULSES)
+ * for the full implementation.
+ *
  * v1.45.0 CHANGE FROM v1.44.0: display name shortened from "Abuse Report
  * Extractor" to "Abuse Reports" -- the @name header, the Settings side-
  * panel link text, the main panel's and Marker Style sub-panel's modal
@@ -1589,6 +1615,50 @@
   const WAE_REVIEW_PULSES = { map: null, host: null, markersById: new Map(), infoWindow: null };
   let waeAllRecords = [];
   let waeRecordsById = new Map();
+  // BUGFIX (not upstream, feature request): waeAllRecords used to only
+  // ever get populated inside refreshPanel(), which is itself a no-op
+  // unless the tool panel is open -- meaning on a fresh page load, with
+  // "Abuse Report Crosses" already on from a previous session, the map
+  // attached with zero records to draw and nothing ever re-populated
+  // waeAllRecords afterward except opening the panel (which didn't
+  // itself trigger a redraw either -- only the *next* pan/zoom's 'idle'
+  // event did, once data happened to already be loaded by then). Net
+  // effect, reported in the field: markers missing on first load, only
+  // appearing after opening the panel AND THEN zooming -- and toggling
+  // the layer off/on didn't help either, since that path hit the exact
+  // same empty waeAllRecords. waeEnsureRecordsLoaded() below is the fix:
+  // a single shared, cached load callers can await before any redraw,
+  // so the data is actually there by the time anything first tries to
+  // draw from it, whether or not the panel has ever been opened. See
+  // its own comment just below.
+  let waeRecordsLoadPromise = null;
+
+  // Loads waeAllRecords/waeRecordsById from storage if nothing has
+  // loaded them yet THIS session, and caches the in-flight promise so
+  // concurrent callers (bootstrap, a layer toggle-on, the review map
+  // attaching, the panel opening) all await the same one IndexedDB read
+  // rather than racing separate ones. Deliberately a one-time-per-session
+  // cache, not a "read fresh every time" -- callers that need genuinely
+  // up-to-date data after a real change (refreshPanel(), and the scan/
+  // import/clear handlers it's called from) still call
+  // getAllExtractedRecords() directly and assign waeAllRecords themselves,
+  // exactly as before; this function only exists to guarantee SOMETHING
+  // has loaded at least once before the very first draw attempt.
+  function waeEnsureRecordsLoaded() {
+    if (!waeRecordsLoadPromise) {
+      waeRecordsLoadPromise = getAllExtractedRecords()
+        .then((records) => {
+          waeAllRecords = records;
+          waeRecordsById = new Map(records.map((r) => [r.id, r]));
+          return records;
+        })
+        .catch((e) => {
+          waeRecordsLoadPromise = null; // don't cache a failure -- let the next caller retry the read
+          throw e;
+        });
+    }
+    return waeRecordsLoadPromise;
+  }
   let waeNearbyMap = new Map();
   let waeSearchQuery = '';
   let waeCurrentPage = 1;
@@ -2878,7 +2948,14 @@
         waeReviewIdleDebounceTimer = setTimeout(waeSafeRefreshReviewPulses, WAE_ZOOM_DEBOUNCE_MS);
       });
       waeInjectReviewToggle(host);
-      waeSafeRefreshReviewPulses();
+      // BUGFIX: see waeEnsureRecordsLoaded()'s own comment -- same fix as
+      // waeApplyLayerEnabled()/waeResyncMapIfVisible(), applied here to
+      // the review-page map-attach path. waeSetReviewMap() itself isn't
+      // async (called from several synchronous call sites), so this is
+      // fire-and-forget rather than awaited -- finally() (not then())
+      // so a draw is still attempted even if the load failed, same
+      // reasoning as those two functions' own .catch(() => {}).
+      waeEnsureRecordsLoaded().finally(waeSafeRefreshReviewPulses);
     } else {
       waeRemoveReviewToggle();
     }
@@ -3104,6 +3181,13 @@
     if (enabled) {
       const attached = await waeAttachToMapIfNeeded();
       if (attached) {
+        // BUGFIX: used to call waeSafeRefreshPulses() immediately here,
+        // which drew nothing at all if waeAllRecords hadn't loaded yet
+        // this session (see waeEnsureRecordsLoaded()'s own comment) --
+        // toggling the layer off/on looked like it simply didn't work.
+        // Awaited so the very first draw after turning this on always
+        // has real data to draw from.
+        await waeEnsureRecordsLoaded().catch(() => {}); // best-effort -- still try to draw with whatever's cached (likely []) rather than leave the layer on with a silent failure
         waeSafeRefreshPulses();
       } else {
         if (waeUI) log(waeUI.logEl, '✗ Could not find the Wayfarer map on this page -- try again from the mapview or the submit-Wayspot map.', 'err');
@@ -3136,8 +3220,16 @@
     if (!isMapPulsesEnabled()) return;
     waeMapRetriesLeft = WAE_MAP_RETRY_LIMIT;
     const attached = await waeAttachToMapIfNeeded();
-    if (attached) waeSafeRefreshPulses();
+    if (attached) {
+      // BUGFIX: see waeEnsureRecordsLoaded()'s own comment -- this is
+      // the actual first-page-load case that comment describes. Awaited
+      // (not fire-and-forget) so the map's very first draw, right after
+      // attaching on a fresh page load, has real data instead of [].
+      await waeEnsureRecordsLoaded().catch(() => {});
+      waeSafeRefreshPulses();
+    }
   }
+
 
   // ---------------------------------------------------------------------
   // Scan: raw imported emails -> extracted rows
@@ -4062,6 +4154,12 @@
     try {
       waeAllRecords = await getAllExtractedRecords();
       waeRecordsById = new Map(waeAllRecords.map((r) => [r.id, r]));
+      // Keeps waeEnsureRecordsLoaded()'s cache in sync with this fresher
+      // read, rather than leaving it pointed at whatever (possibly
+      // stale, possibly still-empty) data it resolved with earlier --
+      // a review map or a layer toggle-on right after this shouldn't
+      // redraw from data older than what the panel itself just showed.
+      waeRecordsLoadPromise = Promise.resolve(waeAllRecords);
     } catch (e) {
       waeUI.countEl.textContent = 'Could not read extracted-report storage.';
       return;
@@ -4078,6 +4176,16 @@
       waeNearbyMapFingerprint = fp;
     }
     waeRenderFilteredTable();
+    // BUGFIX: see waeEnsureRecordsLoaded()'s own comment -- opening the
+    // panel used to only ever refresh the table, never the map, so
+    // whichever surface (mapview/submit crosses, the review-page
+    // markers) happened to already be attached wouldn't pick up
+    // whatever just loaded here until its own next pan/zoom. Only
+    // redraws a surface that's actually attached right now -- this
+    // isn't what makes either surface attach or turn on in the first
+    // place, same restraint waeSaveAppearance() already applies.
+    if (WAE_PULSES.map && isMapPulsesEnabled()) waeSafeRefreshPulses();
+    if (WAE_REVIEW_PULSES.map) waeSafeRefreshReviewPulses();
   }
 
   // ---------------------------------------------------------------------
@@ -4593,6 +4701,15 @@
 
 
   function startPlugin() {
+    // Fired off first, before anything else in this function, so the
+    // IndexedDB read is already in flight by the time waeResyncMapIfVisible()
+    // (below) goes looking for it -- see waeEnsureRecordsLoaded()'s own
+    // comment for the bug this is the other half of the fix for. Not
+    // awaited here -- startPlugin() itself isn't async, and doesn't need
+    // to be: every real consumer (waeResyncMapIfVisible(),
+    // waeApplyLayerEnabled(), the review-map attach path) awaits this
+    // same cached promise itself before its own first draw.
+    waeEnsureRecordsLoaded();
     // One-time migration from the old raw-localStorage keys (removed
     // from this file as of v1.37.0, see WAE_SETTINGS_DEFAULTS' own
     // comment) into WFMM.settings -- only runs if this plugin id has
