@@ -264,12 +264,59 @@ quoted history normally underneath it, so a ticket doesn't stop
 classifying or extracting correctly just because a reply came from your
 own inbox instead of Helpshift's reply link.
 
+## Starring rows & Last Response
+
+Click a row's ★ cell to star it — matches Report History's own star
+button (Report History calls it "Star", not "Favorite," so this does
+too). The ★ column header is itself clickable to sort, same as
+Conversation/Status: ascending shows starred rows first, same "starred
+first" convention Report History uses for its own sort. A re-scan
+rebuilds the extracted-records table from the source emails from
+scratch, but starred rows stay starred across that — matched back up by
+ticket + coordinates, not by an internal row id that isn't guaranteed to
+survive a rebuild.
+
+The **Last Response** column shows the newest message across every
+email imported for that ticket, not just whichever single email
+happened to get scanned — so it stays accurate for a ticket you've
+imported several replies for (see "Long-running tickets" above). Also
+sortable; rows with no parseable timestamp always sort last regardless
+of direction. In the CSV export this is `Last Response (UTC)`, an
+unambiguous ISO 8601 string rather than the locale-formatted date the
+table itself shows.
+
+## Importing locations from elsewhere (CSV)
+
+**Import CSV** (next to Export CSV) is for locations that didn't come
+from a scanned email at all — a known problem spot from another source,
+something you want to track alongside everything else. It's not for
+re-importing this tool's own export. Only a `Latitude`/`Longitude`
+column pair is required (matched case-insensitively against a few
+common header spellings — `Lat`/`Latitude`, `Lng`/`Long`/`Longitude` —
+not one fixed name); `Name`, `Comment`, and `Conversation ID` columns are
+all optional. The format hint above the button always shows a two-line
+example, not just after a failed attempt:
+
+```
+Latitude,Longitude,Name,Comment,Conversation ID
+52.006199,4.535424,Example Wayspot,Optional note,12345
+```
+
+Imported rows show up in the table and on the map like any other, with
+their own **Imported** status badge (purple, distinct from the ticket
+pipeline badges below) — and, since a re-scan otherwise rebuilds the
+extracted-records table from scratch, they're explicitly carried
+forward across one rather than getting silently wiped. They're also
+called out by name in the **Clear Extracted Data** confirmation, since
+—unlike scanned data — there's no source email to re-derive an imported
+row from if either of those clears it.
+
 ## CSV columns
 
-`Conversation ID`, `Ticket Status`, `Wayspot Name (best guess)`,
-`Latitude`, `Longitude`, `Comment`, `Nearby Tickets (<20m, other
-tickets)`, `Issue Type`, `Location Details (raw)`, `Report Details
-(raw)`, `Source Email ID`, `Source Filename`.
+`Starred`, `Conversation ID`, `Ticket Status`, `Last Response (UTC)`,
+`Wayspot Name (best guess)`, `Latitude`, `Longitude`, `Comment`, `Nearby
+Tickets (<20m, other tickets)`, `Issue Type`, `Location Details (raw)`,
+`Report Details (raw)`, `Source Email ID`, `Source Filename`.
 
 `Comment` holds a Street View / Maps link found near that specific
 location in a reply (real example: *"'t Zudn, &lt;lat,lng&gt; (is here:
@@ -284,6 +331,14 @@ several emails, that can be more than one.
 
 `Nearby Tickets` lists any other ticket(s) with a location within 20m of
 this row's — see "Flagging nearby duplicate reports" below.
+
+`Issue Type`, `Location Details (raw)`, and `Report Details (raw)` are
+only written once per ticket — on that ticket's first row — and left
+blank on every other row it produced, since that text is genuinely
+per-ticket, not per-location, and a 12-location ticket repeating the
+same raw text 12 times just bloats the file. Use `Conversation ID` to
+tell which blank rows belong to which ticket. `Comment`, by contrast, is
+written on every row, since that one genuinely is per-location.
 
 The two "(raw)" columns are there so you can sanity-check or hand-correct
 a bad name/coordinate guess in a spreadsheet — there's no in-page editing
@@ -443,7 +498,24 @@ Every table row with coordinates is clickable too, independent of whether
 the map markers themselves are toggled on — click a row to jump the map
 straight to that location (centering and zooming in) and show the same
 info popup there. Since the panel is a full-screen backdrop, clicking a
-row also closes it, so the map you just navigated to is actually visible.
+row also closes it, so the map you just navigated to is actually
+visible — uncheck **Close this panel when a row jumps the map to its
+location** (below the search box) if you'd rather click through several
+rows in a row without the panel closing out from under you each time; a
+row click still centers/zooms and opens the popup either way, the panel
+just stays open too.
+
+### Live Wayspot annotation
+
+Independent of the crosses layer being on at all: click any Wayspot on
+the map (this plugin's own or an ordinary one) and, if it's within 20m
+of one of this plugin's extracted locations, its native details card in
+the side panel gets a `#<ticket>` line added just above the status
+badge — multiple matching tickets show comma-separated. This uses the
+same public side-panel service Base's own code builds that card with, so
+it adds to the real card rather than replacing it or drawing a
+lookalike; nothing shows if there's no match, same as before this
+existed.
 
 ### On the review page
 
@@ -583,11 +655,15 @@ needed since it's plain `@require`-able JS.
   suite both scripts depend on — see Requirements above).
 
 Full version-by-version detail lives in the changelog comment block at
-the top of each `.user.js` file. This README was last brought fully up
-to date at extractor v1.46.0 — the display-name shortening (v1.45.0), the
+the top of each `.user.js` file. This README is fully caught up as of
+extractor v1.46.0, including everything added between v1.26.1 (this
+file's previous checkpoint) and now: the star/favorite column and Last
+Response column (v1.31.0/v1.28.0), Import CSV (v1.34.0), the auto-close
+checkbox (v1.27.0), live Wayspot ticket annotation (v1.30.0), the
+"Show on Map" button's removal in favor of the native Layers-menu
+checkbox (v1.33.0), the display-name shortening (v1.45.0), the
 first-page-load crosses fix (v1.46.0), review-page support (v1.43.0+),
 and the Email Importer's envelope-icon integration (v1.44.0, importer
-v4.10.0+) are all reflected above. Versions between v1.26.1 and v1.42.0
-predate this pass and may include smaller fixes/features not yet
-described here — check that changelog block for anything not covered
-above.
+v4.10.0+). Smaller internal/performance-only changes in between aren't
+each individually called out here — see the changelog block itself for
+those.
