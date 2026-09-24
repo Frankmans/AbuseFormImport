@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.50.2
+// @version      1.50.3
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -15,6 +15,22 @@
 // ==/UserScript==
 
 /*
+ * v1.50.3 CHANGE FROM v1.50.2: fixes the initial render on a fresh page
+ * load showing every record as its own individual cross first, then
+ * reclustering into groups a moment later. waeComputeClusters() falls
+ * back to "every record is its own cluster" whenever the map's
+ * projection isn't ready yet -- a deliberate fallback, but one meant for
+ * a rare transient hiccup, not the normal state of the very first draw.
+ * The three places that draw immediately after first attaching to a map
+ * can all run before Google Maps has actually finished setting up that
+ * map's projection, which made the fallback the norm on a fresh load
+ * rather than the exception. waeSafeRefreshPulses()/
+ * waeSafeRefreshReviewPulses() now wait for the map's one-time
+ * 'projection_changed' event before drawing at all if the projection
+ * isn't ready yet, so the very first thing drawn is already properly
+ * clustered. See waeSafeRefreshPulses()'s own comment for why
+ * 'projection_changed' specifically, not 'idle'.
+ *
  * v1.50.2 CHANGE FROM v1.50.1: fixes mapview/submit crosses/clusters not
  * being clickable at all, even with "Clickable markers" on (its
  * default). Root cause was v1.38.0's own "BUGFIX" (see WaePulseOverlayCtor's
@@ -2688,7 +2704,20 @@
     }
   }
 
+  // Same 'projection_changed' wait as waeSafeRefreshPulses() above, for
+  // the exact same reason -- see that function's own comment. The
+  // review-page map is attached later, and typically already idle by
+  // the time waeSetReviewMap() runs (it's found via DOM search, not an
+  // onReady-style event), so this race is if anything more likely here,
+  // not less.
   function waeSafeRefreshReviewPulses() {
+    const map = WAE_REVIEW_PULSES.map;
+    if (map && typeof google !== 'undefined' && google.maps?.event && !map.getProjection()) {
+      google.maps.event.addListenerOnce(map, 'projection_changed', () => {
+        if (WAE_REVIEW_PULSES.map === map) waeSafeRefreshReviewPulses();
+      });
+      return;
+    }
     try {
       waeRefreshReviewPulses();
     } catch (e) {
@@ -2742,7 +2771,41 @@
   // Pulling that retry logic out into this one shared helper, and
   // routing every caller through it instead of the raw function, gives
   // all of them the same resilience the idle path already had.
+  // BUGFIX (not upstream): reported as "the initial render shows every
+  // record as its own individual cross, then a moment later reclusters
+  // into groups" -- waeComputeClusters() deliberately falls back to
+  // "every record is its own cluster" whenever map.getProjection() isn't
+  // available yet (see that function's own comment: that fallback exists
+  // for a DIFFERENT, more serious failure mode -- without SOME result
+  // there, a still-unready projection used to throw and leave the whole
+  // layer empty). The three callers that draw immediately after first
+  // attaching to a map (WFMM.map.onReady() in waeStartMapTracking(),
+  // waeApplyLayerEnabled()'s toggle-on path, and waeResyncMapIfVisible()
+  // at bootstrap) can all run before Google Maps has actually finished
+  // setting up that map's projection -- which is exactly the visible
+  // "unclustered flash before it settles" being reported, now that the
+  // actual THROW this fallback was originally written for is already
+  // handled elsewhere (see this function's own try/catch below). Waiting
+  // here for 'projection_changed' -- a one-time event that fires the
+  // moment a map's projection becomes available -- means the very first
+  // draw after attaching always has a real projection to cluster
+  // against, so waeComputeClusters()'s fallback is only ever reached for
+  // a genuinely transient hiccup mid-session, not as the normal outcome
+  // of every fresh page load. Deliberately NOT 'idle' (used elsewhere in
+  // this file for the same "wait for the map to be ready" purpose): idle
+  // only fires once a full pan/zoom gesture settles, and if the map had
+  // ALREADY idled once before this particular call happened to run, nothing
+  // guarantees it'll ever fire again on its own -- 'projection_changed'
+  // fires exactly once, unconditionally, the moment the projection first
+  // becomes available, regardless of the map's idle history.
   function waeSafeRefreshPulses() {
+    const map = WAE_PULSES.map;
+    if (map && typeof google !== 'undefined' && google.maps?.event && !map.getProjection()) {
+      google.maps.event.addListenerOnce(map, 'projection_changed', () => {
+        if (WAE_PULSES.map === map) waeSafeRefreshPulses();
+      });
+      return;
+    }
     try {
       waeRefreshPulses();
     } catch (e) {
