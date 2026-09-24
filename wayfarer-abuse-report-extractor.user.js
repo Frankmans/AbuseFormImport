@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.50.1
+// @version      1.50.2
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -15,6 +15,27 @@
 // ==/UserScript==
 
 /*
+ * v1.50.2 CHANGE FROM v1.50.1: fixes mapview/submit crosses/clusters not
+ * being clickable at all, even with "Clickable markers" on (its
+ * default). Root cause was v1.38.0's own "BUGFIX" (see WaePulseOverlayCtor's
+ * comment): it moved the marker div from the overlayMouseTarget pane to
+ * overlayLayer to stop crosses from visually covering real Wayspot
+ * markers, on the assumption that CSS pointer-events on the div itself
+ * would still make it clickable in whatever area wasn't covered by a
+ * real marker. Google's own Custom Overlays documentation says
+ * otherwise: overlayLayer "may not receive DOM events" at all -- a hard
+ * platform restriction, not a CSS one, so nothing about pointer-events
+ * could have ever fixed it. WaePulseOverlayCtor now uses two elements
+ * per marker: the original div stays in overlayLayer, purely visual
+ * from here on (never interactive, whatever the setting says); a second,
+ * invisible "hit" div -- same content, same position, created only
+ * while a marker is actually meant to be clickable -- lives in
+ * overlayMouseTarget (the pane Google's docs confirm does receive DOM
+ * events) and is what the click listener is actually attached to now.
+ * Review-page markers are unaffected -- they're hardcoded click-through
+ * regardless of this setting already (see v1.49.0's own entry), so
+ * WaeReviewPulseOverlayCtor never needed a hit div in the first place.
+ *
  * v1.50.1 CHANGE FROM v1.50.0: v1.50.0's fix still landed the review
  * toggle bar beside the map instead of under it -- reported back with a
  * screenshot showing it inside what looks like the review card's own
@@ -2056,30 +2077,40 @@
   // the actual fix: DOM/SVG rendering doesn't go through image decoding
   // at all, in either browser.
   //
-  // BUGFIX (not upstream): also placed in the overlayLayer pane now
-  // (matching pulse-layer.js's own choice), not overlayMouseTarget --
-  // v1.38.0 originally used overlayMouseTarget on the assumption that
-  // "clickable" meant it belonged in the pane meant for mouse events,
-  // but MapPanes' documented stacking order is mapPane < overlayLayer <
-  // markerLayer < overlayMouseTarget < floatPane: overlayMouseTarget
-  // sits ABOVE markerLayer, which is where native google.maps.Marker
-  // instances (every real Wayspot/Pok\u00e9stop/Gym/Power Spot marker,
-  // and WFMM's own submission-pin/draft markers) actually live. That
-  // put every cross/cluster visually on top of real markers underneath
-  // it, capable of covering them, the opposite of the layering a
-  // "where are there abuse reports" overlay should have relative to the
-  // markers actually being reported on. overlayLayer sits BELOW
-  // markerLayer, so real markers now stay visually on top and remain
-  // clickable through this layer wherever the two overlap -- a cross is
-  // only clickable in the areas no real marker is covering it, which is
-  // the intended trade-off, not a bug: this is context for what's
-  // underneath, not itself the thing meant to take priority for clicks.
-  // Explicit pointer-events (see the CSS: base class none, the
-  // wae-pulse-clickable modifier auto) is still what makes the divs
-  // clickable at all in their own uncovered area -- overlayLayer being a
-  // lower, conventionally-non-interactive pane doesn't block that; CSS
-  // pointer-events on a specific element always overrides whatever an
-  // ancestor pane's own default is.
+  // BUGFIX (not upstream): the VISIBLE div lives in the overlayLayer
+  // pane (matching pulse-layer.js's own choice), not overlayMouseTarget
+  // -- v1.38.0 originally used overlayMouseTarget, which put every
+  // cross/cluster visually ABOVE real markers (MapPanes' documented
+  // stacking order is mapPane < overlayLayer < markerLayer <
+  // overlayMouseTarget < floatPane -- native Wayspot/Pok\u00e9stop/Gym/
+  // Power Spot markers, and WFMM's own submission-pin/draft markers,
+  // live in markerLayer, below overlayMouseTarget), capable of covering
+  // them -- the opposite of the layering a "where are there abuse
+  // reports" overlay should have relative to the markers actually being
+  // reported on. overlayLayer sits below markerLayer, so real markers
+  // now stay visually on top.
+  //
+  // BUGFIX (not upstream), v1.50.2: that move to overlayLayer was
+  // believed to keep the div clickable in its own uncovered area (CSS
+  // pointer-events on a specific element overrides an ancestor pane's
+  // own default, so the reasoning went) -- reported back as simply not
+  // clickable ANYWHERE, not just narrowed to uncovered area, and
+  // Google's own Custom Overlays documentation confirms why: overlayLayer
+  // "may not receive DOM events" at all, a hard platform restriction
+  // with nothing CSS can override, unlike overlayMouseTarget, which
+  // explicitly "contains elements that receive DOM events." No single
+  // pane is both "receives clicks" and "paints below markerLayer," so
+  // this now uses two elements per marker instead of one: the ORIGINAL
+  // visible div stays in overlayLayer, purely cosmetic now (never
+  // interactive, whatever appearance.clickable says); a second,
+  // invisible "hit" div -- same SVG content, same draw() position, only
+  // ever created while appearance.clickable is on -- lives in
+  // overlayMouseTarget and is what the click listener actually attaches
+  // to. Invisible (opacity:0 in CSS, not visibility/display, so it
+  // still receives events) rather than removed-but-present, so it never
+  // changes what's on screen; visually indistinguishable from a single
+  // div that was simply clickable, while still painting below real
+  // markers the way the visible div does.
   //
   // Everything OUTSIDE this class -- the diffing loop in
   // waeRefreshPulses(), waeClearPulses(), the WAE_PULSES.markersById Map
@@ -2095,43 +2126,42 @@
       constructor() {
         super();
         this.div = null;
+        this.hitDiv = null;
         this.latLng = null;
         this.cluster = null;
         this._html = '';
         this._title = '';
         this._clickable = true;
       }
+      // Attached to hitDiv's own click listener (see applyToDiv()) --
+      // hitDiv only ever exists while this._clickable is on, so there's
+      // no need to re-check appearance.clickable in here.
+      _handleClick(ev) {
+        ev.stopPropagation();
+        const c = this.cluster;
+        if (!c) return;
+        if (c.records.length > 1) {
+          WAE_PULSES.map.setCenter(this.latLng);
+          // Jumps straight to zoom 20 (not just "a few levels in") --
+          // a relative +3 from wherever the map happened to already be
+          // could still land inside another cluster's pixel radius at
+          // low starting zooms, leaving the click looking like it did
+          // nothing. Zoom 20 is deep enough that this plugin's own
+          // clustering (WAE_CLUSTER_PIXEL_RADIUS, in screen pixels)
+          // reliably splits every real-world cluster back into
+          // individual markers. Only ever zooms IN to reach it -- if
+          // already deeper than 20, stays there rather than zooming out.
+          WAE_PULSES.map.setZoom(Math.max(WAE_PULSES.map.getZoom() || 8, 20));
+        } else {
+          waeShowPulseInfoWindow(c.records[0], this.latLng);
+        }
+      }
       onAdd() {
         const div = document.createElement('div');
         div.className = 'wae-pulse-marker';
-        div.addEventListener('click', (ev) => {
-          // Only actually reachable when this.div carries
-          // wae-pulse-clickable -- see applyToDiv() -- since the base
-          // class has pointer-events:none, so there's no need to
-          // separately re-check appearance.clickable in here: a click
-          // event on this div, at all, already implies it's on.
-          ev.stopPropagation();
-          const c = this.cluster;
-          if (!c) return;
-          if (c.records.length > 1) {
-            WAE_PULSES.map.setCenter(this.latLng);
-            // Jumps straight to zoom 20 (not just "a few levels in") --
-            // a relative +3 from wherever the map happened to already be
-            // could still land inside another cluster's pixel radius at
-            // low starting zooms, leaving the click looking like it did
-            // nothing. Zoom 20 is deep enough that this plugin's own
-            // clustering (WAE_CLUSTER_PIXEL_RADIUS, in screen pixels)
-            // reliably splits every real-world cluster back into
-            // individual markers. Only ever zooms IN to reach it -- if
-            // already deeper than 20, stays there rather than zooming out.
-            WAE_PULSES.map.setZoom(Math.max(WAE_PULSES.map.getZoom() || 8, 20));
-          } else {
-            waeShowPulseInfoWindow(c.records[0], this.latLng);
-          }
-        });
         this.div = div;
-        this.applyToDiv();
         this.getPanes().overlayLayer.appendChild(div);
+        this.applyToDiv();
         this.draw();
       }
       draw() {
@@ -2140,10 +2170,16 @@
         if (!point) return;
         this.div.style.left = `${point.x}px`;
         this.div.style.top = `${point.y}px`;
+        if (this.hitDiv) {
+          this.hitDiv.style.left = `${point.x}px`;
+          this.hitDiv.style.top = `${point.y}px`;
+        }
       }
       onRemove() {
         this.div?.remove();
         this.div = null;
+        this.hitDiv?.remove();
+        this.hitDiv = null;
       }
       getPosition() {
         return this.latLng;
@@ -2152,7 +2188,26 @@
         if (!this.div) return;
         this.div.innerHTML = this._html;
         this.div.title = this._title;
-        this.div.classList.toggle('wae-pulse-clickable', this._clickable);
+        // hitDiv is created lazily, only once actually needed, and torn
+        // down again the moment it isn't -- no point keeping an extra
+        // per-marker DOM node (and its own listener) around for markers
+        // that will never be clickable, e.g. with the "Clickable
+        // markers" setting off.
+        if (this._clickable && !this.hitDiv) {
+          const hitDiv = document.createElement('div');
+          hitDiv.className = 'wae-pulse-marker wae-pulse-hit wae-pulse-clickable';
+          hitDiv.addEventListener('click', (ev) => this._handleClick(ev));
+          this.hitDiv = hitDiv;
+          this.getPanes()?.overlayMouseTarget.appendChild(hitDiv);
+          this.draw(); // hitDiv just got created -- give it a position immediately, don't wait for the next draw() pass
+        } else if (!this._clickable && this.hitDiv) {
+          this.hitDiv.remove();
+          this.hitDiv = null;
+        }
+        if (this.hitDiv) {
+          this.hitDiv.innerHTML = this._html;
+          this.hitDiv.title = this._title;
+        }
       }
       // Called every refresh pass, for both a brand-new overlay and one
       // being reused for the same cluster key -- same "always reapply
@@ -2175,6 +2230,7 @@
     };
     return true;
   }
+
 
   // Same shape/draw/click logic as WaePulseOverlayCtor above, just wired
   // to WAE_REVIEW_PULSES instead of WAE_PULSES -- kept as a genuinely
@@ -3852,6 +3908,14 @@
     .wae-pulse-marker{ position:absolute; transform:translate(-50%, -50%); pointer-events:none; line-height:0; }
     .wae-pulse-marker.wae-pulse-clickable{ pointer-events:auto; cursor:pointer; }
     .wae-pulse-marker svg{ display:block; }
+    /* The invisible click-target twin WaePulseOverlayCtor's applyToDiv()
+       creates in overlayMouseTarget -- see that class's own comment for
+       why a second element is needed at all. opacity:0 (not visibility
+       or display) so it still receives the DOM events overlayMouseTarget
+       exists for, while never changing what's actually on screen -- the
+       ORIGINAL div, still in overlayLayer, is what renders the visible
+       cross/cluster graphic. */
+    .wae-pulse-hit{ opacity:0; }
     .wae-pulse-count{ position:absolute; top:50%; left:50%; transform:translate(-50%, -50%); color:#ffffff; font-size:10px; font-weight:700; pointer-events:none; user-select:none; }
     .wae-progress{ font-size:11px; color:#2563eb; margin:4px 0; min-height:14px; }
     .wae-log{ margin-top:8px; max-height:110px; overflow-y:auto; font-size:11px; line-height:1.5; }
