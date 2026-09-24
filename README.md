@@ -436,9 +436,12 @@ The extractor panel has a search box above the table. It filters against
 name, conversation ID, comment, issue type, both raw text fields, and the
 source filename/email ID — not just what's shown in the columns, since a
 query is more likely to hit the raw `Location Details`/`Report Details`
-text than the best-guess name. It only changes what's *displayed* —
-**Export CSV**, the map crosses (Layers menu), and the summary counts
-above the table all still reflect everything, not just the
+text than the best-guess name. A leading `#` is stripped before matching,
+so `#12345` finds the same reports plain `12345` does — handy since Live
+Wayspot annotation (see "Plotting on the map" above) shows ticket
+references on the map itself in that `#12345` form. It only changes what's
+*displayed* — **Export CSV**, the map crosses (Layers menu), and the
+summary counts above the table all still reflect everything, not just the
 currently-filtered rows.
 Typing is debounced (200ms) rather than filtering on every keystroke.
 
@@ -534,21 +537,28 @@ pages was a deliberate requirement, not an oversight, so review support
 gets its own small toggle rather than adding a second checkbox to a menu
 that otherwise doesn't apply there. The toggle defaults on, and — same
 as the mapview/submit crosses — its color follows Wayfarer's own dark
-mode correctly, not just your OS/browser's light-dark setting.
+mode correctly, not just your OS/browser's light-dark setting. Review
+markers are always click-through, regardless of the "Clickable markers"
+setting under Marker Style — see that section below for why.
 
 ### Marker Style
 
 Opened via the small cog icon next to the Abuse Reports panel's summary
 line (see "Where to find things" above), this section covers: color,
 size, fill opacity, ring color/width/opacity for the cluster badges, and
-a **Clickable markers** toggle (turn it off to let clicks pass through to
-whatever's underneath — the map itself, or a Wayspot marker at the same
-spot — instead of opening this plugin's own popup). Changes apply live if
-markers are already showing (both mapview/submit crosses and the
-review-page markers). The individual-report X shape itself stays fixed
-by design — it's meant to read as "a problem here," distinct from an
-ordinary POI dot — only its color and size are adjustable; the cluster
-badge, already a filled circle, gets the full set of controls.
+a **Clickable markers (mapview/submit only)** toggle (turn it off to let
+clicks pass through to whatever's underneath — the map itself, or a
+Wayspot marker at the same spot — instead of opening this plugin's own
+popup). As the label says, that toggle only ever governs the
+mapview/submit crosses — review-page markers are always click-through,
+regardless of this setting, since a click there is far more likely meant
+for the review UI underneath (selecting a duplicate candidate, etc.)
+than for this plugin's own popup or cluster-zoom. Color/size/opacity
+changes still apply live to both surfaces if markers are already
+showing. The individual-report X shape itself stays fixed by design —
+it's meant to read as "a problem here," distinct from an ordinary POI
+dot — only its color and size are adjustable; the cluster badge, already
+a filled circle, gets the full set of controls.
 
 These settings are also registered with `WFMM.markerAppearance` (the
 suite's own marker-styling engine), so this is a real, discoverable style
@@ -650,13 +660,13 @@ needed since it's plain `@require`-able JS.
 ## Versions covered by this README
 
 - `wayfarer-abuse-email-importer.user.js` — v4.10.2
-- `wayfarer-abuse-report-extractor.user.js` — v1.46.0
+- `wayfarer-abuse-report-extractor.user.js` — v1.49.1
 - Verified against `wayfarer-map-mods.user.js` v4.3.0 (the consolidated
   suite both scripts depend on — see Requirements above).
 
 Full version-by-version detail lives in the changelog comment block at
 the top of each `.user.js` file. This README is fully caught up as of
-extractor v1.46.0, including everything added between v1.26.1 (this
+extractor v1.49.1, including everything added between v1.26.1 (this
 file's previous checkpoint) and now: the star/favorite column and Last
 Response column (v1.31.0/v1.28.0), Import CSV (v1.34.0), the auto-close
 checkbox (v1.27.0), live Wayspot ticket annotation (v1.30.0), the
@@ -664,6 +674,9 @@ checkbox (v1.27.0), live Wayspot ticket annotation (v1.30.0), the
 checkbox (v1.33.0), the display-name shortening (v1.45.0), the
 first-page-load crosses fix (v1.46.0), review-page support (v1.43.0+),
 and the Email Importer's envelope-icon integration (v1.44.0, importer
-v4.10.0+). Smaller internal/performance-only changes in between aren't
-each individually called out here — see the changelog block itself for
-those.
+v4.10.0+). Since then: the review toggle bar's position-tracking fix
+(v1.47.0), cluster clicks jumping to a fixed zoom 20 (v1.48.0),
+review-page markers being permanently click-through (v1.49.0), and
+search matching a leading "#" the same as no "#" (v1.49.1). Smaller
+internal/performance-only changes in between aren't each individually
+called out here — see the changelog block itself for those.

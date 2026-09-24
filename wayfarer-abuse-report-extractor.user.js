@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.46.0
+// @version      1.50.1
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -15,6 +15,118 @@
 // ==/UserScript==
 
 /*
+ * v1.50.1 CHANGE FROM v1.50.0: v1.50.0's fix still landed the review
+ * toggle bar beside the map instead of under it -- reported back with a
+ * screenshot showing it inside what looks like the review card's own
+ * side panel. Root cause: v1.50.0 tried to force the map's EXISTING
+ * row/grid parent to wrap the bar onto a new line (flex-wrap:wrap +
+ * flex-basis:100%, or grid-column:1/-1), which only works if nothing
+ * else keeps re-asserting the row/grid's own layout after our styles
+ * are applied -- Wayfarer's own layout code (or Angular re-running a
+ * template binding) can simply do that, and there's no reliable way
+ * from outside to tell whether it will. waePlaceReviewToggle() no
+ * longer touches the map's original parent's layout at all: it now
+ * moves host into a small wrapper div this plugin fully owns (copying
+ * host's own resolved row/grid-placement properties onto the wrapper
+ * first, so the wrapper keeps host's original footprint), then stacks
+ * host and the bar inside that wrapper with a plain flex column this
+ * plugin controls end to end -- so nothing about the site's own layout
+ * has any say over whether the two end up on the same line. See
+ * waeInjectReviewToggle()'s and waePlaceReviewToggle()'s own comments.
+ *
+ * v1.50.0 CHANGE FROM v1.49.1: the review-page toggle bar is back to
+ * living in the page's own layout instead of floating over it --
+ * v1.47.0 had moved it to position:fixed on document.body (recomputing
+ * top/left/width from the map's own getBoundingClientRect() every
+ * resize/scroll/idle tick) because a plain insertBefore() landed it
+ * beside the map on review cards with a flex/grid row (map + photo
+ * carousel). That fixed it, but the visible cost was a bar that visibly
+ * lagged a frame behind the page during scroll/resize/card transitions
+ * -- looking like it was "floating around" rather than part of the UI.
+ * waeInjectReviewToggle() now inserts the bar as host's own next DOM
+ * sibling again (normal flow, no getBoundingClientRect tracking, no
+ * resize/scroll listeners), but waePlaceReviewToggle() checks how that
+ * shared parent actually lays out its children first: if it's a flex
+ * row, the parent gets flex-wrap:wrap and the bar gets flex-basis:100%,
+ * which forces it onto its own full-width line below whatever else is
+ * in that row (map + carousel keep sitting side by side above it, per
+ * the original ask that it never share a line with anything); if it's
+ * a grid, the bar gets grid-column:1/-1 to span every column the same
+ * way; otherwise it's already alone on its own line for free, same as
+ * v1.43.0's original approach. Position tracking
+ * (waePositionReviewToggle(), waeStart/StopReviewTogglePositionTracking())
+ * is removed entirely -- nothing to recompute once the bar is back in
+ * normal flow. See waeInjectReviewToggle()/waePlaceReviewToggle()'s own
+ * comments and the CSS block's for the rest.
+ *
+ * v1.49.1 CHANGE FROM v1.49.0: search now strips a leading "#" from the
+ * query before matching, so "#12345" finds the same reports plain
+ * "12345" already did -- conversationId is never stored with a leading
+ * "#", so the two used to be genuinely different substrings and
+ * "#12345" matched nothing. Worth fixing specifically because Live
+ * Wayspot annotation (see the README) shows ticket references on the
+ * map itself as "#12345, #67890" -- exactly the format someone reading
+ * that off the map would naturally paste into this search box. See
+ * waeMatchesQuery()'s own comment.
+ *
+ * v1.49.0 CHANGE FROM v1.48.0: review-page markers are now always
+ * click-through, regardless of the "Clickable markers" setting --
+ * WaeReviewPulseOverlayCtor's own setCluster() used to follow that same
+ * shared appearance.clickable setting as the mapview/submit crosses
+ * (WaePulseOverlayCtor's setCluster()), but a click on the review page
+ * is far more likely meant for the actual review UI underneath
+ * (selecting a duplicate candidate, etc.) than for this plugin's own
+ * popup/cluster-zoom, so this surface now hardcodes _clickable = false
+ * rather than reading the setting at all. The mapview/submit crosses are
+ * unchanged -- still follow "Clickable markers" normally. Relabeled that
+ * checkbox to "Clickable markers (mapview/submit only)" in the Marker
+ * Style section so it doesn't read as covering both surfaces anymore.
+ *
+ * v1.48.0 CHANGE FROM v1.47.0: clicking a cluster badge now jumps
+ * straight to zoom 20, on both the mapview/submit crosses and the
+ * review-page markers -- replaces the old relative "+3 from wherever the
+ * map already was, capped at 21" behavior, which could land back inside
+ * another cluster's own pixel radius at low starting zooms (clicking a
+ * cluster while zoomed way out, say, only reached zoom 11), making the
+ * click look like it hadn't done anything. Only ever zooms IN to reach
+ * 20 -- Math.max(), not Math.min() -- so it never zooms back OUT if
+ * already deeper than that. See WaePulseOverlayCtor's click handler
+ * comment (and the identical one on WaeReviewPulseOverlayCtor) for the
+ * full reasoning.
+ *
+ * v1.47.0 CHANGE FROM v1.46.0: fixes the review-page toggle bar not
+ * always landing above the map -- reported in the field (screenshot) as
+ * sitting to the LEFT of the map instead, in a card with a photo
+ * carousel next to the map. Root cause: v1.43.0's original approach
+ * inserted the bar as a normal sibling right before the map element
+ * (host.parentElement.insertBefore(bar, host)), which only stacks
+ * visually above the map if that parent happens to lay its children out
+ * in a column -- on a review card where the map's own immediate parent
+ * turned out to be a flex/grid ROW (map + photo side by side), the
+ * inserted bar just became another item in that row instead. There's no
+ * single assumption about the map's parent's layout that holds across
+ * every review card type, so no tweak to insertBefore()'s target would
+ * have reliably fixed this for all of them.
+ *
+ * Fixed by taking the bar out of the review page's own layout entirely:
+ * appended straight to document.body and positioned with
+ * `position: fixed`, with top/left/width computed in JS from the map's
+ * own getBoundingClientRect() (waePositionReviewToggle()) -- recomputed
+ * on every map 'idle', on window resize/scroll (capture phase, since a
+ * nested scrollable review card's own scroll doesn't bubble to window by
+ * default), and as a cheap fallback on every periodic recheck tick. This
+ * also brought back a real opaque background/shadow on the bar (briefly
+ * dropped in v1.43.1 in favor of plain color-flipped text) -- a floating
+ * overlay that can now end up positioned over genuinely arbitrary
+ * content needs its own background to stay legible, the same reason any
+ * tooltip/HUD element has one; and switched dark-mode detection from a
+ * ".dark .wae-review-toggle-bar" descendant selector (v1.43.2's fix for
+ * Wayfarer's own in-app dark mode) to a class this script sets directly
+ * on the bar from host.closest('.dark') -- the descendant selector
+ * depended on the bar still being nested inside whatever ancestor
+ * carries that class, which moving it to document.body broke. See
+ * waeInjectReviewToggle()'s own comment for the full explanation.
+ *
  * v1.46.0 CHANGE FROM v1.45.0: fixes crosses not appearing on first page
  * load -- reported in the field as: nothing shows until the panel is
  * opened AND THEN the map is panned/zoomed, and toggling the "Abuse
@@ -1829,6 +1941,19 @@
   // locationDetails/reportDetails text too, since a query like a street
   // name or an issue keyword is more likely to hit those than the
   // best-guess Wayspot name.
+  //
+  // BUGFIX (not upstream, feature request): a query starting with "#"
+  // used to fail to match anything, even for a ticket number that
+  // otherwise matches fine on its own -- conversationId itself is never
+  // stored with a leading "#", so "#12345".includes(...) against a
+  // haystack containing plain "12345" is a real substring mismatch, not
+  // a false positive being avoided. This matters in practice because the
+  // Live Wayspot annotation feature (see the README) shows ticket
+  // references on the map itself as "#12345, #67890" -- the exact format
+  // someone reading that off the map and pasting into this search box
+  // would naturally type. Stripped here (leading "#"s only -- there's no
+  // legitimate reason a real query would start with one otherwise) so
+  // "#12345" and "12345" search identically.
   function waeMatchesQuery(r, q) {
     if (!q) return true;
     if (!r._waeHaystack) {
@@ -1838,7 +1963,7 @@
         waeStatusLabel(r.ticketStatus),
       ].filter(Boolean).join('\n').toLowerCase();
     }
-    return r._waeHaystack.includes(q);
+    return r._waeHaystack.includes(q.replace(/^#+/, ''));
   }
   // Built lazily and cached -- same icon object reused for every marker
   // instead of rebuilt per-call. Invalidated (set back to null) by
@@ -1990,7 +2115,16 @@
           if (!c) return;
           if (c.records.length > 1) {
             WAE_PULSES.map.setCenter(this.latLng);
-            WAE_PULSES.map.setZoom(Math.min((WAE_PULSES.map.getZoom() || 8) + 3, 21));
+            // Jumps straight to zoom 20 (not just "a few levels in") --
+            // a relative +3 from wherever the map happened to already be
+            // could still land inside another cluster's pixel radius at
+            // low starting zooms, leaving the click looking like it did
+            // nothing. Zoom 20 is deep enough that this plugin's own
+            // clustering (WAE_CLUSTER_PIXEL_RADIUS, in screen pixels)
+            // reliably splits every real-world cluster back into
+            // individual markers. Only ever zooms IN to reach it -- if
+            // already deeper than 20, stays there rather than zooming out.
+            WAE_PULSES.map.setZoom(Math.max(WAE_PULSES.map.getZoom() || 8, 20));
           } else {
             waeShowPulseInfoWindow(c.records[0], this.latLng);
           }
@@ -2072,7 +2206,9 @@
           if (!c) return;
           if (c.records.length > 1) {
             WAE_REVIEW_PULSES.map.setCenter(this.latLng);
-            WAE_REVIEW_PULSES.map.setZoom(Math.min((WAE_REVIEW_PULSES.map.getZoom() || 8) + 3, 21));
+            // Same fix, same reasoning as WaePulseOverlayCtor's own click
+            // handler above -- see its comment.
+            WAE_REVIEW_PULSES.map.setZoom(Math.max(WAE_REVIEW_PULSES.map.getZoom() || 8, 20));
           } else {
             waeShowReviewPulseInfoWindow(c.records[0], this.latLng);
           }
@@ -2109,7 +2245,17 @@
         const shapeSvg = isClusterMarker ? waeGetClusterSvgMarkup(isExpanded) : waeGetMarkerSvgMarkup();
         this._html = isClusterMarker ? `${shapeSvg}<span class="wae-pulse-count">${cluster.records.length}</span>` : shapeSvg;
         this._title = isClusterMarker ? `${cluster.records.length} reports` : (cluster.records[0].wayspotName || '(unnamed report)');
-        this._clickable = !!appearance.clickable;
+        // BUGFIX (not upstream, feature request): always false here,
+        // deliberately NOT appearance.clickable -- review-page markers
+        // are meant to stay click-through no matter what the shared
+        // "Clickable markers" setting says, since a click on the review
+        // page is much more likely meant for the actual review UI
+        // underneath (selecting a duplicate candidate, etc.) than for
+        // this plugin's own popup/cluster-zoom. The mapview/submit
+        // crosses (WaePulseOverlayCtor's own setCluster(), earlier in
+        // this file) still follow that setting normally -- this is the
+        // one place the two surfaces are meant to diverge on it.
+        this._clickable = false;
         this.applyToDiv();
         this.draw();
       }
@@ -2766,6 +2912,7 @@
   // extra elements when only one is really present.
   const WAE_REVIEW_TOGGLE_KEY = 'wae_review_pulses_visible';
   const WAE_REVIEW_TOGGLE_ID = 'wae-review-toggle-bar';
+  const WAE_REVIEW_TOGGLE_WRAP_ID = 'wae-review-toggle-wrap';
   // Defaults ON (unlike WAE_LAYER_ID's mapview/submit crosses, which
   // default off via the native Layers menu) -- this is the one thing the
   // whole feature exists to show, and it's opt-OUT via the toggle bar
@@ -2961,17 +3108,46 @@
     }
   }
 
-  // Toggle bar injected directly above whichever <nia-map> element the
-  // currently-attached review map came from (host.parentElement.insertBefore),
-  // rather than into Map Mods' own Settings side panel -- see this
-  // section's own top comment for why the side panel specifically stays
-  // off-limits here. Self-contained, opaque background (not inherited/
-  // transparent) so it reads clearly against both Wayfarer's light and
-  // dark page themes rather than depending on knowing which CSS class or
-  // media feature the site itself uses for dark mode -- see the STYLE
-  // block's own ".wae-review-toggle-bar" rules for the light/dark pair.
+  // Toggle bar embedded in the review page's own layout, directly below
+  // whichever <nia-map> element the currently-attached review map came
+  // from -- a real DOM descendant of host's own parent again (normal
+  // flow, no fixed positioning, no getBoundingClientRect tracking),
+  // which is what "embedded in the UI" means here: it scrolls, resizes
+  // and reflows with the page instead of a script re-synchronizing a
+  // floating copy against it a frame later.
+  //
+  // v1.43.0's original version of this (host.parentElement.insertBefore
+  // (bar, host)) broke on review cards where the map's immediate parent
+  // turned out to be a flex/grid ROW (map + photo carousel side by
+  // side, confirmed in the field via screenshot) rather than a simple
+  // stacked column -- inserting a second child there just became
+  // another item in that row. v1.47.0 sidestepped that with
+  // position:fixed on document.body, which fixed the placement but
+  // introduced the floating/lagging look. v1.50.0 tried forcing the
+  // existing row to wrap (flex-wrap:wrap/grid-column:1/-1 on the bar
+  // itself) instead -- reported back still landing beside the map,
+  // confirming that guessing at and overriding the SITE'S OWN row/grid
+  // settings from outside isn't reliable (Wayfarer's own layout code
+  // can simply re-apply whatever it was already doing).
+  //
+  // waePlaceReviewToggle() below takes a different approach that
+  // doesn't depend on any of that: it moves host itself inside a new
+  // wrapper div this plugin fully owns, with the wrapper -- not host --
+  // now occupying host's old slot in whatever row/grid the review card
+  // uses. Host's own placement/sizing rules (an external "nia-map{...}"
+  // stylesheet rule, an inline style, or an Angular binding -- whichever
+  // it was) still apply to host wherever it's nested, but the ones that
+  // controlled HOW MUCH SPACE THE ROW GAVE IT (flex-grow/shrink/basis,
+  // grid-column/row/area, width) only matter for whatever element is
+  // the row's DIRECT child -- so those are read off host's *computed*
+  // style (the resolved value, however it got there) and copied onto
+  // the wrapper before host moves, giving the wrapper the same
+  // footprint host used to have. Inside that wrapper, host and the bar
+  // are stacked in a plain flex column this plugin controls end to end,
+  // so nothing about the site's own row/grid settings has any say over
+  // whether they end up on the same line -- they can't, structurally.
   function waeInjectReviewToggle(host) {
-    if (!host || !host.parentElement) return;
+    if (!host) return;
     let bar = document.getElementById(WAE_REVIEW_TOGGLE_ID);
     if (!bar) {
       bar = document.createElement('div');
@@ -2993,14 +3169,73 @@
       bar.appendChild(label);
       bar.appendChild(btn);
     }
-    if (bar.parentElement !== host.parentElement || bar.nextSibling !== host) {
-      host.parentElement.insertBefore(bar, host);
-    }
+    waeReviewToggleHost = host;
+    waePlaceReviewToggle(host, bar);
+    // Back to living inside Wayfarer's own app tree (a genuine DOM
+    // descendant of host's parent), so the bar and whatever ancestor
+    // carries Wayfarer's in-app ".dark" class are in the same subtree
+    // again -- but this still checks host.closest('.dark') directly and
+    // applies the result as our own class, rather than reintroducing a
+    // ".dark .wae-review-toggle-bar" descendant selector, since that's
+    // one less thing that can silently stop matching if the bar's exact
+    // DOM position ever moves again in a future version.
+    bar.classList.toggle('wae-review-dark', !!host.closest('.dark'));
     waeUpdateReviewToggleUi();
   }
 
+  // Moves host inside a wrapper div this plugin owns (if it isn't
+  // already), copying host's computed row/grid-placement properties
+  // onto the wrapper first so the wrapper keeps host's original
+  // footprint in the surrounding page, then stacks host and bar
+  // vertically inside that wrapper via a plain flex column -- see
+  // waeInjectReviewToggle()'s own comment for why this replaced trying
+  // to make the SITE'S row/grid wrap the bar onto its own line instead.
+  // 'height' is deliberately left off the copied-property list: copying
+  // host's own resolved height onto the wrapper would cap the wrapper
+  // at exactly the map's height, leaving no room for the bar and
+  // squeezing the map to fit both inside that fixed height instead.
+  // Leaving it off means the wrapper has no explicit height of its own
+  // and simply grows to fit its two stacked children (host at whatever
+  // height it already had, plus the bar) -- taller than a single
+  // grid/flex row might otherwise expect, which is an acceptable
+  // trade-off next to squeezing the actual map.
+  // Idempotent and re-run on every waeInjectReviewToggle() call (not
+  // just the first): the map's host element can get replaced wholesale
+  // by Angular re-rendering a review card (see waeSetReviewMap()'s own
+  // comment), and a fresh host may or may not land back inside the same
+  // wrapper depending on how much of the surrounding DOM Angular
+  // recreated -- checking parentElement's id on every call re-wraps a
+  // host that came back outside our old wrapper, and is a cheap no-op
+  // for one that's still inside it.
+  const WAE_REVIEW_WRAP_COPIED_PROPS = [
+    'flexGrow', 'flexShrink', 'flexBasis', 'alignSelf', 'justifySelf',
+    'gridColumn', 'gridRow', 'gridArea', 'width', 'minWidth', 'maxWidth',
+  ];
+  function waePlaceReviewToggle(host, bar) {
+    let wrap = host.parentElement;
+    if (!wrap || wrap.id !== WAE_REVIEW_TOGGLE_WRAP_ID) {
+      const originalParent = host.parentElement;
+      if (!originalParent) return;
+      wrap = document.createElement('div');
+      wrap.id = WAE_REVIEW_TOGGLE_WRAP_ID;
+      const hostComputed = getComputedStyle(host);
+      for (const prop of WAE_REVIEW_WRAP_COPIED_PROPS) wrap.style[prop] = hostComputed[prop];
+      wrap.style.display = 'flex';
+      wrap.style.flexDirection = 'column';
+      wrap.style.minWidth = wrap.style.minWidth || '0'; // avoid flex-content overflow
+      originalParent.insertBefore(wrap, host);
+      wrap.appendChild(host);
+    }
+    if (bar.parentElement !== wrap || bar.previousElementSibling !== host) {
+      wrap.appendChild(bar); // (re-)place as wrap's last child, right after host
+    }
+  }
+
+  let waeReviewToggleHost = null;
+
   function waeRemoveReviewToggle() {
     document.getElementById(WAE_REVIEW_TOGGLE_ID)?.remove();
+    waeReviewToggleHost = null;
   }
 
   function waeUpdateReviewToggleUi() {
@@ -3709,47 +3944,52 @@
     .wae-nearby-item:hover{ background:#fffbeb; }
 
     /* Review page (/new/review) toggle bar -- see waeInjectReviewToggle()'s
-       own comment. Color-flipped by Wayfarer's own ".dark" ancestor class
-       (confirmed against Map Mods' own source -- e.g. its
-       ".dark .wfmm-contribution-tags-section" rules etc. -- every one of
-       Base's own dark-mode-aware styles keys off that same class on a
-       page-level ancestor, not the OS-level prefers-color-scheme media
-       feature) -- BUGFIX: this used to key off prefers-color-scheme
-       instead, which reads the OS/browser's own light/dark setting, NOT
-       Wayfarer's own in-app dark mode toggle -- the two can (and did, in
-       the field) disagree, leaving black-on-dark, unreadable text
-       whenever the browser was in light mode but the reviewer had
-       Wayfarer's own dark mode on. Since this bar is inserted as a
-       descendant of the review page's own DOM (right before whichever
-       <nia-map> it's anchored to), plain descendant selectors here work
-       the same way Base's own ".dark ..." rules do -- no separate
-       detection needed. The prefers-color-scheme block stays too, purely
-       as a fallback for the (currently unobserved) case of no ".dark"
-       ancestor at all; ".dark" always wins when both could apply, since
-       its selector is more specific either way. */
+       and waePlaceReviewToggle()'s own comments for the full history.
+       Lives in the page's own normal flow, directly under host inside
+       waePlaceReviewToggle()'s own wrapper div (no position:fixed, no
+       JS-computed top/left) -- v1.47.0's fixed-on-document.body version
+       fixed a real placement bug but left the bar visibly floating a
+       frame behind the page during scroll/resize; the wrapper's flex
+       column keeps it pinned directly under the map without that.
+       Kept its own opaque background/border/shadow even though it's
+       embedded now rather than floating over arbitrary content --
+       review cards can still place it next to a photo carousel or
+       other non-uniform background, and it doubles as a visual
+       separator between the map and whatever the reviewer's own
+       controls render right below this bar.
+       Dark/light color pair is chosen by the .wae-review-dark class,
+       which waeInjectReviewToggle() sets directly on the bar itself from
+       host.closest('.dark') rather than a ".dark .wae-review-toggle-bar"
+       descendant selector, so it keeps working regardless of exactly
+       where in the DOM the bar ends up relative to whatever ancestor
+       carries that class. The prefers-color-scheme block stays too,
+       purely as a fallback for the (currently unobserved) case of no
+       ".dark" ancestor at all. */
     .wae-review-toggle-bar{
+      position:static; box-sizing:border-box;
       display:flex; align-items:center; justify-content:space-between; gap:10px;
-      margin:0 0 6px; padding:2px 2px;
-      color:#111827;
+      margin:6px 0; padding:6px 10px; border-radius:6px;
+      background:#ffffff; color:#111827; border:1px solid #d1d5db;
+      box-shadow:0 1px 3px rgba(0,0,0,0.15);
       font-family:Roboto, Arial, sans-serif; font-size:12px; font-weight:600;
     }
-    .wae-review-toggle-label{ white-space:nowrap; }
+    .wae-review-toggle-label{ white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
     .wae-review-toggle-btn{
       min-width:44px; padding:3px 10px; border-radius:9999px; cursor:pointer;
-      font-size:11px; font-weight:700; line-height:1.4;
+      font-size:11px; font-weight:700; line-height:1.4; flex-shrink:0;
       background:transparent; color:#111827; border:1px solid currentColor;
     }
     .wae-review-toggle-btn.wae-review-toggle-on{
       background:#16a34a; color:#ffffff; border-color:#15803d;
     }
     @media (prefers-color-scheme: dark){
-      .wae-review-toggle-bar{ color:#f9fafb; }
+      .wae-review-toggle-bar{ background:#1f2937; color:#f9fafb; border-color:#4b5563; box-shadow:0 2px 6px rgba(0,0,0,0.5); }
       .wae-review-toggle-btn{ color:#f9fafb; }
       .wae-review-toggle-btn.wae-review-toggle-on{ background:#22c55e; color:#052e16; border-color:#16a34a; }
     }
-    .dark .wae-review-toggle-bar{ color:#f9fafb; }
-    .dark .wae-review-toggle-btn{ color:#f9fafb; }
-    .dark .wae-review-toggle-btn.wae-review-toggle-on{ background:#22c55e; color:#052e16; border-color:#16a34a; }
+    .wae-review-toggle-bar.wae-review-dark{ background:#1f2937; color:#f9fafb; border-color:#4b5563; box-shadow:0 2px 6px rgba(0,0,0,0.5); }
+    .wae-review-toggle-bar.wae-review-dark .wae-review-toggle-btn{ color:#f9fafb; }
+    .wae-review-toggle-bar.wae-review-dark .wae-review-toggle-btn.wae-review-toggle-on{ background:#22c55e; color:#052e16; border-color:#16a34a; }
   `;
 
   function log(container, msg, cls) {
@@ -4286,7 +4526,7 @@
       },
     });
     const styleClickableToggle = ui.checkboxRow({
-      label: 'Clickable markers',
+      label: 'Clickable markers (mapview/submit only)',
       checked: initialAppearance.clickable,
       onChange: (checked) => updateAppearance({ clickable: checked }),
     });
