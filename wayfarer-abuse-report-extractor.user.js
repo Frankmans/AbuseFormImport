@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.50.3
+// @version      1.51.2
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -15,6 +15,71 @@
 // ==/UserScript==
 
 /*
+ * v1.51.2 CHANGE FROM v1.51.1 (reported not matching the wanted
+ * interaction): replaces the global "+" toggle on the main panel
+ * (arm marking mode, then click a Wayspot anywhere on the map) with a
+ * "+" that lives directly on the Wayspot details side panel instead --
+ * right alongside the existing ticket-number annotation this plugin
+ * already adds there (see waeStartSidePanelDetailsWatcher(), extended
+ * rather than duplicated: same WFMM.sidePanel.EVENTS.DETAILS_CHANGED
+ * subscription, same DOM-read approach for the Wayspot's title/lat/lng).
+ * Individual Wayspots now each get their own "+" to click, rather than a
+ * separate mode that had to be armed first and applied to whatever got
+ * clicked next. waeSetMarkModeActive()/WFMM.selection-based selection
+ * listening from v1.51.1 is removed entirely -- nothing left needs it,
+ * since the side panel's own DETAILS_CHANGED event already reliably
+ * fires with the right Wayspot's data every time one is selected. The
+ * List button (Copy All/Clear All) on the main panel is unchanged.
+ *
+ * v1.51.1 CHANGE FROM v1.51.0: v1.51.0's own name/location capture (a
+ * capturing DOM click listener + map projection math, with the name only
+ * ever a best-effort guess at a title/aria-label/alt attribute on
+ * whatever DOM element was clicked) is replaced with a proper one,
+ * checked against WFMM's own source rather than guessed at: Wayfarer's
+ * real Wayspot markers render through deck.gl, so there was never a
+ * per-marker DOM element for that attribute guess to actually read
+ * anything off in the first place. WFMM itself already tracks every
+ * Wayspot click centrally, for its own purposes, via WFMM.selection
+ * (type "poi") backed by WFMM.pois (built from Wayfarer's own map-data
+ * API responses) -- waeHandleWfmmSelectionChanged() now reads the
+ * clicked Wayspot's real title/lat/lng straight from there instead, both
+ * exact rather than either being a guess. See that function's own
+ * comment, and this feature's top-of-section comment (search "Marked
+ * Wayspots" above waeRenderMarkerStyleSection()), for the full
+ * before/after.
+ *
+ * v1.51.0 CHANGE FROM v1.50.4 (feature request): adds a "Marked
+ * Wayspots" scratch list, separate from the ticket-tracking table the
+ * rest of this plugin is built around -- meant for copying into an
+ * actual abuse report filed elsewhere, not for tracking tickets already
+ * extracted from email. A new "+" icon button on the main panel arms
+ * marking mode; while armed, clicking a Wayspot on the mapview/submit
+ * map records its name, latitude, longitude and an (initially blank)
+ * note into a small persisted list (waeSetMarkModeActive()). A second
+ * new icon button opens that list in its own modal
+ * (waeOpenMarkedWayspotListModal()), with Copy All (plain-text, one line
+ * per entry) and Clear All buttons. Clicking a row's note opens a
+ * textarea to edit it; clicking anywhere outside that textarea closes it
+ * and saves whatever's in it (waeBuildMarkedWayspotRow()). (Its original
+ * name/location capture approach didn't survive first contact with the
+ * real page -- see v1.51.1, directly above.)
+ *
+ * v1.50.4 CHANGE FROM v1.50.3: fixes clicking a cluster whose records
+ * all share the same (or near-identical) coordinates -- previously,
+ * clicking it just recentered/zoomed to try to split it apart, but
+ * records at identical coordinates measure 0px apart at every zoom
+ * level, so that zoom could never actually separate them into
+ * individually-clickable crosses; once already at the deepest zoom this
+ * plugin ever zooms a cluster to, clicking it again just repeated the
+ * same no-op zoom forever, leaving every ticket underneath it
+ * unreachable. _handleClick() (WaePulseOverlayCtor) now checks whether
+ * the map is already at WAE_CLUSTER_MAX_ZOOM (a newly-named constant --
+ * previously a bare "20") before zooming again; if it is, it opens an
+ * info window (waeShowPulseClusterInfoWindow(), new) listing every
+ * record in the cluster by ticket number and Wayspot name instead, so
+ * the reports are at least visible/readable even though the map itself
+ * still can't give them separate clickable crosses.
+ *
  * v1.50.3 CHANGE FROM v1.50.2: fixes the initial render on a fresh page
  * load showing every record as its own individual cross first, then
  * reclustering into groups a moment later. waeComputeClusters() falls
@@ -2157,17 +2222,34 @@
         const c = this.cluster;
         if (!c) return;
         if (c.records.length > 1) {
-          WAE_PULSES.map.setCenter(this.latLng);
-          // Jumps straight to zoom 20 (not just "a few levels in") --
-          // a relative +3 from wherever the map happened to already be
-          // could still land inside another cluster's pixel radius at
-          // low starting zooms, leaving the click looking like it did
-          // nothing. Zoom 20 is deep enough that this plugin's own
-          // clustering (WAE_CLUSTER_PIXEL_RADIUS, in screen pixels)
-          // reliably splits every real-world cluster back into
-          // individual markers. Only ever zooms IN to reach it -- if
-          // already deeper than 20, stays there rather than zooming out.
-          WAE_PULSES.map.setZoom(Math.max(WAE_PULSES.map.getZoom() || 8, 20));
+          const map = WAE_PULSES.map;
+          // BUGFIX (not upstream, feature request): a cluster whose
+          // records all share the same (or near-identical) coordinates
+          // can never actually split apart no matter how far in you
+          // zoom -- waeComputeClusters()'s pixel-distance grouping still
+          // measures 0px between them at any zoom, so the "zoom in to
+          // split it" behavior below used to just re-run at an already-
+          // maxed-out zoom, doing nothing visible and leaving every
+          // record underneath it unreachable. Once already at
+          // WAE_CLUSTER_MAX_ZOOM (so a further zoom genuinely can't
+          // reveal anything a previous click hasn't already tried),
+          // list the records directly instead of zooming again.
+          if (Math.floor(map.getZoom() ?? 0) >= WAE_CLUSTER_MAX_ZOOM) {
+            waeShowPulseClusterInfoWindow(c, this.latLng);
+            return;
+          }
+          map.setCenter(this.latLng);
+          // Jumps straight to WAE_CLUSTER_MAX_ZOOM (not just "a few
+          // levels in") -- a relative +3 from wherever the map happened
+          // to already be could still land inside another cluster's
+          // pixel radius at low starting zooms, leaving the click
+          // looking like it did nothing. WAE_CLUSTER_MAX_ZOOM is deep
+          // enough that this plugin's own clustering
+          // (WAE_CLUSTER_PIXEL_RADIUS, in screen pixels) reliably splits
+          // every real-world cluster back into individual markers.
+          // Only ever zooms IN to reach it -- if already deeper than
+          // that, the branch above already caught it.
+          map.setZoom(Math.max(map.getZoom() || 8, WAE_CLUSTER_MAX_ZOOM));
         } else {
           waeShowPulseInfoWindow(c.records[0], this.latLng);
         }
@@ -2335,6 +2417,14 @@
     return true;
   }
 
+  // Ceiling of Google's own zoom scale for this map type -- also the
+  // target _handleClick() above zooms a cluster in to. Named here (used
+  // by both _handleClick() and waeShowPulseClusterInfoWindow()) instead
+  // of the bare "20" it used to be, now that there's a second thing that
+  // needs to agree on exactly which zoom counts as "as far in as this
+  // can go."
+  const WAE_CLUSTER_MAX_ZOOM = 20;
+
   const WAE_CLUSTER_PIXEL_RADIUS = 45;
 
   // Groups records into clusters based on screen-pixel distance at the
@@ -2461,6 +2551,37 @@
     if (record.comment) parts.push(`<div style="margin-top:4px;color:#6b7280;word-break:break-all;">${escapeHtml(record.comment)}</div>`);
     if (record.conversationId) parts.push(`<div style="margin-top:4px;color:#9ca3af;">Ticket ${escapeHtml(record.conversationId)}</div>`);
     parts.push('</div>');
+    WAE_PULSES.infoWindow.setContent(parts.join(''));
+    WAE_PULSES.infoWindow.setPosition(latLng);
+    WAE_PULSES.infoWindow.open(WAE_PULSES.map);
+  }
+
+  // Feature request (not upstream): shown instead of waeShowPulseInfoWindow()
+  // when _handleClick() (WaePulseOverlayCtor, above) finds a cluster it
+  // can't zoom-and-split any further -- see that call site's own comment.
+  // A plain list of tickets, one per record, is deliberately as far as
+  // this goes: these records still can't be individually clicked on the
+  // map itself (there's no way to give two same-pixel crosses separate
+  // hit targets), so this exists purely to make the tickets themselves
+  // visible/copyable, not to reproduce the single-record popup's full
+  // detail (comment text, etc.) for every record at once.
+  // 'ticket' falls back to sourceEmailId, same as every other "what do
+  // we call this record" spot in the file (waeFindNearbyDuplicates()'s
+  // own list, the main table's export column, etc.) -- some records
+  // never got a real conversationId (see this file's own conversationId/
+  // sourceEmailId history) and still need *something* shown here.
+  function waeShowPulseClusterInfoWindow(cluster, latLng) {
+    if (typeof google === 'undefined' || !google.maps?.InfoWindow || !WAE_PULSES.map) return;
+    if (!WAE_PULSES.infoWindow) WAE_PULSES.infoWindow = new google.maps.InfoWindow();
+    const parts = [`<div style="font-size:12px;max-width:280px;"><strong>${cluster.records.length} reports at this location</strong>`];
+    parts.push(`<div>${latLng.lat().toFixed(6)}, ${latLng.lng().toFixed(6)}</div>`);
+    parts.push('<ul style="margin:6px 0 0;padding-left:16px;">');
+    for (const record of cluster.records) {
+      const ticket = record.conversationId || record.sourceEmailId || '(no ticket)';
+      const name = escapeHtml(record.wayspotName || '(unnamed report)');
+      parts.push(`<li style="margin-bottom:2px;">${escapeHtml(String(ticket))} \u2014 ${name}</li>`);
+    }
+    parts.push('</ul></div>');
     WAE_PULSES.infoWindow.setContent(parts.join(''));
     WAE_PULSES.infoWindow.setPosition(latLng);
     WAE_PULSES.infoWindow.open(WAE_PULSES.map);
@@ -3460,15 +3581,60 @@
       const lng = Number(coordsEl?.dataset.lng);
       if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
 
-      const tickets = waeFindMatchingTicketNumbers(lat, lng);
-      if (!tickets.length) return;
-
       const statusRow = slot.querySelector('.wfmapmods-detail-status');
       if (!statusRow || !statusRow.parentNode) return;
-      const line = document.createElement('div');
-      line.className = 'wae-detail-ticket-line';
-      line.textContent = tickets.map((t) => `#${t}`).join(', ');
-      statusRow.parentNode.insertBefore(line, statusRow);
+
+      const tickets = waeFindMatchingTicketNumbers(lat, lng);
+      if (tickets.length) {
+        const line = document.createElement('div');
+        line.className = 'wae-detail-ticket-line';
+        line.textContent = tickets.map((t) => `#${t}`).join(', ');
+        statusRow.parentNode.insertBefore(line, statusRow);
+      }
+
+      // Feature request: a "+" right in this same spot (where the
+      // ticket-number line above shows, whether or not there's actually
+      // one to show right now) to add THIS Wayspot to the separate
+      // Marked Wayspots scratch list -- see that feature's own
+      // top-of-section comment (search "Marked Wayspots" further down
+      // this file) for what that list is for. An earlier version of this
+      // feature tried a global "arm marking mode, then click a Wayspot
+      // on the map" toggle instead, reported back as not matching the
+      // wanted interaction -- individual Wayspots need their own "+" to
+      // click, not a separate mode. Same DOM-read approach as the ticket
+      // line above (title read off .wfmapmods-detail-title, confirmed
+      // against Base's own createTitleElement(), same source as
+      // everything else in this watcher) rather than WFMM.selection/
+      // WFMM.pois -- one mechanism for this whole watcher, not two, and
+      // this one's already proven reliable here.
+      const titleText = slot.querySelector('.wfmapmods-detail-title')?.textContent?.trim() || '';
+      const name = (titleText && titleText !== 'Untitled location') ? titleText : '';
+      const markBtn = document.createElement('button');
+      markBtn.type = 'button';
+      markBtn.className = 'wae-detail-mark-btn';
+      markBtn.textContent = '+ Add to Abuse Report List';
+      markBtn.title = 'Add this Wayspot to your Marked Wayspots list';
+      markBtn.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        waeAddMarkedWayspot({ name, lat, lng });
+        markBtn.textContent = '\u2713 Added';
+        markBtn.disabled = true;
+        setTimeout(() => {
+          // Guards against the slot (and this button along with it)
+          // having already been torn down/replaced by the time this
+          // fires -- Base wipes and rebuilds the whole details slot on
+          // every new selection (see this watcher's own top comment),
+          // so a stale button re-enabling itself into nothing visible
+          // is harmless, but touching it at all past that point isn't
+          // needed either.
+          if (markBtn.isConnected) {
+            markBtn.textContent = '+ Add to Abuse Report List';
+            markBtn.disabled = false;
+          }
+        }, 1200);
+      });
+      statusRow.parentNode.insertBefore(markBtn, statusRow);
     });
   }
 
@@ -3948,6 +4114,20 @@
     .wae-panel-header-row{ display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:8px; }
     .wae-panel-header-row .wae-sub{ margin-bottom:0; }
     .wae-panel-header-actions{ display:flex; align-items:center; gap:4px; flex-shrink:0; }
+    /* Marked Wayspots -- the list modal's rows (waeBuildMarkedWayspotRow()).
+       The "+" itself is styled separately (.wae-detail-mark-btn, in the
+       side-panel-details section below) since it lives in the Wayspot
+       details side panel, not this panel. */
+    .wae-mark-list{ max-height:320px; overflow-y:auto; margin-top:8px; }
+    .wae-mark-row{ border:1px solid var(--wfmm-border, #e5e7eb); border-radius:6px; padding:6px 8px; margin-bottom:6px; }
+    .wae-mark-row-main{ display:flex; align-items:center; gap:8px; }
+    .wae-mark-row-name{ font-weight:600; font-size:12px; flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .wae-mark-row-coord{ font-size:11px; color:var(--wfmm-muted-text, #667085); flex-shrink:0; }
+    .wae-mark-row-delete{ flex-shrink:0; border:none; background:none; color:var(--wfmm-muted-text, #667085); font-size:16px; line-height:1; cursor:pointer; padding:0 2px; }
+    .wae-mark-row-delete:hover{ color:#dc2626; }
+    .wae-mark-row-note{ margin-top:4px; font-size:11px; color:var(--wfmm-muted-text, #667085); cursor:pointer; word-break:break-word; white-space:pre-wrap; }
+    .wae-mark-row-note-empty{ font-style:italic; opacity:0.7; }
+    .wae-mark-row-note-input{ margin-top:4px; width:100%; box-sizing:border-box; font:inherit; font-size:11px; resize:vertical; }
     .wae-csv-hint{ white-space:pre-line; font-family:ui-monospace, monospace; }
     /* BUGFIX (not upstream): the crosses/clusters this plugin draws on the
        map used to be google.maps.Marker instances with a data: URI SVG
@@ -3995,6 +4175,18 @@
       font-size:11px; font-weight:600; color:#dc2626;
       margin:2px 0 6px; text-align:center;
     }
+    /* "+" button added right alongside the ticket-number line above --
+       see waeStartSidePanelDetailsWatcher()'s own comment. A small plain
+       button rather than a pill/badge like the ticket line itself, so it
+       reads as clickable (an action) rather than as more status text. */
+    .wae-detail-mark-btn{
+      display:block; width:100%; margin:2px 0 6px; padding:4px 8px;
+      font-size:11px; font-weight:600; font-family:Roboto, Arial, sans-serif;
+      color:#154aab; background:#eef2ff; border:1px solid #c7d2fe; border-radius:5px;
+      cursor:pointer; text-align:center;
+    }
+    .wae-detail-mark-btn:hover{ background:#e0e7ff; }
+    .wae-detail-mark-btn:disabled{ color:#16a34a; background:#f0fdf4; border-color:#bbf7d0; cursor:default; }
     /* Star toggle -- matches Report History's own \u2605/\u2606 button
        convention (plain glyph, no pill/border) rather than inventing a
        new visual language for what's already a familiar affordance. */
@@ -4556,6 +4748,241 @@
   }
 
   // ---------------------------------------------------------------------
+  // ---------------------------------------------------------------------
+  // Marked Wayspots -- feature request: a "+" button on the Wayspot
+  // details side panel (see waeStartSidePanelDetailsWatcher(), where it's
+  // actually added -- right alongside the existing ticket-number
+  // annotation, per the request) records the currently-shown Wayspot's
+  // name/coordinates into a small persistent list, editable with a
+  // per-entry note, viewable/copyable/clearable from its own modal
+  // (waeOpenMarkedWayspotListModal(), opened via markListBtn on the main
+  // panel). Meant as a scratch list to copy from while filing an actual
+  // abuse report elsewhere (Niantic's own form/email), not a duplicate of
+  // the ticket-tracking table above -- nothing here reads from or writes
+  // to waeAllRecords/the extracted-report storage.
+  //
+  // Persisted via WFMM.settings, same mechanism as appearance/
+  // autoCloseOnNavigate elsewhere in this file -- a handful to a few
+  // dozen manually-marked entries is a trivially small amount of data
+  // next to what that's already used for.
+  //
+  // (Two earlier approaches to WHERE/HOW this "+" gets clicked didn't
+  // survive first contact with real use: a capturing map-click listener
+  // that could only guess at the Wayspot's name since Wayfarer's markers
+  // render through deck.gl with no DOM element to read one off, then a
+  // global "arm marking mode, then click a Wayspot" toggle once the name
+  // problem was fixed via WFMM.selection/WFMM.pois -- reported back as
+  // not the wanted interaction. Individual Wayspots need their own "+",
+  // not a separate mode, hence this landing in the side panel instead.)
+  // ---------------------------------------------------------------------
+
+  const WAE_MARK_LIST_SETTINGS_KEY = 'markedWayspots';
+
+  function waeLoadMarkedWayspots() {
+    try {
+      const list = wfmmWindow.WFMM.settings.get(PLUGIN_ID, WAE_MARK_LIST_SETTINGS_KEY, []);
+      return Array.isArray(list) ? list : [];
+    } catch (e) {
+      return [];
+    }
+  }
+
+  function waeSaveMarkedWayspots(list) {
+    try {
+      wfmmWindow.WFMM.settings.set(PLUGIN_ID, WAE_MARK_LIST_SETTINGS_KEY, list);
+    } catch (e) { /* ignore -- next mutation attempt will just try again */ }
+  }
+
+  function waeAddMarkedWayspot({ name, lat, lng }) {
+    const list = waeLoadMarkedWayspots();
+    list.push({
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      name: name || '',
+      lat,
+      lng,
+      note: '',
+      markedAt: Date.now(),
+    });
+    waeSaveMarkedWayspots(list);
+    waeMarkListRenderHook?.();
+  }
+
+  // Set by waeRenderMarkedWayspotListSection() (below) to its own render()
+  // while that modal is open, cleared on close -- lets waeAddMarkedWayspot()
+  // above keep the list modal's own view in sync with entries added by
+  // clicking the map WHILE the list modal happens to already be open,
+  // without the two having any other reference to each other.
+  let waeMarkListRenderHook = null;
+
+  async function waeCopyToClipboard(text) {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch (e) { /* fall through to the execCommand fallback below */ }
+    // Fallback for a context where the async Clipboard API isn't
+    // available/permitted (an insecure context, or a permission
+    // prompt that was denied) -- the old hidden-textarea +
+    // execCommand('copy') trick, synchronous and far less capable but
+    // reliable enough for a plain-text copy.
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      document.execCommand('copy');
+      ta.remove();
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function waeFormatMarkedWayspotLine(item) {
+    const name = item.name || '(unnamed)';
+    const coords = `${Number(item.lat).toFixed(6)}, ${Number(item.lng).toFixed(6)}`;
+    return item.note ? `${name} \u2014 ${coords} \u2014 ${item.note}` : `${name} \u2014 ${coords}`;
+  }
+
+  // One list row: name/coords/delete on the first line, a click-to-edit
+  // note below it. Feature request, exact interaction as specified:
+  // clicking the note line opens a textarea; a second click OUTSIDE that
+  // textarea closes it again and stores whatever's in it. Implemented
+  // with a capturing 'mousedown' listener on the document (checking
+  // whether the click landed inside the textarea, not any particular
+  // element outside it) rather than the textarea's own 'blur' -- blur
+  // alone is unreliable here since not every element that can be clicked
+  // is itself focusable, and this needs to catch literally any outside
+  // click, not just a focus change.
+  function waeBuildMarkedWayspotRow(item, ui, onDelete) {
+    const row = ui.createElement('div', { className: 'wae-mark-row' });
+    const mainLine = ui.createElement('div', { className: 'wae-mark-row-main' });
+    const nameEl = ui.createElement('span', { className: 'wae-mark-row-name', text: item.name || '(unnamed)' });
+    const coordEl = ui.createElement('span', { className: 'wae-mark-row-coord', text: `${Number(item.lat).toFixed(6)}, ${Number(item.lng).toFixed(6)}` });
+    const deleteBtn = ui.createElement('button', { className: 'wae-mark-row-delete', text: '\u00d7', attrs: { type: 'button', title: 'Remove from list' } });
+    mainLine.append(nameEl, coordEl, deleteBtn);
+
+    const noteEl = ui.createElement('div', {
+      className: `wae-mark-row-note${item.note ? '' : ' wae-mark-row-note-empty'}`,
+      text: item.note || 'Click to add a note\u2026',
+    });
+    row.append(mainLine, noteEl);
+
+    deleteBtn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      waeSaveMarkedWayspots(waeLoadMarkedWayspots().filter((x) => x.id !== item.id));
+      onDelete(row);
+    });
+
+    noteEl.addEventListener('click', () => {
+      if (row.querySelector('textarea')) return; // already open
+      const textarea = ui.createElement('textarea', {
+        className: 'wae-mark-row-note-input',
+        attrs: { rows: '2' },
+      });
+      textarea.value = item.note || '';
+      row.replaceChild(textarea, noteEl);
+      textarea.focus();
+      textarea.select();
+
+      const commit = () => {
+        document.removeEventListener('mousedown', onOutsideMouseDown, true);
+        const value = textarea.value.trim();
+        item.note = value;
+        waeSaveMarkedWayspots(waeLoadMarkedWayspots().map((x) => (x.id === item.id ? { ...x, note: value } : x)));
+        noteEl.textContent = value || 'Click to add a note\u2026';
+        noteEl.classList.toggle('wae-mark-row-note-empty', !value);
+        if (row.contains(textarea)) row.replaceChild(noteEl, textarea);
+      };
+      const onOutsideMouseDown = (ev) => {
+        if (!textarea.contains(ev.target)) commit();
+      };
+      // Deferred to the next tick so the SAME click that just opened
+      // this editor (still being dispatched) isn't immediately treated
+      // as the "outside" click that closes it right back again.
+      setTimeout(() => document.addEventListener('mousedown', onOutsideMouseDown, true), 0);
+    });
+
+    return row;
+  }
+
+  function waeRenderMarkedWayspotListSection(ui, body) {
+    const listContainer = ui.createElement('div', { className: 'wae-mark-list' });
+    const emptyEl = ui.createElement('div', {
+      className: 'wae-sub',
+      text: 'No wayspots marked yet -- use the + button on the main panel, then click a Wayspot on the map.',
+    });
+    const copyAllBtn = ui.button({ text: 'Copy All', disabled: true });
+    const clearAllBtn = ui.button({ text: 'Clear All', variant: 'danger', disabled: true });
+    const buttonRow = ui.buttonRow([copyAllBtn, clearAllBtn]);
+
+    function render() {
+      listContainer.innerHTML = '';
+      const list = waeLoadMarkedWayspots();
+      copyAllBtn.disabled = !list.length;
+      clearAllBtn.disabled = !list.length;
+      if (!list.length) {
+        listContainer.append(emptyEl);
+        return;
+      }
+      for (const item of list) {
+        listContainer.append(waeBuildMarkedWayspotRow(item, ui, (rowEl) => {
+          rowEl.remove();
+          if (!waeLoadMarkedWayspots().length) render();
+          else { copyAllBtn.disabled = false; clearAllBtn.disabled = false; }
+        }));
+      }
+    }
+
+    copyAllBtn.addEventListener('click', async () => {
+      const list = waeLoadMarkedWayspots();
+      if (!list.length) return;
+      const ok = await waeCopyToClipboard(list.map(waeFormatMarkedWayspotLine).join('\n'));
+      copyAllBtn.textContent = ok ? 'Copied!' : 'Copy failed';
+      setTimeout(() => { copyAllBtn.textContent = 'Copy All'; }, 1500);
+    });
+
+    clearAllBtn.addEventListener('click', () => {
+      if (!waeLoadMarkedWayspots().length) return;
+      if (!confirm('Clear the entire marked-wayspots list? This cannot be undone.')) return;
+      waeSaveMarkedWayspots([]);
+      render();
+    });
+
+    body.append(buttonRow, listContainer);
+    render();
+    waeMarkListRenderHook = render;
+
+    return {
+      onOk() { return true; }, // no-op -- every action above already saves on its own
+    };
+  }
+
+  let waeMarkListController = null;
+  function waeOpenMarkedWayspotListModal() {
+    if (waeMarkListController) return; // already open
+    waeMarkListController = wfmmWindow.WFMM.ui.openModal({
+      id: 'wae-mark-list',
+      title: 'Abuse Reports - Marked Wayspots',
+      className: 'wae-dialog',
+      showFooterButtons: false,
+      ownerPluginId: PLUGIN_ID,
+      desktopInteractions: { minWidth: 360, minHeight: 320 },
+      buildContent(modal) {
+        return waeRenderMarkedWayspotListSection(modal.ui, modal.body);
+      },
+      onClose() {
+        waeMarkListController = null;
+        waeMarkListRenderHook = null;
+      },
+    });
+  }
+  // ---------------------------------------------------------------------
+
   // Marker Style settings -- its own modal, opened from a small cog
   // button next to the tool panel's title (see buildPanelContent()),
   // rather than living inline at the bottom of the panel where it used
@@ -4751,6 +5178,21 @@
     const tableContainer = ui.createElement('div', { className: 'wae-table-container' });
     const logEl = ui.createElement('div', { className: 'wae-log' });
 
+    // ---- Marked Wayspots ----
+    // List icon -- opens the modal listing everything marked so far via
+    // the "+" on the Wayspot details side panel (see
+    // waeStartSidePanelDetailsWatcher()), with its own Copy All/Clear
+    // All (waeOpenMarkedWayspotListModal()). Same tucked-next-to-the-
+    // summary-line treatment as markerStyleBtn/emailImporterBtn below,
+    // for the same reason: a once-in-a-while tool, not something that
+    // should compete with the table/export/scan controls every time the
+    // panel opens.
+    const markListBtn = ui.iconButton({
+      iconSvg: '<svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"></line><line x1="8" y1="12" x2="21" y2="12"></line><line x1="8" y1="18" x2="21" y2="18"></line><line x1="3" y1="6" x2="3.01" y2="6"></line><line x1="3" y1="12" x2="3.01" y2="12"></line><line x1="3" y1="18" x2="3.01" y2="18"></line></svg>',
+      title: 'Marked Wayspots List',
+      onClick: () => waeOpenMarkedWayspotListModal(),
+    });
+
     // ---- Marker Style ----
     // BUGFIX (not upstream, feature request): used to also have its own
     // entry in the native Settings side-panel list -- see
@@ -4803,7 +5245,7 @@
 
     const panelHeaderRow = ui.createElement('div', { className: 'wae-panel-header-row' });
     const panelHeaderActions = ui.createElement('div', { className: 'wae-panel-header-actions' });
-    panelHeaderActions.append(emailImporterBtn, markerStyleBtn);
+    panelHeaderActions.append(markListBtn, emailImporterBtn, markerStyleBtn);
     panelHeaderRow.append(countEl, panelHeaderActions);
 
     modal.body.append(panelHeaderRow, buttonRowEl, csvHint, csvFileInput, progressEl, searchInput, autoCloseToggle.row, tableContainer, logEl);
