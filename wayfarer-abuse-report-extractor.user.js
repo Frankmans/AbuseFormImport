@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.51.2
+// @version      1.53.0
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -15,6 +15,45 @@
 // ==/UserScript==
 
 /*
+ * v1.53.0 CHANGE FROM v1.52.1 (feature request): every entry on the
+ * Marked Wayspots list now also gets a visual marker on the mapview/
+ * submit map itself -- a small filled dot, default blue (#2563eb),
+ * clicking it shows the name/coordinates/note in an info window
+ * (waeRenderMarkedWayspotMarkers()/WaeMarkMarkerOverlayCtor, new). The
+ * color is changeable from Marker Style (the new "Marked Wayspot color"
+ * field, separate from the abuse-report cross/cluster color above it)
+ * and applies immediately, same as every other control in that section.
+ * Deliberately its own, much simpler OverlayView rather than reusing
+ * WaePulseOverlayCtor: no clustering (a manually-curated list realistic-
+ * ally never gets dense enough to need it), and a single div straight in
+ * overlayMouseTarget rather than a visible+hit-div pair, since there's
+ * no "must not visually cover a real Wayspot marker" requirement for
+ * these the way there is for abuse-report crosses (see that class's own
+ * comment, and v1.50.2's changelog entry, for why splitting it in two
+ * was necessary there specifically).
+ *
+ * v1.52.1 CHANGE FROM v1.52.0 (feature request): the Marked Wayspots list
+ * modal (waeRenderMarkedWayspotListSection()) now opens with a link to
+ * Niantic's own "Reporting Abuse in Wayfarer" Help Center article, right
+ * above Copy All/Clear All -- a shortcut to where the copied list is
+ * actually meant to be pasted.
+ *
+ * v1.52.0 CHANGE FROM v1.51.3 (feature request): the "+" on the Wayspot
+ * details side panel now sits alongside a short note field
+ * (waeStartSidePanelDetailsWatcher(), the new .wae-detail-mark-row/
+ * .wae-detail-mark-note) -- typing a note there before clicking "+"
+ * captures it in the same entry right away, instead of only being able
+ * to add one afterward from the list modal (still possible too -- this
+ * doesn't replace that). waeAddMarkedWayspot() now takes an optional
+ * `note`. The button's own label is shortened to "+ Add" (was "+ Add to
+ * Abuse Report List") now that it shares its row with that field.
+ *
+ * v1.51.3 CHANGE FROM v1.51.2: Marked Wayspots Copy All/per-row format
+ * tweaked to "Name, lat, lng (note)" -- comma between name and
+ * coordinates instead of an em dash, note in parentheses at the end
+ * instead of another em-dash-separated segment. waeFormatMarkedWayspotLine()
+ * is the only thing that changed.
+ *
  * v1.51.2 CHANGE FROM v1.51.1 (reported not matching the wanted
  * interaction): replaces the global "+" toggle on the main panel
  * (arm marking mode, then click a Wayspot anywhere on the map) with a
@@ -1951,6 +1990,13 @@
     borderWidth: 1,
     borderOpacity: 1,
     clickable: true,
+    // Feature request: color for the separate Marked Wayspots dots (see
+    // waeRenderMarkedWayspotMarkers()) -- blue by default, deliberately
+    // distinct from fillColor's own red-ish default above so the two
+    // marker types (abuse-report crosses/clusters vs. this plugin's own
+    // scratch-list dots) stay visually distinguishable even before
+    // anyone customizes either one.
+    markColor: '#2563eb',
   });
   // Combined with autoCloseOnNavigate (see waeAutoCloseOnNavigateEnabled()
   // above) under one WFMM.settings.registerPlugin() call in startPlugin()
@@ -1993,6 +2039,7 @@
       // simplest to save/normalize/reset together with the rest rather
       // than as a separate WFMM.settings key.
       clickable: typeof a.clickable === 'boolean' ? a.clickable : WAE_APPEARANCE_DEFAULTS.clickable,
+      markColor: waeNormalizeHexColor(a.markColor, WAE_APPEARANCE_DEFAULTS.markColor),
     };
   }
   // BUGFIX (not upstream, better-integration pass): used to be its own
@@ -2960,6 +3007,11 @@
   function waeSetCurrentMap(map, surface) {
     if (WAE_PULSES.map === map) return;
     waeClearPulses();
+    // Marked Wayspots' own dots (waeMarkMarkerOverlays) are OverlayView
+    // instances tied to the OLD map instance -- torn down and redrawn on
+    // the new one below, same reasoning as waeClearPulses() just above
+    // for the abuse-report crosses/clusters.
+    waeClearMarkedWayspotMarkers();
     WAE_PULSES.map = map;
     WAE_PULSES.surface = map ? (surface || null) : null;
     if (map) {
@@ -2968,6 +3020,7 @@
         clearTimeout(debounceTimer);
         debounceTimer = setTimeout(waeSafeRefreshPulses, WAE_ZOOM_DEBOUNCE_MS);
       });
+      waeRenderMarkedWayspotMarkers();
     }
   }
 
@@ -3609,15 +3662,39 @@
       // this one's already proven reliable here.
       const titleText = slot.querySelector('.wfmapmods-detail-title')?.textContent?.trim() || '';
       const name = (titleText && titleText !== 'Untitled location') ? titleText : '';
+
+      const markRow = document.createElement('div');
+      markRow.className = 'wae-detail-mark-row';
+
+      // Feature request: a short note can be typed here BEFORE clicking
+      // "+", so it's captured in the same entry right away instead of
+      // needing a separate trip to the list modal afterward to open and
+      // fill in the note there (still possible too -- this is an
+      // addition, not a replacement for that).
+      const noteInput = document.createElement('input');
+      noteInput.type = 'text';
+      noteInput.className = 'wae-detail-mark-note';
+      noteInput.placeholder = 'Note (optional)';
+      noteInput.maxLength = 300;
+      // Typing/clicking into this field is squarely inside Wayfarer's own
+      // side panel, which has its own click handling around it (the same
+      // reason markBtn's own click handler below stops propagation) --
+      // without this, a keystroke could end up also triggering whatever
+      // that surrounding panel does with clicks/keys it doesn't
+      // recognize as text input.
+      noteInput.addEventListener('click', (ev) => ev.stopPropagation());
+      noteInput.addEventListener('keydown', (ev) => ev.stopPropagation());
+
       const markBtn = document.createElement('button');
       markBtn.type = 'button';
       markBtn.className = 'wae-detail-mark-btn';
-      markBtn.textContent = '+ Add to Abuse Report List';
+      markBtn.textContent = '+ Add';
       markBtn.title = 'Add this Wayspot to your Marked Wayspots list';
       markBtn.addEventListener('click', (ev) => {
         ev.preventDefault();
         ev.stopPropagation();
-        waeAddMarkedWayspot({ name, lat, lng });
+        waeAddMarkedWayspot({ name, lat, lng, note: noteInput.value.trim() });
+        noteInput.value = '';
         markBtn.textContent = '\u2713 Added';
         markBtn.disabled = true;
         setTimeout(() => {
@@ -3629,11 +3706,13 @@
           // is harmless, but touching it at all past that point isn't
           // needed either.
           if (markBtn.isConnected) {
-            markBtn.textContent = '+ Add to Abuse Report List';
+            markBtn.textContent = '+ Add';
             markBtn.disabled = false;
           }
         }, 1200);
       });
+      markRow.append(noteInput, markBtn);
+      statusRow.parentNode.insertBefore(markRow, statusRow);
       statusRow.parentNode.insertBefore(markBtn, statusRow);
     });
   }
@@ -4119,6 +4198,15 @@
        side-panel-details section below) since it lives in the Wayspot
        details side panel, not this panel. */
     .wae-mark-list{ max-height:320px; overflow-y:auto; margin-top:8px; }
+    /* The on-map dot for a Marked Wayspots entry (waeRenderMarkedWayspotMarkers()) --
+       same absolute-positioned/centered pattern as .wae-pulse-marker,
+       just its own class since it lives in a different pane
+       (overlayMouseTarget, not overlayLayer -- see that function's own
+       comment) and isn't subject to the clickable-or-not toggle the
+       abuse-report crosses are. */
+    .wae-mark-marker{ position:absolute; transform:translate(-50%, -50%); cursor:pointer; line-height:0; }
+    .wae-mark-marker svg{ display:block; }
+    .wae-mark-form-link{ display:block; font-size:12px; margin-bottom:6px; }
     .wae-mark-row{ border:1px solid var(--wfmm-border, #e5e7eb); border-radius:6px; padding:6px 8px; margin-bottom:6px; }
     .wae-mark-row-main{ display:flex; align-items:center; gap:8px; }
     .wae-mark-row-name{ font-weight:600; font-size:12px; flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -4175,12 +4263,19 @@
       font-size:11px; font-weight:600; color:#dc2626;
       margin:2px 0 6px; text-align:center;
     }
-    /* "+" button added right alongside the ticket-number line above --
-       see waeStartSidePanelDetailsWatcher()'s own comment. A small plain
-       button rather than a pill/badge like the ticket line itself, so it
-       reads as clickable (an action) rather than as more status text. */
+    /* "+" row (note field + button) added right alongside the
+       ticket-number line above -- see waeStartSidePanelDetailsWatcher()'s
+       own comment. A small plain button rather than a pill/badge like
+       the ticket line itself, so it reads as clickable (an action)
+       rather than as more status text. */
+    .wae-detail-mark-row{ display:flex; align-items:stretch; gap:4px; margin:2px 0 6px; }
+    .wae-detail-mark-note{
+      flex:1 1 auto; min-width:0; padding:4px 6px;
+      font-size:11px; font-family:Roboto, Arial, sans-serif;
+      border:1px solid #c7d2fe; border-radius:5px; box-sizing:border-box;
+    }
     .wae-detail-mark-btn{
-      display:block; width:100%; margin:2px 0 6px; padding:4px 8px;
+      flex:0 0 auto; padding:4px 8px; white-space:nowrap;
       font-size:11px; font-weight:600; font-family:Roboto, Arial, sans-serif;
       color:#154aab; background:#eef2ff; border:1px solid #c7d2fe; border-radius:5px;
       cursor:pointer; text-align:center;
@@ -4793,18 +4888,19 @@
     } catch (e) { /* ignore -- next mutation attempt will just try again */ }
   }
 
-  function waeAddMarkedWayspot({ name, lat, lng }) {
+  function waeAddMarkedWayspot({ name, lat, lng, note }) {
     const list = waeLoadMarkedWayspots();
     list.push({
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       name: name || '',
       lat,
       lng,
-      note: '',
+      note: note || '',
       markedAt: Date.now(),
     });
     waeSaveMarkedWayspots(list);
     waeMarkListRenderHook?.();
+    waeRenderMarkedWayspotMarkers();
   }
 
   // Set by waeRenderMarkedWayspotListSection() (below) to its own render()
@@ -4813,6 +4909,145 @@
   // clicking the map WHILE the list modal happens to already be open,
   // without the two having any other reference to each other.
   let waeMarkListRenderHook = null;
+
+  // ---------------------------------------------------------------------
+  // Feature request: a visual marker on the map (mapview/submit) for
+  // every entry on the Marked Wayspots list, not just an entry in the
+  // list modal -- a small filled dot, default blue, in a color this
+  // plugin's own Marker Style settings can change (see
+  // waeRenderMarkerStyleSection()'s new markColorInput) just like the
+  // abuse-report cross/cluster color already is. Deliberately its own,
+  // much simpler OverlayView -- no clustering (this list is manually
+  // curated, realistically never dense enough to need it the way
+  // hundreds of scanned tickets are) and a single div per marker rather
+  // than WaePulseOverlayCtor's visible+hit-div pair, added straight to
+  // overlayMouseTarget: there's no "stay visually under real Wayspot
+  // markers" requirement for these the way there is for abuse-report
+  // crosses (see THAT class's own comment for why it's split there), so
+  // nothing here needs to trade away reliable clicks (see v1.50.2's own
+  // changelog entry) to get it.
+  // ---------------------------------------------------------------------
+
+  function waeGetMarkedWayspotSvgMarkup(color) {
+    return `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="${color}" fill-opacity="0.9" stroke="#ffffff" stroke-width="2"/></svg>`;
+  }
+
+  function waeShowMarkedWayspotInfoWindow(item, latLng) {
+    if (typeof google === 'undefined' || !google.maps?.InfoWindow || !WAE_PULSES.map) return;
+    if (!WAE_PULSES.infoWindow) WAE_PULSES.infoWindow = new google.maps.InfoWindow();
+    const name = escapeHtml(item.name || '(unnamed)');
+    const parts = [`<div style="font-size:12px;max-width:260px;"><strong>${name}</strong>`];
+    parts.push(`<div>${latLng.lat().toFixed(6)}, ${latLng.lng().toFixed(6)}</div>`);
+    if (item.note) parts.push(`<div style="margin-top:4px;color:#6b7280;word-break:break-word;white-space:pre-wrap;">${escapeHtml(item.note)}</div>`);
+    parts.push('</div>');
+    WAE_PULSES.infoWindow.setContent(parts.join(''));
+    WAE_PULSES.infoWindow.setPosition(latLng);
+    WAE_PULSES.infoWindow.open(WAE_PULSES.map);
+  }
+
+  let WaeMarkMarkerOverlayCtor = null;
+  function waeEnsureMarkMarkerOverlayCtor() {
+    if (WaeMarkMarkerOverlayCtor) return true;
+    if (typeof google === 'undefined' || !google.maps?.OverlayView) return false;
+    WaeMarkMarkerOverlayCtor = class extends google.maps.OverlayView {
+      constructor() {
+        super();
+        this.div = null;
+        this.latLng = null;
+        this.item = null;
+      }
+      onAdd() {
+        const div = document.createElement('div');
+        div.className = 'wae-mark-marker';
+        div.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          if (this.item && this.latLng) waeShowMarkedWayspotInfoWindow(this.item, this.latLng);
+        });
+        this.div = div;
+        // overlayMouseTarget, not overlayLayer -- see this section's own
+        // top comment: unlike WaePulseOverlayCtor's crosses, there's no
+        // "must not visually cover a real marker" requirement to trade
+        // against reliable clicks here (see v1.50.2's own changelog
+        // entry for why overlayLayer alone can't ever deliver those).
+        this.getPanes().overlayMouseTarget.appendChild(div);
+        this.applyToDiv();
+        this.draw();
+      }
+      draw() {
+        if (!this.div || !this.latLng) return;
+        const point = this.getProjection()?.fromLatLngToDivPixel(this.latLng);
+        if (!point) return;
+        this.div.style.left = `${point.x}px`;
+        this.div.style.top = `${point.y}px`;
+      }
+      onRemove() {
+        this.div?.remove();
+        this.div = null;
+      }
+      getPosition() {
+        return this.latLng;
+      }
+      applyToDiv() {
+        if (!this.div || !this.item) return;
+        this.div.innerHTML = waeGetMarkedWayspotSvgMarkup(this._color);
+        this.div.title = this.item.name || '(unnamed)';
+      }
+      setItem(item, color) {
+        this.item = item;
+        this._color = color;
+        this.latLng = new google.maps.LatLng(item.lat, item.lng);
+        this.applyToDiv();
+        this.draw();
+      }
+    };
+    return true;
+  }
+
+  // id -> overlay instance, reused across refreshes the same way
+  // WAE_PULSES.markersById is -- redrawing everything from scratch on
+  // every add/delete/map-change would work too, but this way an entry
+  // that didn't change (position, color) doesn't churn its own DOM node
+  // for no reason.
+  const waeMarkMarkerOverlays = new Map();
+
+  function waeClearMarkedWayspotMarkers() {
+    for (const overlay of waeMarkMarkerOverlays.values()) overlay.setMap(null);
+    waeMarkMarkerOverlays.clear();
+  }
+
+  // Called on every list mutation (add/delete/clear -- see this
+  // feature's own call sites) and on every map change (waeSetCurrentMap())
+  // -- no viewport/idle-based redraw the way waeSafeRefreshPulses() needs
+  // (see that function's own comment): a manually-curated list is
+  // realistically never large enough that redrawing the whole thing on
+  // every one of those triggers is worth debouncing against a map pan.
+  function waeRenderMarkedWayspotMarkers() {
+    const map = WAE_PULSES.map;
+    if (!map || !waeEnsureMarkMarkerOverlayCtor()) {
+      waeClearMarkedWayspotMarkers();
+      return;
+    }
+    const color = waeLoadAppearance().markColor;
+    const list = waeLoadMarkedWayspots();
+    const seen = new Set();
+    for (const item of list) {
+      if (!Number.isFinite(item.lat) || !Number.isFinite(item.lng)) continue;
+      seen.add(item.id);
+      let overlay = waeMarkMarkerOverlays.get(item.id);
+      if (!overlay) {
+        overlay = new WaeMarkMarkerOverlayCtor();
+        waeMarkMarkerOverlays.set(item.id, overlay);
+      }
+      overlay.setItem(item, color);
+      if (overlay.getMap() !== map) overlay.setMap(map);
+    }
+    for (const [id, overlay] of waeMarkMarkerOverlays) {
+      if (!seen.has(id)) {
+        overlay.setMap(null);
+        waeMarkMarkerOverlays.delete(id);
+      }
+    }
+  }
 
   async function waeCopyToClipboard(text) {
     try {
@@ -4845,7 +5080,7 @@
   function waeFormatMarkedWayspotLine(item) {
     const name = item.name || '(unnamed)';
     const coords = `${Number(item.lat).toFixed(6)}, ${Number(item.lng).toFixed(6)}`;
-    return item.note ? `${name} \u2014 ${coords} \u2014 ${item.note}` : `${name} \u2014 ${coords}`;
+    return item.note ? `${name}, ${coords} (${item.note})` : `${name}, ${coords}`;
   }
 
   // One list row: name/coords/delete on the first line, a click-to-edit
@@ -4875,6 +5110,7 @@
     deleteBtn.addEventListener('click', (ev) => {
       ev.stopPropagation();
       waeSaveMarkedWayspots(waeLoadMarkedWayspots().filter((x) => x.id !== item.id));
+      waeRenderMarkedWayspotMarkers();
       onDelete(row);
     });
 
@@ -4916,6 +5152,20 @@
       className: 'wae-sub',
       text: 'No wayspots marked yet -- use the + button on the main panel, then click a Wayspot on the map.',
     });
+    // Feature request: a quick link to Niantic's own "Reporting Abuse in
+    // Wayfarer" Help Center article right on this list -- where the
+    // entries actually get copied FROM before going to file the report,
+    // not the extracted-ticket table elsewhere in this plugin, which is
+    // about reports already filed rather than about to be.
+    const formLinkEl = ui.createElement('a', {
+      className: 'wae-mark-form-link',
+      text: 'Report abuse via Wayfarer Help Center \u2197',
+      attrs: {
+        href: 'https://scopelyexplore.helpshift.com/hc/en/10-wayfarer/faq/1999-reporting-abuse-in-wayfarer/',
+        target: '_blank',
+        rel: 'noopener noreferrer',
+      },
+    });
     const copyAllBtn = ui.button({ text: 'Copy All', disabled: true });
     const clearAllBtn = ui.button({ text: 'Clear All', variant: 'danger', disabled: true });
     const buttonRow = ui.buttonRow([copyAllBtn, clearAllBtn]);
@@ -4950,10 +5200,11 @@
       if (!waeLoadMarkedWayspots().length) return;
       if (!confirm('Clear the entire marked-wayspots list? This cannot be undone.')) return;
       waeSaveMarkedWayspots([]);
+      waeRenderMarkedWayspotMarkers();
       render();
     });
 
-    body.append(buttonRow, listContainer);
+    body.append(formLinkEl, buttonRow, listContainer);
     render();
     waeMarkListRenderHook = render;
 
@@ -5077,12 +5328,29 @@
         styleBorderOpacityRange.input.value = String(d.borderOpacity);
         styleBorderOpacityRange.valueEl.textContent = `${Math.round(d.borderOpacity * 100)}%`;
         styleClickableToggle.input.checked = d.clickable;
+        styleMarkColorInput.value = d.markColor;
+        waeRenderMarkedWayspotMarkers();
       },
     });
     const styleClickableToggle = ui.checkboxRow({
       label: 'Clickable markers (mapview/submit only)',
       checked: initialAppearance.clickable,
       onChange: (checked) => updateAppearance({ clickable: checked }),
+    });
+    // Feature request: color for the separate Marked Wayspots dots (see
+    // waeRenderMarkedWayspotMarkers()) -- a distinct field/control from
+    // fillColor above since it's a genuinely different marker type (this
+    // plugin's own scratch list, not an extracted abuse-report ticket),
+    // re-rendering those dots immediately on change the same way
+    // updateAppearance()'s other onInput handlers apply immediately to
+    // the crosses/clusters -- WFMM.settings alone doesn't redraw
+    // anything already on screen, this plugin has to do that itself.
+    const styleMarkColorInput = ui.colorInput({
+      value: initialAppearance.markColor,
+      onInput: (v) => {
+        updateAppearance({ markColor: v });
+        waeRenderMarkedWayspotMarkers();
+      },
     });
     const styleSection = ui.section({
       title: 'Marker Style',
@@ -5096,6 +5364,7 @@
         ui.fieldRow({ label: 'Ring width', input: styleBorderWidthRange.row }),
         ui.fieldRow({ label: 'Ring opacity', input: styleBorderOpacityRange.row }),
         styleClickableToggle.row,
+        ui.fieldRow({ label: 'Marked Wayspot color', input: styleMarkColorInput, help: 'The dot shown for entries on your Marked Wayspots list.' }),
         ui.buttonRow([resetStyleBtn]),
       ],
     });
