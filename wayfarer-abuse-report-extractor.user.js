@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.53.0
+// @version      1.53.6
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -15,6 +15,86 @@
 // ==/UserScript==
 
 /*
+ * v1.53.6 CHANGE FROM v1.53.5 (feature request): the side-panel "+" button's
+ * label is spelled back out to "+ add to abuse report draft" -- v1.52.0's
+ * "+ Add" shortening (see that entry below) turned out too terse once
+ * people had to tell it apart from the "\u2713 Added"/"\u2713 Updated" it
+ * flashes after a click. WAE_MARK_BTN_LABEL is the one place this string
+ * lives now, referenced both where the button's created and in the
+ * post-click reset that used to hardcode "+ Add" a second time.
+ *
+ * v1.53.5 CHANGE FROM v1.53.4 (feature request): waeAddMarkedWayspot()
+ * used to unconditionally push a new list entry every time "+ Add" was
+ * clicked, even for a Wayspot already on the Marked Wayspots list --
+ * clicking it again on the same Wayspot (e.g. to jot a note after the
+ * fact, or just by accident) left two rows for one physical place. It now
+ * looks for an existing entry at the same coordinates first (exact match
+ * at toFixed(6) precision -- see the function's own comment for why that,
+ * rather than a Haversine "nearby" check, is enough here) and, if found,
+ * overwrites that entry's note with whatever's in the note field this
+ * time -- including clearing it out to blank, same "last write wins"
+ * behavior as every other field on this list -- rather than adding a
+ * second row. The name is refreshed too, but only when the new read isn't
+ * blank, so a real title never gets clobbered back to "Untitled location"
+ * by a stale re-read. The "+ Add" button now shows "\u2713 Updated" instead of
+ * "\u2713 Added" for this case, so it's obvious which happened.
+ *
+ * v1.53.4 CHANGE FROM v1.53.3 (bugfix, reported): Marked Wayspots' dots
+ * stayed on the map even after unchecking "Abuse Report Crosses" in the
+ * Layers menu -- v1.53.0 wired them up as their own always-on OverlayView
+ * set (see that entry below), never actually gated on isMapPulsesEnabled()
+ * the way the abuse-report crosses/clusters already are everywhere else.
+ * waeRenderMarkedWayspotMarkers() now checks isMapPulsesEnabled() itself,
+ * right alongside its existing `!map`/`!waeEnsureMarkMarkerOverlayCtor()`
+ * early-clear check, so every one of its call sites (add/edit/delete/
+ * clear-list, marker-style-size and marker-color changes, a fresh
+ * waeSetCurrentMap() attach) now hides the dots for free whenever the
+ * layer's off, with no need to touch any of those call sites individually.
+ * waeApplyLayerEnabled() -- the layer's own onChange handler -- calls it
+ * explicitly in both directions: on the disable path, right after
+ * waeClearPulses(), so the dots disappear the instant the checkbox is
+ * unticked rather than waiting for the next list mutation to trigger the
+ * now-gated render; on the enable path, right after waeSafeRefreshPulses(),
+ * since re-checking the box doesn't reassign WAE_PULSES.map (same map
+ * instance as before) and so wouldn't otherwise re-trigger a draw the way
+ * waeSetCurrentMap()'s own call does for a genuinely new map.
+ *
+ * v1.53.3 CHANGE FROM v1.53.2 (performance): waeGetMarkedWayspotSvgMarkup()
+ * -- the Marked Wayspots cross icon -- used to rebuild its SVG string
+ * from scratch on every single call, i.e. once per marker on every single
+ * waeRenderMarkedWayspotMarkers() pass, even though every marker in a
+ * given pass shares the same global color/markerSize. It now caches the
+ * built SVG (WAE_MARK_ICON, new) and only rebuilds when the color or
+ * markerSize it's called with actually differs from last time -- the
+ * same kind of cache WAE_MARKER_ICON/WAE_CLUSTER_ICON already keep for
+ * the abuse-report markers, just self-invalidating by comparing its own
+ * inputs rather than needing an external reset call, since color is
+ * already passed in as a parameter here rather than read internally.
+ *
+ * v1.53.2 CHANGE FROM v1.53.1 (performance): waeFindMatchingTicketNumbers()
+ * -- the ticket-number annotation on the Wayspot details side panel, run
+ * on every single Wayspot click -- used to do a plain linear scan (with a
+ * Haversine distance check) over every record in waeAllRecords, every
+ * time. Fine at a few hundred extracted tickets; increasingly not once
+ * that climbs into the thousands, since accumulating exactly that over
+ * time is this plugin's whole purpose. It now reuses the same grid-hash
+ * index waeFindNearbyDuplicates() already builds for its own, similarly-
+ * shaped nearby-match problem (waeGetTicketIndexBuckets(), new -- see its
+ * own comment for why it's a different index from that function's
+ * result, not a shared one), only checking the 3x3 neighborhood of grid
+ * cells around the clicked Wayspot instead of the entire list. The index
+ * is rebuilt only when waeAllRecords itself is reassigned, the same
+ * reference-comparison cache-invalidation idiom already used for
+ * waeFilteredSortedCacheFor/waeStatsCacheFor elsewhere in this file.
+ *
+ * v1.53.1 CHANGE FROM v1.53.0 (feature request): Marked Wayspots dots
+ * changed from a filled circle to the same "X" cross glyph as the
+ * abuse-report markers (waeGetMarkedWayspotSvgMarkup(), now sharing its
+ * size math with waeGetMarkerSvgMarkup() -- markerSize * 2 viewbox, same
+ * arm/stroke scaling), just drawn in this list's own configurable color
+ * instead of fillColor. The Marker Style size slider now redraws these
+ * too on every change, since their shape's size depends on it now.
+ *
  * v1.53.0 CHANGE FROM v1.52.1 (feature request): every entry on the
  * Marked Wayspots list now also gets a visual marker on the mapview/
  * submit map itself -- a small filled dot, default blue (#2563eb),
@@ -1703,6 +1783,48 @@
     return waeSortedNearbyMatches(nearby)
       .map((n) => `${n.record.conversationId || n.record.sourceEmailId} (${Math.round(n.distanceMeters)}m)`)
       .join('; ');
+  }
+
+  // Same grid (WAE_GRID_DEG/waeGridKey, just above) waeFindNearbyDuplicates()
+  // already indexes waeAllRecords with -- reused here rather than a second
+  // grid built from scratch, since the cell math (threshold, cell size) is
+  // identical either way. A DIFFERENT index from that function's own,
+  // though, not its result: waeFindNearbyDuplicates() deliberately excludes
+  // a record's own ticket (it's answering "does this ticket duplicate a
+  // DIFFERENT one?"), while waeFindMatchingTicketNumbers() below answers
+  // "what ticket(s), if any, already cover this exact Wayspot?" -- self-
+  // matches are exactly what it wants, so the two can't share one result.
+  //
+  // BUGFIX (not upstream): this index used to not exist at all --
+  // waeFindMatchingTicketNumbers() did a plain, unindexed linear scan
+  // (with a Haversine check) over every single record in waeAllRecords,
+  // run again from scratch on every single Wayspot click (see
+  // waeStartSidePanelDetailsWatcher(), the only caller). Fine at a few
+  // hundred extracted tickets; increasingly not once that count climbs
+  // into the thousands, since this plugin's whole purpose is accumulating
+  // exactly that over time. Rebuilt only when waeAllRecords itself is
+  // reassigned (waeTicketIndexFor !== waeAllRecords) -- comparing the
+  // array by reference rather than diffing its contents, same
+  // cache-invalidation idiom already used for waeFilteredSortedCacheFor/
+  // waeStatsCacheFor elsewhere in this file, safe because every place
+  // that actually changes what's extracted (see those two variables' own
+  // comments) always assigns waeAllRecords a fresh array rather than
+  // mutating the existing one in place.
+  let waeTicketIndexFor = null;
+  let waeTicketIndexBuckets = null;
+  function waeGetTicketIndexBuckets() {
+    if (waeTicketIndexFor === waeAllRecords) return waeTicketIndexBuckets;
+    const buckets = new Map();
+    for (const r of waeAllRecords) {
+      if (!Number.isFinite(r.latitude) || !Number.isFinite(r.longitude)) continue;
+      const key = waeGridKey(r.latitude, r.longitude);
+      let bucket = buckets.get(key);
+      if (!bucket) { bucket = []; buckets.set(key, bucket); }
+      bucket.push(r);
+    }
+    waeTicketIndexBuckets = buckets;
+    waeTicketIndexFor = waeAllRecords;
+    return buckets;
   }
 
   // ---------------------------------------------------------------------
@@ -3614,15 +3736,37 @@
   let waeSidePanelDetailsUnsub = null;
 
   function waeFindMatchingTicketNumbers(lat, lng) {
+    // BUGFIX (not upstream): was a plain linear scan over every record in
+    // waeAllRecords -- see waeGetTicketIndexBuckets()'s own comment (just
+    // above waeFindNearbyDuplicates()) for why that stopped scaling and
+    // what replaced it. Only the 3x3 neighborhood around (lat, lng)'s own
+    // grid cell needs checking -- same reasoning as
+    // waeFindNearbyDuplicates()'s own neighborhood scan, and the same
+    // WAE_GRID_DEG cell size guarantees it here too: anything within
+    // WAE_NEARBY_THRESHOLD_METERS always falls in one of these 9 cells.
+    const buckets = waeGetTicketIndexBuckets();
+    const cellLat = Math.floor(lat / WAE_GRID_DEG);
+    const cellLon = Math.floor(lng / WAE_GRID_DEG);
     const seen = new Set();
-    for (const r of waeAllRecords) {
-      if (!Number.isFinite(r.latitude) || !Number.isFinite(r.longitude)) continue;
-      if (waeHaversineMeters(lat, lng, r.latitude, r.longitude) <= WAE_NEARBY_THRESHOLD_METERS) {
-        seen.add(r.conversationId || r.sourceEmailId);
+    for (let dLat = -1; dLat <= 1; dLat++) {
+      for (let dLon = -1; dLon <= 1; dLon++) {
+        const bucket = buckets.get(`${cellLat + dLat}:${cellLon + dLon}`);
+        if (!bucket) continue;
+        for (const r of bucket) {
+          if (waeHaversineMeters(lat, lng, r.latitude, r.longitude) <= WAE_NEARBY_THRESHOLD_METERS) {
+            seen.add(r.conversationId || r.sourceEmailId);
+          }
+        }
       }
     }
     return Array.from(seen);
   }
+
+  // v1.53.6: spelled back out from the terser "+ Add" (v1.52.0's own
+  // shortening, once the note field moved into this same row) -- kept as
+  // one constant since the label's set in two places below (the button's
+  // initial text, and the post-"\u2713 Added"/"\u2713 Updated" reset).
+  const WAE_MARK_BTN_LABEL = '+ add to abuse report draft';
 
   function waeStartSidePanelDetailsWatcher() {
     if (waeSidePanelDetailsUnsub) return; // already subscribed
@@ -3688,14 +3832,23 @@
       const markBtn = document.createElement('button');
       markBtn.type = 'button';
       markBtn.className = 'wae-detail-mark-btn';
-      markBtn.textContent = '+ Add';
+      // Feature request: label spelled out again (was shortened to the
+      // terser "+ Add" in v1.52.0 once the note field landed alongside it
+      // in this same row -- see that changelog entry) -- WAE_MARK_BTN_LABEL
+      // is the one place this string lives now, since it's set both here
+      // and in the post-click reset below.
+      markBtn.textContent = WAE_MARK_BTN_LABEL;
       markBtn.title = 'Add this Wayspot to your Marked Wayspots list';
       markBtn.addEventListener('click', (ev) => {
         ev.preventDefault();
         ev.stopPropagation();
-        waeAddMarkedWayspot({ name, lat, lng, note: noteInput.value.trim() });
+        const result = waeAddMarkedWayspot({ name, lat, lng, note: noteInput.value.trim() });
         noteInput.value = '';
-        markBtn.textContent = '\u2713 Added';
+        // Distinguishes an overwrite of an already-marked Wayspot's note
+        // from a genuinely new entry -- waeAddMarkedWayspot() itself is
+        // what actually decides which happened (coordinate match against
+        // the existing list, see its own comment).
+        markBtn.textContent = result === 'updated' ? '\u2713 Updated' : '\u2713 Added';
         markBtn.disabled = true;
         setTimeout(() => {
           // Guards against the slot (and this button along with it)
@@ -3706,7 +3859,7 @@
           // is harmless, but touching it at all past that point isn't
           // needed either.
           if (markBtn.isConnected) {
-            markBtn.textContent = '+ Add';
+            markBtn.textContent = WAE_MARK_BTN_LABEL;
             markBtn.disabled = false;
           }
         }, 1200);
@@ -3788,6 +3941,13 @@
         // has real data to draw from.
         await waeEnsureRecordsLoaded().catch(() => {}); // best-effort -- still try to draw with whatever's cached (likely []) rather than leave the layer on with a silent failure
         waeSafeRefreshPulses();
+        // v1.53.4: Marked Wayspots' dots are gated on isMapPulsesEnabled()
+        // now (see waeRenderMarkedWayspotMarkers()'s own comment), but
+        // re-ticking this checkbox reuses the SAME map instance as before
+        // (WAE_PULSES.map already pointed at it) -- waeSetCurrentMap()'s
+        // guard clause means it won't re-fire its own render call the way
+        // it does for a genuinely new map, so this has to ask explicitly.
+        waeRenderMarkedWayspotMarkers();
       } else {
         if (waeUI) log(waeUI.logEl, '✗ Could not find the Wayfarer map on this page -- try again from the mapview or the submit-Wayspot map.', 'err');
         // Couldn't actually attach -- don't leave the layer claiming to
@@ -3799,6 +3959,12 @@
       }
     } else {
       waeClearPulses();
+      // v1.53.4: hide Marked Wayspots' dots the instant the box is
+      // unticked, rather than leaving them up until the next list
+      // mutation happens to call waeRenderMarkedWayspotMarkers() again --
+      // isMapPulsesEnabled() already reflects the new (disabled) state by
+      // this point, so the gate inside that function clears them here.
+      waeRenderMarkedWayspotMarkers();
     }
   }
 
@@ -4890,17 +5056,45 @@
 
   function waeAddMarkedWayspot({ name, lat, lng, note }) {
     const list = waeLoadMarkedWayspots();
-    list.push({
-      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      name: name || '',
-      lat,
-      lng,
-      note: note || '',
-      markedAt: Date.now(),
-    });
+    // Feature request: adding a Wayspot that's already on this list --
+    // matched on coordinates, not name, since the side-panel title can
+    // read blank/"Untitled location" for the very same physical Wayspot
+    // depending on what happened to be rendered at click time (see this
+    // watcher's own name-reading comment above) -- now updates that
+    // existing entry's note in place instead of pushing a second entry
+    // for the same Wayspot. Coordinates come from the same WFMM/side-panel
+    // source every time, so an exact match at toFixed(6) precision -- the
+    // same precision this file already keys duplicate/identity checks on
+    // elsewhere (the CSV-row key, the review-page pulse key) -- is enough
+    // here; no Haversine "nearby" fuzz-match needed the way it is for
+    // independently-typed abuse-report coordinates (waeFindNearbyDuplicates()).
+    const existing = list.find((item) =>
+      Number(item.lat).toFixed(6) === Number(lat).toFixed(6) &&
+      Number(item.lng).toFixed(6) === Number(lng).toFixed(6)
+    );
+    let result;
+    if (existing) {
+      existing.note = note || '';
+      // Keep the name in sync too, but only ever upgrade a blank one --
+      // never clobber a real title with a blank one from a stale re-read.
+      if (name) existing.name = name;
+      existing.markedAt = Date.now();
+      result = 'updated';
+    } else {
+      list.push({
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        name: name || '',
+        lat,
+        lng,
+        note: note || '',
+        markedAt: Date.now(),
+      });
+      result = 'added';
+    }
     waeSaveMarkedWayspots(list);
     waeMarkListRenderHook?.();
     waeRenderMarkedWayspotMarkers();
+    return result;
   }
 
   // Set by waeRenderMarkedWayspotListSection() (below) to its own render()
@@ -4928,8 +5122,45 @@
   // changelog entry) to get it.
   // ---------------------------------------------------------------------
 
+  // Feature request: an "X" cross, same glyph as waeGetMarkerSvgMarkup()'s
+  // own abuse-report markers (see that function's own comment for why a
+  // cross rather than a filled circle/pin in the first place -- it reads
+  // as "a problem here", not just another POI dot), just in this list's
+  // own configurable color instead of fillColor. Reuses the same size
+  // math (markerSize * 2 viewbox, 0.35 arm length, stroke scaled off
+  // markerSize) so the two marker types stay visually consistent in
+  // scale too, not just in shape -- there's no separate "Marked Wayspot
+  // size" control, this rides on the same markerSize the abuse-report
+  // crosses use.
+  //
+  // BUGFIX (not upstream, performance): used to rebuild this SVG string
+  // from scratch on every single call -- i.e. once per marker, on every
+  // single waeRenderMarkedWayspotMarkers() pass, even though every marker
+  // in a given pass shares the exact same color and markerSize (there's
+  // one global setting for each, not a per-entry one). WAE_MARKER_ICON/
+  // WAE_CLUSTER_ICON above cache the same way for the same reason, just
+  // invalidated externally (from waeSaveAppearance(), since those two
+  // read appearance internally rather than taking it as a parameter) --
+  // this one instead compares its own last-seen color/markerSize against
+  // the current call's before deciding whether to rebuild, since color is
+  // already threaded in as a parameter here. Self-contained rather than
+  // one more place waeSaveAppearance() has to remember to reach into.
+  let WAE_MARK_ICON = { color: null, markerSize: null, svg: null };
   function waeGetMarkedWayspotSvgMarkup(color) {
-    return `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="${color}" fill-opacity="0.9" stroke="#ffffff" stroke-width="2"/></svg>`;
+    const markerSize = waeLoadAppearance().markerSize;
+    if (WAE_MARK_ICON.color === color && WAE_MARK_ICON.markerSize === markerSize) {
+      return WAE_MARK_ICON.svg;
+    }
+    const size = markerSize * 2;
+    const half = size / 2;
+    const arm = size * 0.35;
+    const stroke = Math.max(2, Math.round(markerSize * 0.45));
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}">`
+      + `<line x1="${half - arm}" y1="${half - arm}" x2="${half + arm}" y2="${half + arm}" stroke="${color}" stroke-width="${stroke}" stroke-linecap="round"/>`
+      + `<line x1="${half + arm}" y1="${half - arm}" x2="${half - arm}" y2="${half + arm}" stroke="${color}" stroke-width="${stroke}" stroke-linecap="round"/>`
+      + '</svg>';
+    WAE_MARK_ICON = { color, markerSize, svg };
+    return svg;
   }
 
   function waeShowMarkedWayspotInfoWindow(item, latLng) {
@@ -5023,7 +5254,14 @@
   // every one of those triggers is worth debouncing against a map pan.
   function waeRenderMarkedWayspotMarkers() {
     const map = WAE_PULSES.map;
-    if (!map || !waeEnsureMarkMarkerOverlayCtor()) {
+    // Gated on isMapPulsesEnabled() (the "Abuse Report Crosses" Layers-menu
+    // checkbox) same as the abuse-report crosses/clusters themselves --
+    // added in v1.53.4, see that changelog entry for why this was missing
+    // up to v1.53.3. Centralizing the check here, rather than at each of
+    // this function's call sites, is what makes every one of them --
+    // add/edit/delete/clear-list, marker-style changes, a fresh map
+    // attach -- respect the toggle without having to touch them individually.
+    if (!map || !isMapPulsesEnabled() || !waeEnsureMarkMarkerOverlayCtor()) {
       waeClearMarkedWayspotMarkers();
       return;
     }
@@ -5276,7 +5514,15 @@
     const styleSizeRange = ui.rangeInput({
       min: 4, max: 24, step: 1, value: initialAppearance.markerSize,
       formatValue: (v) => `${v}px`,
-      onInput: (v) => updateAppearance({ markerSize: Number(v) }),
+      onInput: (v) => {
+        updateAppearance({ markerSize: Number(v) });
+        // Marked Wayspots' own crosses ride on this same markerSize now
+        // (see waeGetMarkedWayspotSvgMarkup()) -- redraw them too,
+        // same as the abuse-report crosses eventually pick this up via
+        // waeSafeRefreshPulses(), just immediately rather than waiting
+        // for the next map idle since these aren't on that refresh cycle.
+        waeRenderMarkedWayspotMarkers();
+      },
     });
     // BUGFIX (not upstream, feature request): this used to be the same
     // markerSize as the cross above (waeGetClusterIcon() just multiplied
