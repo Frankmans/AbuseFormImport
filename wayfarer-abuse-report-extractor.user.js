@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.55.1
+// @version      1.55.2
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -15,6 +15,10 @@
 // ==/UserScript==
 
 /*
+ * v1.55.2 CHANGE FROM v1.55.1 (wording): the "Marked Wayspot color" help
+ * text in Marker Style settings said "dot" -- Marked Wayspots are drawn
+ * as crosses, so it now says "cross".
+ *
  * v1.55.1 CHANGE FROM v1.55.0 (bugfix): v1.55.0 guessed at the wrong
  * element for the submitter's username (.wfmapmods-detail-username).
  * The real one is <div class="wfmapmods-detail-poi-submitter">Submitted
@@ -6305,7 +6309,7 @@
         ui.fieldRow({ label: 'Ring width', input: styleBorderWidthRange.row }),
         ui.fieldRow({ label: 'Ring opacity', input: styleBorderOpacityRange.row }),
         styleClickableToggle.row,
-        ui.fieldRow({ label: 'Marked Wayspot color', input: styleMarkColorInput, help: 'The dot shown for entries on your Marked Wayspots list.' }),
+        ui.fieldRow({ label: 'Marked Wayspot color', input: styleMarkColorInput, help: 'The cross shown for entries on your Marked Wayspots list.' }),
         ui.fieldRow({ label: 'Favorite user color', input: styleFavoriteUserColorInput, help: 'A submitter\u2019s username in the side panel, once favorited.' }),
         ui.buttonRow([resetStyleBtn]),
       ],
