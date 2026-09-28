@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.56.0
+// @version      1.57.1
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -15,6 +15,27 @@
 // ==/UserScript==
 
 /*
+ * v1.57.1 CHANGE FROM v1.57.0 (feature request): the review-page row now
+ * ends with an "Abuse form" link to the same Help Center article the
+ * Marked Wayspots list links to, opening in a new tab. The URL now lives
+ * in one WAE_ABUSE_FORM_URL constant used by both.
+ *
+ * v1.57.0 CHANGE FROM v1.56.0 (feature request): folds the standalone
+ * "Wayfarer Abuse Text Formatter" script into this one. On /new/review,
+ * every review candidate (new, photo or edit) now gets a small row with
+ * a copy icon -- instead of the old script's visible text -- that copies
+ * "name, lat, lng" in the exact Marked Wayspots list format (a typed note
+ * is appended when "Include notes when copying" is on), plus the same
+ * note field and "+ add to abuse report draft" button the native side
+ * panel has, adding to the same Marked Wayspots list. The candidate is
+ * read the same way the old script did, by wrapping XMLHttpRequest.open
+ * to catch GET /api/v1/vault/review; the row goes in the same anchor
+ * spots (before the first .mt-2, or second child of .review-edit-info).
+ * The note field + button are now built by one shared
+ * waeBuildMarkControls() used by both the side panel and this row. The
+ * old script should be uninstalled, otherwise you'll see both. See
+ * "Review-page abuse helper" above waeStopReviewTracking().
+ *
  * v1.56.0 CHANGE FROM v1.55.2 (feature request): the Marked Wayspots list
  * has an "Include notes when copying" checkbox under Copy All. Checked
  * (the default, and how Copy All always behaved) copies
@@ -3873,6 +3894,154 @@
     if (waeReviewIsOnRoute()) waeReviewOnRouteEnter(); // this version can load while already sitting on /new/review
   }
 
+  // ---------------------------------------------------------------------
+  // Review-page abuse helper (folded in from the standalone "Wayfarer
+  // Abuse Text Formatter" script): on /new/review, each review candidate
+  // gets a small row with a copy icon (copies "name, lat, lng" in the
+  // same format as the Marked Wayspots list's Copy All, including a typed
+  // note when "Include notes when copying" is on) plus the same note
+  // field and "+ add to abuse report draft" button the native side panel
+  // has. The old script showed the text itself; this shows only the icon.
+  //
+  // The candidate comes from the review page's own GET
+  // /api/v1/vault/review response, intercepted by wrapping
+  // XMLHttpRequest.prototype.open exactly like that script did -- this
+  // script already runs @run-at document-start / @inject-into page, so
+  // the wrapper is in place before Wayfarer's first request. Guarded by
+  // a flag on wfmmWindow so it's only ever installed once. If the old
+  // standalone script is still installed you'll get its text AND this
+  // row; uninstall it once this is in use.
+  // ---------------------------------------------------------------------
+  // Niantic's "Reporting Abuse in Wayfarer" Help Center article -- linked
+  // from the Marked Wayspots list and from the review-page row below.
+  const WAE_ABUSE_FORM_URL = 'https://scopelyexplore.helpshift.com/hc/en/10-wayfarer/faq/1999-reporting-abuse-in-wayfarer/';
+  let waePluginActive = false; // true between startPlugin() and stopPlugin() -- the hook below stays installed but does nothing while off
+  let waeLatestReviewCandidate = null;
+  let waeReviewAbuseInsertToken = 0;
+
+  const WAE_COPY_ICON_SVG = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"></rect><path d="M5 15V6a2 2 0 0 1 2-2h9"></path></svg>';
+  const WAE_CHECK_ICON_SVG = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12l5 5 9-10"></path></svg>';
+
+  function waeAwaitElement(get, tries = 30, delayMs = 100) {
+    return new Promise((resolve, reject) => {
+      let left = tries;
+      const loop = () => {
+        const ref = get();
+        if (ref) resolve(ref);
+        else if (!left--) reject(new Error('element not found'));
+        else setTimeout(loop, delayMs);
+      };
+      loop();
+    });
+  }
+
+  function waeRemoveReviewAbuseRows() {
+    document.querySelectorAll('.wae-review-abuse-row').forEach((el) => el.remove());
+  }
+
+  function waeBuildReviewAbuseRow(candidate) {
+    const lat = Number(candidate.lat);
+    const lng = Number(candidate.lng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+    // Same naming rule as the side panel: no title -> blank name (the
+    // list/copy formatting then shows "(unnamed)").
+    const name = typeof candidate.title === 'string' ? candidate.title.trim() : '';
+
+    const row = document.createElement('div');
+    row.className = 'wae-review-abuse-row';
+
+    const { noteInput, markBtn } = waeBuildMarkControls({ name, lat, lng });
+
+    const copyBtn = document.createElement('button');
+    copyBtn.type = 'button';
+    copyBtn.className = 'wae-review-copy-btn';
+    copyBtn.innerHTML = WAE_COPY_ICON_SVG;
+    copyBtn.title = 'Copy name and coordinates for the abuse report form';
+    copyBtn.addEventListener('click', async (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      const text = waeFormatMarkedWayspotLine({ name, lat, lng, note: noteInput.value.trim() }, waeCopyIncludesNotes());
+      const ok = await waeCopyToClipboard(text);
+      copyBtn.innerHTML = ok ? WAE_CHECK_ICON_SVG : WAE_COPY_ICON_SVG;
+      copyBtn.classList.toggle('wae-copied', ok);
+      copyBtn.title = ok ? 'Copied!' : 'Copy failed';
+      setTimeout(() => {
+        if (!copyBtn.isConnected) return;
+        copyBtn.innerHTML = WAE_COPY_ICON_SVG;
+        copyBtn.classList.remove('wae-copied');
+        copyBtn.title = 'Copy name and coordinates for the abuse report form';
+      }, 1200);
+    });
+
+    // Link to the abuse form, same target as the Marked Wayspots list's
+    // link -- opens in a new tab so the review in progress isn't lost.
+    const formLink = document.createElement('a');
+    formLink.className = 'wae-review-form-link';
+    formLink.textContent = 'Abuse form';
+    formLink.href = WAE_ABUSE_FORM_URL;
+    formLink.target = '_blank';
+    formLink.rel = 'noopener noreferrer';
+
+    row.append(copyBtn, noteInput, markBtn, formLink);
+    return row;
+  }
+
+  // Same anchor points the old script used: before the first .mt-2 on a
+  // NEW/PHOTO card, as the second child of .review-edit-info on an EDIT
+  // card. Waits for the element (the response can land before Angular
+  // has rendered the card); a newer candidate arriving while waiting
+  // supersedes this one via the token.
+  async function waeInsertReviewAbuseRow(candidate) {
+    if (!waePluginActive) return;
+    const token = ++waeReviewAbuseInsertToken;
+    const isEdit = candidate.type === 'EDIT';
+    let target;
+    try {
+      target = await waeAwaitElement(() => document.querySelector(isEdit ? '.review-edit-info' : '.mt-2'));
+    } catch (e) {
+      return; // no card to attach to (e.g. left the page)
+    }
+    if (token !== waeReviewAbuseInsertToken || !waePluginActive) return;
+    const row = waeBuildReviewAbuseRow(candidate);
+    if (!row) return;
+    waeRemoveReviewAbuseRows(); // drop the previous candidate's row
+    if (isEdit) {
+      if (target.children.length >= 1) target.insertBefore(row, target.children[1] || null);
+      else target.appendChild(row);
+    } else {
+      target.parentNode.insertBefore(row, target);
+    }
+  }
+
+  function waeOnReviewResponse() {
+    try {
+      const json = typeof this.response === 'string' ? JSON.parse(this.response) : this.response;
+      if (!json || json.captcha) return;
+      const c = json.result;
+      if (!c) return;
+      if (c.type === 'NEW' || c.type === 'PHOTO' || c.type === 'EDIT') {
+        waeLatestReviewCandidate = { type: c.type, title: c.title, lat: c.lat, lng: c.lng };
+        waeInsertReviewAbuseRow(waeLatestReviewCandidate);
+      }
+    } catch (e) { /* not a review response we can use -- ignore */ }
+  }
+
+  function waeInstallReviewCandidateHook() {
+    const XHR = wfmmWindow.XMLHttpRequest;
+    if (!XHR || wfmmWindow.__waeReviewCandidateHooked) return;
+    wfmmWindow.__waeReviewCandidateHooked = true;
+    const originalOpen = XHR.prototype.open;
+    XHR.prototype.open = function (method, url) {
+      try {
+        if (String(method).toUpperCase() === 'GET' && String(url).split('?')[0] === '/api/v1/vault/review') {
+          this.addEventListener('load', waeOnReviewResponse, false);
+        }
+      } catch (e) { /* never let the hook break a request */ }
+      return originalOpen.apply(this, arguments);
+    };
+  }
+  waeInstallReviewCandidateHook();
+
   function waeStopReviewTracking() {
     waeReviewRouteEnterUnsub?.();
     waeReviewRouteLeaveUnsub?.();
@@ -4001,6 +4170,54 @@
     }
   }
 
+  // Feature request: the note field + "+ add to abuse report draft" button,
+  // shared by the native side panel (waeStartSidePanelDetailsWatcher())
+  // and the review-page row (waeBuildReviewAbuseRow()) so both behave
+  // identically -- a note can be typed BEFORE clicking the button so it's
+  // captured in the same Marked Wayspots entry right away, and adding a
+  // Wayspot that's already on the list overwrites its note (see
+  // waeAddMarkedWayspot()). Returns the two elements unattached; each
+  // caller decides where they go.
+  function waeBuildMarkControls({ name, lat, lng }) {
+    const noteInput = document.createElement('input');
+    noteInput.type = 'text';
+    noteInput.className = 'wae-detail-mark-note';
+    noteInput.placeholder = 'Note (optional)';
+    noteInput.maxLength = 300;
+    // Typing/clicking into this field is inside Wayfarer's own page,
+    // which has its own click/key handling around it -- without this a
+    // keystroke could also trigger whatever that surrounding UI does
+    // with keys it doesn't recognize as text input.
+    noteInput.addEventListener('click', (ev) => ev.stopPropagation());
+    noteInput.addEventListener('keydown', (ev) => ev.stopPropagation());
+
+    const markBtn = document.createElement('button');
+    markBtn.type = 'button';
+    markBtn.className = 'wae-detail-mark-btn';
+    markBtn.textContent = WAE_MARK_BTN_LABEL;
+    markBtn.title = 'Add this Wayspot to your Marked Wayspots list';
+    markBtn.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      const result = waeAddMarkedWayspot({ name, lat, lng, note: noteInput.value.trim() });
+      noteInput.value = '';
+      // waeAddMarkedWayspot() decides whether this was a new entry or an
+      // overwrite of an already-marked Wayspot's note.
+      markBtn.textContent = result === 'updated' ? '\u2713 Updated' : '\u2713 Added';
+      markBtn.disabled = true;
+      setTimeout(() => {
+        // The surrounding DOM may have been torn down/replaced by the
+        // time this fires (Base rebuilds the details slot on every
+        // selection; the review card re-renders per candidate).
+        if (markBtn.isConnected) {
+          markBtn.textContent = WAE_MARK_BTN_LABEL;
+          markBtn.disabled = false;
+        }
+      }, 1200);
+    });
+    return { noteInput, markBtn };
+  }
+
   function waeStartSidePanelDetailsWatcher() {
     if (waeSidePanelDetailsUnsub) return; // already subscribed
     const WFMM = wfmmWindow.WFMM;
@@ -4100,61 +4317,10 @@
 
       const markRow = document.createElement('div');
       markRow.className = 'wae-detail-mark-row';
-
-      // Feature request: a short note can be typed here BEFORE clicking
-      // "+", so it's captured in the same entry right away instead of
-      // needing a separate trip to the list modal afterward to open and
-      // fill in the note there (still possible too -- this is an
-      // addition, not a replacement for that).
-      const noteInput = document.createElement('input');
-      noteInput.type = 'text';
-      noteInput.className = 'wae-detail-mark-note';
-      noteInput.placeholder = 'Note (optional)';
-      noteInput.maxLength = 300;
-      // Typing/clicking into this field is squarely inside Wayfarer's own
-      // side panel, which has its own click handling around it (the same
-      // reason markBtn's own click handler below stops propagation) --
-      // without this, a keystroke could end up also triggering whatever
-      // that surrounding panel does with clicks/keys it doesn't
-      // recognize as text input.
-      noteInput.addEventListener('click', (ev) => ev.stopPropagation());
-      noteInput.addEventListener('keydown', (ev) => ev.stopPropagation());
-
-      const markBtn = document.createElement('button');
-      markBtn.type = 'button';
-      markBtn.className = 'wae-detail-mark-btn';
-      // Feature request: label spelled out again (was shortened to the
-      // terser "+ Add" in v1.52.0 once the note field landed alongside it
-      // in this same row -- see that changelog entry) -- WAE_MARK_BTN_LABEL
-      // is the one place this string lives now, since it's set both here
-      // and in the post-click reset below.
-      markBtn.textContent = WAE_MARK_BTN_LABEL;
-      markBtn.title = 'Add this Wayspot to your Marked Wayspots list';
-      markBtn.addEventListener('click', (ev) => {
-        ev.preventDefault();
-        ev.stopPropagation();
-        const result = waeAddMarkedWayspot({ name, lat, lng, note: noteInput.value.trim() });
-        noteInput.value = '';
-        // Distinguishes an overwrite of an already-marked Wayspot's note
-        // from a genuinely new entry -- waeAddMarkedWayspot() itself is
-        // what actually decides which happened (coordinate match against
-        // the existing list, see its own comment).
-        markBtn.textContent = result === 'updated' ? '\u2713 Updated' : '\u2713 Added';
-        markBtn.disabled = true;
-        setTimeout(() => {
-          // Guards against the slot (and this button along with it)
-          // having already been torn down/replaced by the time this
-          // fires -- Base wipes and rebuilds the whole details slot on
-          // every new selection (see this watcher's own top comment),
-          // so a stale button re-enabling itself into nothing visible
-          // is harmless, but touching it at all past that point isn't
-          // needed either.
-          if (markBtn.isConnected) {
-            markBtn.textContent = WAE_MARK_BTN_LABEL;
-            markBtn.disabled = false;
-          }
-        }, 1200);
-      });
+      // Note field + "+ add to abuse report draft" button now come from
+      // waeBuildMarkControls() (shared with the review-page row, see
+      // waeBuildReviewAbuseRow()) rather than being built inline here.
+      const { noteInput, markBtn } = waeBuildMarkControls({ name, lat, lng });
       markRow.append(noteInput, markBtn);
       statusRow.parentNode.insertBefore(markRow, statusRow);
       statusRow.parentNode.insertBefore(markBtn, statusRow);
@@ -4828,6 +4994,19 @@
       cursor:pointer; text-align:center;
     }
     .wae-detail-mark-btn:hover{ background:#e0e7ff; }
+    /* Review-page row (copy icon + note + add button) -- see
+       waeBuildReviewAbuseRow(). Reuses the side panel's note/button
+       styles above; only the row layout and the copy icon are new. */
+    .wae-review-abuse-row{ display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin:4px 0; }
+    .wae-review-abuse-row .wae-detail-mark-note{ flex:0 1 260px; }
+    .wae-review-copy-btn{
+      flex:0 0 auto; display:inline-flex; align-items:center; justify-content:center;
+      padding:4px 6px; color:#154aab; background:#eef2ff;
+      border:1px solid #c7d2fe; border-radius:5px; cursor:pointer;
+    }
+    .wae-review-copy-btn:hover{ background:#e0e7ff; }
+    .wae-review-form-link{ flex:0 0 auto; font-size:12px; white-space:nowrap; }
+    .wae-review-copy-btn.wae-copied{ color:#16a34a; background:#f0fdf4; border-color:#bbf7d0; }
     .wae-detail-mark-btn:disabled{ color:#16a34a; background:#f0fdf4; border-color:#bbf7d0; cursor:default; }
     /* Star toggle -- matches Report History's own \u2605/\u2606 button
        convention (plain glyph, no pill/border) rather than inventing a
@@ -6027,7 +6206,7 @@
       className: 'wae-mark-form-link',
       text: 'Report abuse via Wayfarer Help Center \u2197',
       attrs: {
-        href: 'https://scopelyexplore.helpshift.com/hc/en/10-wayfarer/faq/1999-reporting-abuse-in-wayfarer/',
+        href: WAE_ABUSE_FORM_URL,
         target: '_blank',
         rel: 'noopener noreferrer',
       },
@@ -6711,6 +6890,12 @@
 
 
   function startPlugin() {
+    waePluginActive = true;
+    // A review candidate can arrive before this runs (the request hook is
+    // installed at load) -- show its row now that the plugin's on.
+    try {
+      if (waeLatestReviewCandidate && waeReviewIsOnRoute()) waeInsertReviewAbuseRow(waeLatestReviewCandidate);
+    } catch (e) { /* not on a route we can check yet -- next response will insert it */ }
     // Fired off first, before anything else in this function, so the
     // IndexedDB read is already in flight by the time waeResyncMapIfVisible()
     // (below) goes looking for it -- see waeEnsureRecordsLoaded()'s own
@@ -6830,6 +7015,8 @@
   }
 
   function stopPlugin() {
+    waePluginActive = false;
+    waeRemoveReviewAbuseRows();
     waeSidePanelReadyUnsub?.();
     waeSidePanelReadyUnsub = null;
     waeSidePanelClearedUnsub?.();
