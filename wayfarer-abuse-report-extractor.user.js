@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.55.2
+// @version      1.56.0
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -15,6 +15,13 @@
 // ==/UserScript==
 
 /*
+ * v1.56.0 CHANGE FROM v1.55.2 (feature request): the Marked Wayspots list
+ * has an "Include notes when copying" checkbox under Copy All. Checked
+ * (the default, and how Copy All always behaved) copies
+ * "name, lat, lng (note)" per entry; unchecked copies just
+ * "name, lat, lng". Saved via WFMM.settings (copyIncludeNotes) and read
+ * fresh at copy time, so it applies to the very next Copy All.
+ *
  * v1.55.2 CHANGE FROM v1.55.1 (wording): the "Marked Wayspot color" help
  * text in Marker Style settings said "dot" -- Marked Wayspots are drawn
  * as crosses, so it now says "cross".
@@ -2275,6 +2282,9 @@
   const WAE_SETTINGS_DEFAULTS = Object.freeze({
     appearance: WAE_APPEARANCE_DEFAULTS,
     autoCloseOnNavigate: true,
+    // Feature request: whether the Marked Wayspots list's "Copy All"
+    // appends each entry's note -- see waeCopyIncludesNotes().
+    copyIncludeNotes: true,
   });
   // Set once at startPlugin() (WFMM.markerAppearance.registerStyle()'s
   // return value) and called at stopPlugin() -- registerStyle() throws
@@ -5914,10 +5924,18 @@
     }
   }
 
-  function waeFormatMarkedWayspotLine(item) {
+  function waeFormatMarkedWayspotLine(item, includeNotes = true) {
     const name = item.name || '(unnamed)';
     const coords = `${Number(item.lat).toFixed(6)}, ${Number(item.lng).toFixed(6)}`;
-    return item.note ? `${name}, ${coords} (${item.note})` : `${name}, ${coords}`;
+    return (includeNotes && item.note) ? `${name}, ${coords} (${item.note})` : `${name}, ${coords}`;
+  }
+
+  // Feature request: "Copy All" on the Marked Wayspots list can copy with
+  // or without each entry's note, via a checkbox next to it. On by
+  // default (what Copy All always did before this existed). Stored in
+  // WFMM.settings like this file's other real preferences.
+  function waeCopyIncludesNotes() {
+    return wfmmWindow.WFMM.settings.get(PLUGIN_ID, 'copyIncludeNotes', true) !== false;
   }
 
   // One list row: name/coords/delete on the first line, a click-to-edit
@@ -6017,6 +6035,11 @@
     const copyAllBtn = ui.button({ text: 'Copy All', disabled: true });
     const clearAllBtn = ui.button({ text: 'Clear All', variant: 'danger', disabled: true });
     const buttonRow = ui.buttonRow([copyAllBtn, clearAllBtn]);
+    const copyNotesToggle = ui.checkboxRow({
+      label: 'Include notes when copying',
+      checked: waeCopyIncludesNotes(),
+      onChange: (checked) => wfmmWindow.WFMM.settings.set(PLUGIN_ID, 'copyIncludeNotes', checked),
+    });
 
     function render() {
       listContainer.innerHTML = '';
@@ -6039,7 +6062,7 @@
     copyAllBtn.addEventListener('click', async () => {
       const list = waeLoadMarkedWayspots();
       if (!list.length) return;
-      const ok = await waeCopyToClipboard(list.map(waeFormatMarkedWayspotLine).join('\n'));
+      const ok = await waeCopyToClipboard(list.map((item) => waeFormatMarkedWayspotLine(item, waeCopyIncludesNotes())).join('\n'));
       copyAllBtn.textContent = ok ? 'Copied!' : 'Copy failed';
       setTimeout(() => { copyAllBtn.textContent = 'Copy All'; }, 1500);
     });
@@ -6052,7 +6075,7 @@
       render();
     });
 
-    body.append(formLinkEl, buttonRow, listContainer);
+    body.append(formLinkEl, buttonRow, copyNotesToggle.row, listContainer);
     render();
     waeMarkListRenderHook = render;
 
