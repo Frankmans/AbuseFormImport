@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.53.6
+// @version      1.55.1
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -15,6 +15,105 @@
 // ==/UserScript==
 
 /*
+ * v1.55.1 CHANGE FROM v1.55.0 (bugfix): v1.55.0 guessed at the wrong
+ * element for the submitter's username (.wfmapmods-detail-username).
+ * The real one is <div class="wfmapmods-detail-poi-submitter">Submitted
+ * by NAME</div> -- the whole line, not just the name -- so the watcher
+ * now matches that element, splits off the "Submitted by " prefix, and
+ * wraps only the username in its own span, which is what becomes
+ * clickable/colored. The prefix stays plain text. Nothing else in the
+ * feature (storage, list, color setting) changed.
+ *
+ * v1.55.0 CHANGE FROM v1.54.0 (feature request): a submitter's username in
+ * the native side panel (shown whenever Base actually renders one for the
+ * current slot -- e.g. reviewing a nomination) is now clickable, toggling
+ * it in/out of a new Favorite Users scratch list. A favorited username is
+ * colored (bold, in a user-customizable color -- new "Favorite user
+ * color" picker in Marker Style settings, right alongside the existing
+ * Marked Wayspot color one, default amber) both live in the side panel
+ * and in this new list's own rows. The list itself lives in the SAME
+ * modal as Marked Wayspots (waeRenderFavoriteUsersSection(), its own
+ * ui.section() within that modal) rather than a modal of its own, per how
+ * this was asked for. Persisted via WFMM.settings, same registry/
+ * reasoning as everything else this file already keeps there.
+ * waeStartSidePanelDetailsWatcher() reads the username off a new
+ * .wfmapmods-detail-poi-submitter element (see v1.55.1), same DOM-read approach (and same
+ * Base-slot source) as the title/coords/status it already reads there.
+ *
+ * v1.54.0 CHANGE FROM v1.53.9 (feature request): the main abuse-report
+ * table's column widths are user-adjustable now -- drag the border
+ * between two header cells to resize, cursor changes to col-resize right
+ * over the border to show it's draggable. The nth-child percentages this
+ * file used to hardcode (WAE_TABLE_COLUMN_DEFAULTS now) are just the
+ * starting point; a drag only ever trades width between the two columns
+ * it sits between, so every column's share still always sums to 100% --
+ * no horizontal-scroll container needed, this table's never had one.
+ * Saved per column KEY (not position) via WFMM.settings -- same registry/
+ * reasoning as this file's own appearance settings, so a real layout
+ * preference like this is worth carrying through WFMM's own Settings >
+ * Backups, not just this browser profile -- so it survives a future
+ * column being inserted/reordered, and carries over to every session.
+ * waeMakeTableColumnsResizable() (new) does this by building a
+ * <colgroup> at render time instead of the old CSS width-by-nth-child
+ * rule, and attaching the drag handles themselves -- see that function's
+ * own comment for why a colgroup specifically, over setting width
+ * directly on the header cells.
+ *
+ * v1.53.9 CHANGE FROM v1.53.8 (feature request): the date of the last
+ * interaction now shows right after a ticket number, everywhere one
+ * shows up -- the main map's single-report InfoWindow
+ * (waeShowPulseInfoWindow()), its cluster InfoWindow's per-ticket list
+ * (waeShowPulseClusterInfoWindow()), the review-page InfoWindow
+ * (waeShowReviewPulseInfoWindow()), and the native side panel's own
+ * ticket-number line (waeStartSidePanelDetailsWatcher()). Sourced from
+ * lastResponseAt, the same per-ticket "most recent message" timestamp the
+ * main table's own Last Response column already shows -- a short date in
+ * the line itself, full date+time on hover, via one new shared
+ * waeFormatTicketDateSuffix() wrapping the table column's own
+ * waeFormatLastResponse() so all four surfaces format it identically.
+ * When the side panel's line lists more than one ticket for the same
+ * Wayspot, only the single most recent date across all of them is shown
+ * (not one date per ticket) -- waeFindMatchingTicketNumbers() now returns
+ * {ticket, lastResponseAt} pairs instead of bare ticket strings so that
+ * line can work out which one that is; its one caller was updated to
+ * match. A ticket with no parseable date shows no date suffix at all,
+ * same "blank rather than guess" convention as everywhere else this file
+ * already handles a missing lastResponseAt.
+ *
+ * v1.53.8 CHANGE FROM v1.53.7 (feature request): Marked Wayspots list rows
+ * are now clickable, same as a row in the main abuse-report table already
+ * is -- clicking the name/coords line pans/zooms the map to that Wayspot
+ * and pops its InfoWindow (waeShowMarkedWayspotInfoWindow(), the same one
+ * this list's own map markers already show on click), via the new
+ * waeGoToMarkedWayspot(), a twin of waeGoToLocation() for a marked
+ * entry's own lat/lng/name/note shape rather than a report record's.
+ * Clicking "\u00d7" to remove an entry still doesn't also navigate to it
+ * on the way out -- deleteBtn's own listener stops propagation before
+ * the row's new click handler ever sees it, same as it always did against
+ * this row's other click handlers. Clicking the note line is unaffected
+ * -- that's a separate element (noteEl), not part of the newly-clickable
+ * main line, so its own click-to-edit behavior didn't need to change.
+ *
+ * v1.53.7 CHANGE FROM v1.53.6 (feature request, companion-script side):
+ * exposes wfmmWindow.WayfarerAbuseReportExtractor.scanImportedEmails(),
+ * so the companion Abuse Email Importer script's own new "scan after
+ * import" checkbox (its own v4.11.0) can trigger a real scan right after
+ * a Gmail sync/.eml import, without this script's panel needing to be
+ * open first. The panel's own Scan button and this new external entry
+ * point both now call one shared waeScanAndPersist() -- pulled out of
+ * what used to be scanBtn's click handler inline -- which does the
+ * classify/parse/rebuild-from-scratch work (starred flags and CSV rows
+ * carried forward across the rebuild, exactly as before) and then
+ * refreshes whichever surfaces are actually attached, including the map/
+ * review pulses even when this panel itself isn't open -- refreshPanel()
+ * alone bails out entirely in that case (see its own comment), which
+ * never mattered before this, since a scan could previously only be
+ * triggered by a button click inside this very panel. See
+ * wfmmWindow.WayfarerAbuseReportExtractor's own comment, right above its
+ * assignment near the bottom of this file, for the wfmmWindow-vs-window
+ * reasoning (same distinction as the importer's own equivalent
+ * assignment, just in the other direction).
+ *
  * v1.53.6 CHANGE FROM v1.53.5 (feature request): the side-panel "+" button's
  * label is spelled back out to "+ add to abuse report draft" -- v1.52.0's
  * "+ Add" shortening (see that entry below) turned out too terse once
@@ -2062,6 +2161,44 @@
   let waeSortKey = waeInitialSortState.key;
   let waeSortDirection = waeInitialSortState.direction;
 
+  // Feature request: table column widths are user-adjustable (drag the
+  // border between two header cells in buildTableSection() below) rather
+  // than fixed forever -- these percentages (summing to 100, matching
+  // this file's own long-standing tuned widths) are now just the
+  // STARTING point a first render falls back to. Keyed by the same
+  // column `key` buildTableSection() already gives each column (not by
+  // position), so a saved width still lands on the right column even if
+  // a future column gets inserted/reordered there. Persisted via
+  // WFMM.settings (see waeLoadTableColumnWidths()/
+  // waeSaveTableColumnWidths()) rather than raw localStorage the way sort
+  // state above still is -- same reasoning as this file's own appearance
+  // settings: a real, user-tuned layout preference is worth carrying
+  // through WFMM's own Settings > Backups export/import, not just this
+  // browser profile.
+  const WAE_TABLE_COLUMN_DEFAULTS = {
+    starred: 5, conversation: 8, name: 19, lat: 9, lng: 9,
+    comment: 5, nearby: 5, status: 18, lastResponse: 22,
+  };
+  // Floor on any one column's share -- keeps a fat-fingered drag from
+  // shrinking a column to nothing (and, since a drag only ever trades
+  // width between the two columns it's between -- see
+  // waeMakeTableColumnsResizable()'s own comment -- from ever needing to
+  // touch a THIRD column just to keep this floor everywhere at once).
+  const WAE_TABLE_MIN_COLUMN_PERCENT = 4;
+  function waeLoadTableColumnWidths() {
+    const saved = wfmmWindow.WFMM.settings.get(PLUGIN_ID, 'tableColumnWidths', null);
+    const widths = { ...WAE_TABLE_COLUMN_DEFAULTS };
+    if (saved && typeof saved === 'object') {
+      for (const key of Object.keys(widths)) {
+        if (Number.isFinite(saved[key]) && saved[key] >= WAE_TABLE_MIN_COLUMN_PERCENT) widths[key] = saved[key];
+      }
+    }
+    return widths;
+  }
+  function waeSaveTableColumnWidths(widths) {
+    wfmmWindow.WFMM.settings.set(PLUGIN_ID, 'tableColumnWidths', widths);
+  }
+
   // ---------------------------------------------------------------------
   // Marker appearance -- v1.23.0. Registered with WFMM.markerAppearance
   // (confirmed against the real source, src/core/marker-appearance.js) so
@@ -2118,6 +2255,13 @@
     // marker types (abuse-report crosses/clusters vs. this plugin's own
     // scratch-list dots) stay visually distinguishable even before
     // anyone customizes either one.
+    // Feature request: color for a favorited submitter's username in the
+    // side panel (see waeStartSidePanelDetailsWatcher()'s own comment on
+    // where that's read/styled) -- amber by default, distinct from both
+    // fillColor's red and markColor's blue above so all three stay
+    // visually distinguishable from each other without anyone having to
+    // customize anything first.
+    favoriteUserColor: '#f59e0b',
     markColor: '#2563eb',
   });
   // Combined with autoCloseOnNavigate (see waeAutoCloseOnNavigateEnabled()
@@ -2162,6 +2306,7 @@
       // than as a separate WFMM.settings key.
       clickable: typeof a.clickable === 'boolean' ? a.clickable : WAE_APPEARANCE_DEFAULTS.clickable,
       markColor: waeNormalizeHexColor(a.markColor, WAE_APPEARANCE_DEFAULTS.markColor),
+      favoriteUserColor: waeNormalizeHexColor(a.favoriteUserColor, WAE_APPEARANCE_DEFAULTS.favoriteUserColor),
     };
   }
   // BUGFIX (not upstream, better-integration pass): used to be its own
@@ -2711,6 +2856,21 @@
     return cluster.recordIds.join(',');
   }
 
+  // Feature request: a "date of last interaction" appended after a ticket
+  // number, in both InfoWindow flavors below and the side-panel's own
+  // ticket-number line (waeStartSidePanelDetailsWatcher()) -- one shared
+  // helper so all three surfaces format the exact same timestamp the
+  // exact same way, reusing waeFormatLastResponse() (the main table's own
+  // "Last Response" column formatter, defined further down this file)
+  // rather than re-deriving short/full date strings a second way. Returns
+  // null for a ticket with no parseable date, same "blank rather than
+  // guess" convention waeFormatLastResponse() itself already follows.
+  function waeFormatTicketDateSuffix(lastResponseAt) {
+    const lr = waeFormatLastResponse(lastResponseAt);
+    if (!lr) return null;
+    return { text: ` \u2014 ${escapeHtml(lr.short)}`, title: escapeHtml(lr.full) };
+  }
+
   function waeShowPulseInfoWindow(record, latLng) {
     if (typeof google === 'undefined' || !google.maps?.InfoWindow || !WAE_PULSES.map) return;
     if (!WAE_PULSES.infoWindow) WAE_PULSES.infoWindow = new google.maps.InfoWindow();
@@ -2718,7 +2878,11 @@
     const parts = [`<div style="font-size:12px;max-width:260px;"><strong>${name}</strong>`];
     parts.push(`<div>${latLng.lat().toFixed(6)}, ${latLng.lng().toFixed(6)}</div>`);
     if (record.comment) parts.push(`<div style="margin-top:4px;color:#6b7280;word-break:break-all;">${escapeHtml(record.comment)}</div>`);
-    if (record.conversationId) parts.push(`<div style="margin-top:4px;color:#9ca3af;">Ticket ${escapeHtml(record.conversationId)}</div>`);
+    if (record.conversationId) {
+      const dateSuffix = waeFormatTicketDateSuffix(record.lastResponseAt);
+      const titleAttr = dateSuffix ? ` title="${dateSuffix.title}"` : '';
+      parts.push(`<div style="margin-top:4px;color:#9ca3af;"${titleAttr}>Ticket ${escapeHtml(record.conversationId)}${dateSuffix ? dateSuffix.text : ''}</div>`);
+    }
     parts.push('</div>');
     WAE_PULSES.infoWindow.setContent(parts.join(''));
     WAE_PULSES.infoWindow.setPosition(latLng);
@@ -2748,7 +2912,9 @@
     for (const record of cluster.records) {
       const ticket = record.conversationId || record.sourceEmailId || '(no ticket)';
       const name = escapeHtml(record.wayspotName || '(unnamed report)');
-      parts.push(`<li style="margin-bottom:2px;">${escapeHtml(String(ticket))} \u2014 ${name}</li>`);
+      const dateSuffix = waeFormatTicketDateSuffix(record.lastResponseAt);
+      const titleAttr = dateSuffix ? ` title="${dateSuffix.title}"` : '';
+      parts.push(`<li style="margin-bottom:2px;"${titleAttr}>${escapeHtml(String(ticket))} \u2014 ${name}${dateSuffix ? dateSuffix.text : ''}</li>`);
     }
     parts.push('</ul></div>');
     WAE_PULSES.infoWindow.setContent(parts.join(''));
@@ -2775,7 +2941,11 @@
     const parts = [`<div style="font-size:12px;max-width:260px;"><strong>${name}</strong>`];
     parts.push(`<div>${latLng.lat().toFixed(6)}, ${latLng.lng().toFixed(6)}</div>`);
     if (record.comment) parts.push(`<div style="margin-top:4px;color:#6b7280;word-break:break-all;">${escapeHtml(record.comment)}</div>`);
-    if (record.conversationId) parts.push(`<div style="margin-top:4px;color:#9ca3af;">Ticket ${escapeHtml(record.conversationId)}</div>`);
+    if (record.conversationId) {
+      const dateSuffix = waeFormatTicketDateSuffix(record.lastResponseAt);
+      const titleAttr = dateSuffix ? ` title="${dateSuffix.title}"` : '';
+      parts.push(`<div style="margin-top:4px;color:#9ca3af;"${titleAttr}>Ticket ${escapeHtml(record.conversationId)}${dateSuffix ? dateSuffix.text : ''}</div>`);
+    }
     parts.push('</div>');
     WAE_REVIEW_PULSES.infoWindow.setContent(parts.join(''));
     WAE_REVIEW_PULSES.infoWindow.setPosition(latLng);
@@ -3747,19 +3917,27 @@
     const buckets = waeGetTicketIndexBuckets();
     const cellLat = Math.floor(lat / WAE_GRID_DEG);
     const cellLon = Math.floor(lng / WAE_GRID_DEG);
-    const seen = new Set();
+    // Keyed by ticket rather than a plain Set now (feature request: the
+    // side-panel line built from this needs each ticket's own
+    // lastResponseAt to work out the single most recent date across all
+    // of them) -- lastResponseAt is a per-TICKET value, the same on every
+    // row for that ticket (see scanImportedEmails()'s own comment), so
+    // the first row seen for a given ticket already carries the right
+    // value; no need to compare/overwrite on a second sighting.
+    const seen = new Map();
     for (let dLat = -1; dLat <= 1; dLat++) {
       for (let dLon = -1; dLon <= 1; dLon++) {
         const bucket = buckets.get(`${cellLat + dLat}:${cellLon + dLon}`);
         if (!bucket) continue;
         for (const r of bucket) {
           if (waeHaversineMeters(lat, lng, r.latitude, r.longitude) <= WAE_NEARBY_THRESHOLD_METERS) {
-            seen.add(r.conversationId || r.sourceEmailId);
+            const ticket = r.conversationId || r.sourceEmailId;
+            if (!seen.has(ticket)) seen.set(ticket, r.lastResponseAt);
           }
         }
       }
     }
-    return Array.from(seen);
+    return Array.from(seen.entries()).map(([ticket, lastResponseAt]) => ({ ticket, lastResponseAt }));
   }
 
   // v1.53.6: spelled back out from the terser "+ Add" (v1.52.0's own
@@ -3768,11 +3946,95 @@
   // initial text, and the post-"\u2713 Added"/"\u2713 Updated" reset).
   const WAE_MARK_BTN_LABEL = '+ add to abuse report draft';
 
+  // The username element currently shown in the side panel, if any --
+  // kept so a color change in the Marker Style settings modal
+  // (waeRenderMarkerStyleSection()'s favoriteUserColor picker) can
+  // restyle it immediately, the same "apply live, don't wait for the
+  // slot to re-render" behavior markColor's own picker already gives
+  // waeRenderMarkedWayspotMarkers(). Cleared (set back to null) at the
+  // top of every DETAILS_CHANGED firing, including ones with no username
+  // to show at all -- so this never points at a stale element from a
+  // previous, different Wayspot's slot.
+  let waeCurrentUsernameEl = null;
+
+  // Applies (or clears) the favorite styling on a live username element --
+  // shared between where it's first set up below and the toggle-on-click
+  // handler right next to it, so both always agree on what "favorited"
+  // looks like.
+  function waeApplyFavoriteUsernameStyle(el, username) {
+    if (waeIsFavoriteUser(username)) {
+      el.style.color = waeLoadAppearance().favoriteUserColor;
+      el.style.fontWeight = '700';
+    } else {
+      el.style.color = '';
+      el.style.fontWeight = '';
+    }
+  }
+
+  // Called from the Marker Style settings modal's favoriteUserColor
+  // picker (waeRenderMarkerStyleSection()) so a color change applies
+  // immediately to whatever username is currently on screen, the same
+  // "apply live" behavior markColor's own picker already gives
+  // waeRenderMarkedWayspotMarkers() -- rather than leaving it stale until
+  // the side panel happens to re-render for some other reason. isConnected
+  // guards against the slot (and this element along with it) having
+  // already been torn down/replaced by a different selection since --
+  // same defensive check the "+ add to abuse report draft" button's own
+  // post-click reset uses for the same reason.
+  function waeRestyleCurrentFavoriteUsername() {
+    if (waeCurrentUsernameEl && waeCurrentUsernameEl.isConnected) {
+      waeApplyFavoriteUsernameStyle(waeCurrentUsernameEl, waeCurrentUsernameEl.textContent.trim());
+    }
+  }
+
   function waeStartSidePanelDetailsWatcher() {
     if (waeSidePanelDetailsUnsub) return; // already subscribed
     const WFMM = wfmmWindow.WFMM;
     waeSidePanelDetailsUnsub = WFMM.events.on(WFMM.sidePanel.EVENTS.DETAILS_CHANGED, ({ slot }) => {
       if (!slot) return;
+
+      // Feature request: click a submitter's username -- shown here
+      // whenever Base actually renders one for the current slot (e.g.
+      // reviewing a nomination; a mapview/submit Wayspot with no
+      // submitter of its own has nothing here to click) -- to toggle
+      // them in/out of a separate Favorite Users scratch list, visible in
+      // the same modal as the Marked Wayspots list (see
+      // waeRenderFavoriteUsersSection(), further down this file, for that
+      // list itself; waeToggleFavoriteUser()/waeIsFavoriteUser() above
+      // for the storage). Handled before the coordinate check below
+      // (and independent of it either way) since favoriting a person
+      // doesn't need this Wayspot to have coordinates -- the ticket-line/
+      // mark-row features right after this DO, hence that check staying
+      // where it is.
+      waeCurrentUsernameEl = null;
+      // Base renders this as one div reading "Submitted by <username>"
+      // (.wfmapmods-detail-poi-submitter, confirmed against the live DOM)
+      // -- the whole line, not just the name. Split here so only the
+      // username itself becomes the click target/gets colored, with the
+      // "Submitted by " prefix left as plain text in front of it. The
+      // slot is rebuilt by Base on every selection (see this watcher's
+      // own top comment), so rewriting this element's children is as
+      // safe as the ticket line/mark row this watcher already injects.
+      const submitterEl = slot.querySelector('.wfmapmods-detail-poi-submitter');
+      const submitterMatch = submitterEl?.textContent.match(/^(\s*Submitted by\s+)(\S.*?)\s*$/i);
+      if (submitterMatch) {
+        const username = submitterMatch[2];
+        submitterEl.textContent = submitterMatch[1];
+        const usernameEl = document.createElement('span');
+        usernameEl.textContent = username;
+        submitterEl.appendChild(usernameEl);
+        waeCurrentUsernameEl = usernameEl;
+        usernameEl.classList.add('wae-favorite-username-trigger');
+        usernameEl.title = 'Click to toggle as a favorite user';
+        waeApplyFavoriteUsernameStyle(usernameEl, username);
+        usernameEl.addEventListener('click', (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          waeToggleFavoriteUser(username);
+          waeApplyFavoriteUsernameStyle(usernameEl, username);
+        });
+      }
+
       const coordsEl = slot.querySelector('.wfmapmods-detail-coords');
       const lat = Number(coordsEl?.dataset.lat);
       const lng = Number(coordsEl?.dataset.lng);
@@ -3785,7 +4047,22 @@
       if (tickets.length) {
         const line = document.createElement('div');
         line.className = 'wae-detail-ticket-line';
-        line.textContent = tickets.map((t) => `#${t}`).join(', ');
+        // Feature request: the date of the last interaction, shown after
+        // the ticket number(s) -- when this Wayspot matches more than one
+        // ticket, only the single most recent date across all of them is
+        // shown (not one date per ticket), since that's the one that
+        // actually answers "is this still active?" and this line has
+        // limited room for a per-ticket breakdown. Reuses
+        // waeFormatTicketDateSuffix() (this file's own InfoWindow
+        // functions use the exact same helper) for the same short-in-the-
+        // line/full-on-hover formatting everywhere this shows up.
+        const ticketText = tickets.map((t) => `#${t.ticket}`).join(', ');
+        const latest = tickets.reduce((max, t) => (
+          Number.isFinite(t.lastResponseAt) && (max === null || t.lastResponseAt > max) ? t.lastResponseAt : max
+        ), null);
+        const dateSuffix = waeFormatTicketDateSuffix(latest);
+        line.textContent = dateSuffix ? `${ticketText}${dateSuffix.text}` : ticketText;
+        if (dateSuffix) line.title = dateSuffix.title;
         statusRow.parentNode.insertBefore(line, statusRow);
       }
 
@@ -3995,6 +4272,73 @@
     }
   }
 
+
+  // ---------------------------------------------------------------------
+  // Scan-and-persist: runs scanImportedEmails() (below) and writes its
+  // result to storage, carrying starred flags and CSV-imported rows
+  // forward across the rebuild -- factored out of the panel's own Scan
+  // button (buildPanelContent()'s scanBtn handler) so the exact same
+  // logic can also run with no panel open at all. That's what the
+  // external API right below this needs: the companion Abuse Email
+  // Importer script's own "scan after import" checkbox triggers a scan
+  // right after a Gmail sync/.eml import, which will essentially always
+  // happen from ITS panel, not this one -- refreshPanel() alone bails out
+  // entirely when waeUI is null (see its own comment), which was never a
+  // problem before this function existed since a scan could previously
+  // only be triggered by clicking a button inside this panel, guaranteeing
+  // it was already open. Explicitly refreshes the map/review surfaces
+  // here too, for exactly that externally-triggered, panel-closed case.
+  async function waeScanAndPersist(onProgress) {
+    // Fetched BEFORE the rebuild below wipes them -- carries starred
+    // flags forward across a re-scan, which the full-rebuild-from-
+    // scratch approach (see the comment a few lines down) would
+    // otherwise silently lose every single time, same as it would
+    // any other flag not sourced fresh from the emails themselves.
+    const previousRecords = await getAllExtractedRecords();
+    const starredKeys = new Set(previousRecords.filter((r) => r.starred).map(waeStarredKey));
+    // CSV-imported rows (see waeParseCsvImport()) don't come from a
+    // scanned email at all, so there's nothing for a re-scan to
+    // re-derive them from -- unlike every other row, wiping them in
+    // the rebuild below would be permanent, not just "re-scan to get
+    // them back". Set aside here and re-added after the rebuild
+    // completes, same idea as the starred carry-over just above but
+    // for whole rows rather than one field on rows that do get
+    // re-derived.
+    const csvRecords = previousRecords.filter((r) => r.source === 'csv');
+
+    const { extracted, ticketDetails } = await scanImportedEmails(onProgress);
+    if (starredKeys.size) {
+      for (const r of extracted) {
+        if (starredKeys.has(waeStarredKey(r))) r.starred = true;
+      }
+    }
+    // Rebuild from scratch rather than upsert: a ticket's row count can
+    // change between scans (a multi-location ticket now yields several
+    // "conv:X:0" / "conv:X:1" / ... rows instead of one "conv:X" row),
+    // and upserting alone would leave the old id's row behind as a
+    // stale duplicate. Source data is the already-imported emails, so
+    // a full rebuild is cheap and side-steps that entirely. Both
+    // stores rebuild together -- ticketDetails is the per-ticket raw
+    // text extractedReports' rows now reference via ticketKey rather
+    // than each carrying their own copy (see EXTRACT_DB_VERSION note).
+    await clearExtractedRecords();
+    await clearTicketDetails();
+    await putExtractedRecords([...extracted, ...csvRecords]);
+    await putTicketDetails(ticketDetails);
+
+    const ticketCount = new Set(extracted.map((r) => r.conversationId || r.sourceEmailId)).size;
+    const missingCoords = extracted.filter((r) => r.latitude === null).length;
+
+    await refreshPanel(); // no-op if the panel isn't open -- see its own comment
+    if (!waeUI) {
+      // refreshPanel() would otherwise have done exactly this -- see its
+      // own comment on why that's nested under an early `if (!waeUI)
+      // return` -- so it's repeated here for the panel-closed case.
+      if (WAE_PULSES.map && isMapPulsesEnabled()) waeSafeRefreshPulses();
+      if (WAE_REVIEW_PULSES.map) waeSafeRefreshReviewPulses();
+    }
+    return { extractedCount: extracted.length, ticketCount, missingCoords };
+  }
 
   // ---------------------------------------------------------------------
   // Scan: raw imported emails -> extracted rows
@@ -4374,7 +4718,8 @@
     .wae-mark-marker svg{ display:block; }
     .wae-mark-form-link{ display:block; font-size:12px; margin-bottom:6px; }
     .wae-mark-row{ border:1px solid var(--wfmm-border, #e5e7eb); border-radius:6px; padding:6px 8px; margin-bottom:6px; }
-    .wae-mark-row-main{ display:flex; align-items:center; gap:8px; }
+    .wae-mark-row-main{ display:flex; align-items:center; gap:8px; cursor:pointer; }
+    .wae-mark-row-main:hover .wae-mark-row-name{ text-decoration:underline; }
     .wae-mark-row-name{ font-weight:600; font-size:12px; flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .wae-mark-row-coord{ font-size:11px; color:var(--wfmm-muted-text, #667085); flex-shrink:0; }
     .wae-mark-row-delete{ flex-shrink:0; border:none; background:none; color:var(--wfmm-muted-text, #667085); font-size:16px; line-height:1; cursor:pointer; padding:0 2px; }
@@ -4382,6 +4727,28 @@
     .wae-mark-row-note{ margin-top:4px; font-size:11px; color:var(--wfmm-muted-text, #667085); cursor:pointer; word-break:break-word; white-space:pre-wrap; }
     .wae-mark-row-note-empty{ font-style:italic; opacity:0.7; }
     .wae-mark-row-note-input{ margin-top:4px; width:100%; box-sizing:border-box; font:inherit; font-size:11px; resize:vertical; }
+    /* Feature request: Favorite Users list -- same visual language
+       (bordered row, small "\u00d7" remove button) as the Marked Wayspots
+       rows just above, minus that list's own note/coordinates line since
+       a favorite user is just a name. */
+    .wae-favorite-user-row{
+      display:flex; align-items:center; gap:8px;
+      border:1px solid var(--wfmm-border, #e5e7eb); border-radius:6px;
+      padding:6px 8px; margin-bottom:6px;
+    }
+    .wae-favorite-user-name{ font-size:12px; flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .wae-favorite-user-remove{ flex-shrink:0; border:none; background:none; color:var(--wfmm-muted-text, #667085); font-size:16px; line-height:1; cursor:pointer; padding:0 2px; }
+    .wae-favorite-user-remove:hover{ color:#dc2626; }
+    /* Feature request: the submitter-username element itself, live in
+       Wayfarer's own side panel -- see waeStartSidePanelDetailsWatcher()'s
+       own comment. Underline-on-hover is the only affordance needed here
+       (unlike the Marked Wayspots "+" row, this isn't adding a whole new
+       row of controls to the panel) since the color change on click is
+       itself immediate, visible feedback that something happened.
+       Favorited color itself is applied inline (waeApplyFavoriteUsernameStyle()),
+       not here, since it's user-customizable (Marker Style settings). */
+    .wae-favorite-username-trigger{ cursor:pointer; }
+    .wae-favorite-username-trigger:hover{ text-decoration:underline; }
     .wae-csv-hint{ white-space:pre-line; font-family:ui-monospace, monospace; }
     /* BUGFIX (not upstream): the crosses/clusters this plugin draws on the
        map used to be google.maps.Marker instances with a data: URI SVG
@@ -4484,18 +4851,31 @@
        the same way, rather than silently reproducing this exact bug
        again. */
     .wae-table{ table-layout: fixed; }
-    .wae-table th:nth-child(1), .wae-table td:nth-child(1){ width: 5%; }
-    .wae-table th:nth-child(2), .wae-table td:nth-child(2){ width: 8%; }
-    .wae-table th:nth-child(3), .wae-table td:nth-child(3){ width: 19%; }
-    .wae-table th:nth-child(4), .wae-table td:nth-child(4){ width: 9%; }
-    .wae-table th:nth-child(5), .wae-table td:nth-child(5){ width: 9%; }
-    .wae-table th:nth-child(6), .wae-table td:nth-child(6){ width: 5%; }
-    .wae-table th:nth-child(7), .wae-table td:nth-child(7){ width: 5%; }
-    .wae-table th:nth-child(8), .wae-table td:nth-child(8){ width: 18%; }
-    .wae-table th:nth-child(9), .wae-table td:nth-child(9){ width: 22%; }
+    /* Per-column widths used to be fixed here by nth-child position --
+       now a <colgroup> waeMakeTableColumnsResizable() builds at render
+       time controls each column's share instead (see that function's own
+       comment for why a colgroup, specifically, rather than width on the
+       header cells themselves), driven by WAE_TABLE_COLUMN_DEFAULTS/
+       waeLoadTableColumnWidths() further up the file. table-layout:fixed
+       above still needs to stay, though -- that's what makes a
+       <colgroup>'s widths authoritative at all instead of every column
+       just sizing to its own content. */
     .wae-table td{
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     }
+    /* Feature request: the actual drag handle waeMakeTableColumnsResizable()
+       attaches to every header cell except the last -- a thin strip
+       straddling the border between two columns (right:-3px, half its own
+       6px width past the header cell's own right edge) so the hit target
+       is centered ON the border a user would expect to drag, not offset
+       to one side of it. th itself gets position:relative from that same
+       function (JS, not here) so this absolute positioning is relative to
+       the RIGHT header cell, not the table or the page. */
+    .wae-col-resize-handle{
+      position:absolute; top:0; right:-3px; width:6px; height:100%;
+      cursor:col-resize; z-index:2;
+    }
+    .wae-col-resize-handle:hover{ background:rgba(37,99,235,0.35); }
     .wae-pagination{ display:flex; align-items:center; justify-content:center; gap:10px; margin-top:8px; }
     .wae-pagination .wae-sub{ margin:0; white-space:nowrap; }
     td.wae-missing{ color:#9ca3af; font-style:italic; }
@@ -4659,6 +5039,111 @@
       return `${ticket}|${r.latitude.toFixed(6)},${r.longitude.toFixed(6)}`;
     }
     return `${ticket}|name:${r.wayspotName || ''}`;
+  }
+
+  // Feature request: makes an already-rendered wae-table's columns
+  // user-resizable by dragging the border between two header cells.
+  // Called fresh at the end of buildTableSection() on every render (that
+  // whole table is torn down and rebuilt from scratch on every render
+  // anyway -- see waeRenderFilteredTable() -- so there's no separate
+  // "keep an existing colgroup in sync" case to maintain).
+  //
+  // A <colgroup> (one <col> per column, same order as the `columns` array
+  // buildTableSection() itself builds) is what actually controls each
+  // column's share of the table here, rather than setting width directly
+  // on the header cells -- more reliable across browsers for a
+  // table-layout:fixed table, some of which only really respect a
+  // column's width from a table's very first row (which may or may not
+  // count a <thead> row, depending on the engine); a <colgroup> has no
+  // such ambiguity.
+  //
+  // Dragging a handle only ever trades width between the TWO columns it
+  // sits between (their combined share stays constant) rather than
+  // growing the table's overall width -- keeps every column's percentage
+  // summing to 100% always, with no horizontal-scroll container needed
+  // for this table (it's never had one).
+  function waeMakeTableColumnsResizable(tableEl, columns) {
+    tableEl.querySelector(':scope > colgroup')?.remove();
+    const colgroup = document.createElement('colgroup');
+    const widths = waeLoadTableColumnWidths();
+    const cols = columns.map((col) => {
+      const c = document.createElement('col');
+      c.style.width = `${widths[col.key] ?? (100 / columns.length)}%`;
+      colgroup.appendChild(c);
+      return c;
+    });
+    tableEl.insertBefore(colgroup, tableEl.firstChild);
+
+    const headerRow = tableEl.querySelector('thead tr');
+    if (!headerRow) return; // defensive -- nothing to attach handles to
+    const ths = Array.from(headerRow.children);
+
+    ths.forEach((th, i) => {
+      if (i >= columns.length - 1) return; // no handle after the last column -- nothing to its right to trade width with
+      const handle = document.createElement('div');
+      handle.className = 'wae-col-resize-handle';
+      // Absolute-positioned relative to THIS header cell (not the table
+      // or the page) -- th's own default position (static) would anchor
+      // it to the nearest ALREADY-positioned ancestor instead, which
+      // could be the table or scroll wrapper depending on what table()'s
+      // own markup happens to do upstream of this.
+      if (!th.style.position) th.style.position = 'relative';
+      th.appendChild(handle);
+
+      handle.addEventListener('mousedown', (ev) => {
+        // Stops this from also reaching whatever sort-on-click handling
+        // table() itself put on this header cell (or a button inside
+        // it) -- a drag to resize shouldn't also re-sort the column.
+        ev.preventDefault();
+        ev.stopPropagation();
+        const tableWidth = tableEl.getBoundingClientRect().width;
+        if (!tableWidth) return;
+        const startX = ev.clientX;
+        const startLeftPercent = parseFloat(cols[i].style.width) || 0;
+        const startRightPercent = parseFloat(cols[i + 1].style.width) || 0;
+        const leftKey = columns[i].key;
+        const rightKey = columns[i + 1].key;
+        const previousCursor = document.body.style.cursor;
+        document.body.style.cursor = 'col-resize';
+
+        const onMove = (moveEv) => {
+          const deltaPercent = ((moveEv.clientX - startX) / tableWidth) * 100;
+          let newLeft = startLeftPercent + deltaPercent;
+          let newRight = startRightPercent - deltaPercent;
+          // Floor enforcement moves the OTHER column's share by whatever
+          // amount was clamped off this one, rather than just clamping
+          // this one alone -- that's what keeps the pair's combined
+          // share (and so the whole row's 100% total) exactly constant
+          // through the clamp, not just before it.
+          if (newLeft < WAE_TABLE_MIN_COLUMN_PERCENT) {
+            newRight -= (WAE_TABLE_MIN_COLUMN_PERCENT - newLeft);
+            newLeft = WAE_TABLE_MIN_COLUMN_PERCENT;
+          }
+          if (newRight < WAE_TABLE_MIN_COLUMN_PERCENT) {
+            newLeft -= (WAE_TABLE_MIN_COLUMN_PERCENT - newRight);
+            newRight = WAE_TABLE_MIN_COLUMN_PERCENT;
+          }
+          cols[i].style.width = `${newLeft}%`;
+          cols[i + 1].style.width = `${newRight}%`;
+        };
+        const onUp = () => {
+          document.removeEventListener('mousemove', onMove);
+          document.removeEventListener('mouseup', onUp);
+          document.body.style.cursor = previousCursor;
+          // Re-reads current saved widths (rather than reusing `widths`
+          // from this render) before writing back -- avoids clobbering a
+          // change from some other, unrelated column drag that happened
+          // to be saved in between this table's render and this drag
+          // actually finishing.
+          const latest = waeLoadTableColumnWidths();
+          latest[leftKey] = parseFloat(cols[i].style.width);
+          latest[rightKey] = parseFloat(cols[i + 1].style.width);
+          waeSaveTableColumnWidths(latest);
+        };
+        document.addEventListener('mousemove', onMove);
+        document.addEventListener('mouseup', onUp);
+      });
+    });
   }
 
   // Builds the table (or an empty-state) for the current page, using
@@ -4825,6 +5310,12 @@
       }
       if (nearby && nearby.length) tr.classList.add('wae-row-nearby');
     });
+
+    // table() has no per-column width option either -- see
+    // waeMakeTableColumnsResizable()'s own comment just above
+    // buildTableSection() for what this actually builds and why.
+    const tableEl = wrap.tagName === 'TABLE' ? wrap : wrap.querySelector('table');
+    if (tableEl) waeMakeTableColumnsResizable(tableEl, columns);
 
     const children = [wrap];
     if (totalPages > 1) {
@@ -5105,6 +5596,85 @@
   let waeMarkListRenderHook = null;
 
   // ---------------------------------------------------------------------
+  // Feature request: a Favorite Users scratch list -- click a submitter's
+  // username in the native side panel (waeStartSidePanelDetailsWatcher()
+  // below) to toggle them in/out. Deliberately its own small list rather
+  // than folded into Marked Wayspots above (a username isn't a location,
+  // has no coordinates/note of its own to carry), but shown in that same
+  // modal (waeRenderFavoriteUsersSection(), further down) rather than a
+  // modal of its own -- exactly what was asked for, and the two lists
+  // already share a natural home: both are "things noticed while
+  // reviewing, jotted down for later" scratch lists, not part of the
+  // ticket-tracking table this plugin's main panel is otherwise about.
+  // Persisted via WFMM.settings, same mechanism (and same reasoning) as
+  // the Marked Wayspots list just above.
+  // ---------------------------------------------------------------------
+
+  const WAE_FAVORITE_USERS_SETTINGS_KEY = 'favoriteUsers';
+
+  function waeLoadFavoriteUsers() {
+    try {
+      const list = wfmmWindow.WFMM.settings.get(PLUGIN_ID, WAE_FAVORITE_USERS_SETTINGS_KEY, []);
+      return Array.isArray(list) ? list : [];
+    } catch (e) {
+      return [];
+    }
+  }
+
+  function waeSaveFavoriteUsers(list) {
+    try {
+      wfmmWindow.WFMM.settings.set(PLUGIN_ID, WAE_FAVORITE_USERS_SETTINGS_KEY, list);
+    } catch (e) { /* ignore -- next mutation attempt will just try again */ }
+  }
+
+  // Matched case-insensitively, trimmed -- a username read off the side
+  // panel a second time (a different report by the same person, or the
+  // same one re-opened) should still count as the SAME favorite even if
+  // whatever rendered it capitalized it differently that time, rather
+  // than silently accumulating near-duplicate entries that all display
+  // the same to a human but never match each other.
+  function waeFavoriteUserKey(username) {
+    return (username || '').trim().toLowerCase();
+  }
+
+  function waeIsFavoriteUser(username) {
+    const key = waeFavoriteUserKey(username);
+    if (!key) return false;
+    return waeLoadFavoriteUsers().some((u) => waeFavoriteUserKey(u.username) === key);
+  }
+
+  // Toggles rather than a separate add/remove pair -- one click target
+  // (the username itself, see waeStartSidePanelDetailsWatcher()) has to
+  // serve both "mark" and "unmark", there's no second control to put an
+  // explicit remove action on the way the Marked Wayspots list has its
+  // own "\u00d7" button for that. Returns the new state so the caller
+  // (both the side panel and this list's own row remove button) can
+  // restyle whatever it's showing without a second waeIsFavoriteUser()
+  // lookup right after.
+  function waeToggleFavoriteUser(username) {
+    const name = (username || '').trim();
+    const key = waeFavoriteUserKey(name);
+    if (!key) return false;
+    const list = waeLoadFavoriteUsers();
+    const idx = list.findIndex((u) => waeFavoriteUserKey(u.username) === key);
+    let isFavoriteNow;
+    if (idx >= 0) {
+      list.splice(idx, 1);
+      isFavoriteNow = false;
+    } else {
+      list.push({ username: name, markedAt: Date.now() });
+      isFavoriteNow = true;
+    }
+    waeSaveFavoriteUsers(list);
+    waeFavoriteUsersRenderHook?.();
+    return isFavoriteNow;
+  }
+
+  // Same idea as waeMarkListRenderHook above, for the Favorite Users
+  // block within that same modal.
+  let waeFavoriteUsersRenderHook = null;
+
+  // ---------------------------------------------------------------------
   // Feature request: a visual marker on the map (mapview/submit) for
   // every entry on the Marked Wayspots list, not just an entry in the
   // list modal -- a small filled dot, default blue, in a color this
@@ -5174,6 +5744,31 @@
     WAE_PULSES.infoWindow.setContent(parts.join(''));
     WAE_PULSES.infoWindow.setPosition(latLng);
     WAE_PULSES.infoWindow.open(WAE_PULSES.map);
+  }
+
+  // Feature request: clicking a Marked Wayspots list row navigates the
+  // map there and shows an InfoWindow, same as clicking a row in the main
+  // abuse-report table already does via waeGoToLocation() -- this is that
+  // same attach/center/zoom/autoclose sequence, just for a marked-wayspot
+  // item's own shape (lat/lng/name/note) rather than a report record's
+  // (latitude/longitude/wayspotName/comment/conversationId), and reusing
+  // the InfoWindow this list's own map markers already show on click
+  // (waeShowMarkedWayspotInfoWindow, right above) rather than
+  // waeGoToLocation()'s waeShowPulseInfoWindow().
+  async function waeGoToMarkedWayspot(item) {
+    if (!Number.isFinite(item.lat) || !Number.isFinite(item.lng)) return;
+    const attached = await waeAttachToMapIfNeeded();
+    if (!attached) {
+      if (waeUI) log(waeUI.logEl, '✗ Could not find the Wayfarer map on this page -- try again from the mapview or the submit-Wayspot map.', 'err');
+      return;
+    }
+    const map = WAE_PULSES.map;
+    const latLng = new google.maps.LatLng(item.lat, item.lng);
+    map.setCenter(latLng);
+    const z = map.getZoom();
+    if (typeof z === 'number' && z < 17) map.setZoom(17);
+    if (waeAutoCloseOnNavigateEnabled()) closePanel();
+    google.maps.event.addListenerOnce(map, 'idle', () => waeShowMarkedWayspotInfoWindow(item, latLng));
   }
 
   let WaeMarkMarkerOverlayCtor = null;
@@ -5333,11 +5928,22 @@
   // click, not just a focus change.
   function waeBuildMarkedWayspotRow(item, ui, onDelete) {
     const row = ui.createElement('div', { className: 'wae-mark-row' });
-    const mainLine = ui.createElement('div', { className: 'wae-mark-row-main' });
+    const mainLine = ui.createElement('div', {
+      className: 'wae-mark-row-main',
+      attrs: { title: 'Click to show this Wayspot on the map' },
+    });
     const nameEl = ui.createElement('span', { className: 'wae-mark-row-name', text: item.name || '(unnamed)' });
     const coordEl = ui.createElement('span', { className: 'wae-mark-row-coord', text: `${Number(item.lat).toFixed(6)}, ${Number(item.lng).toFixed(6)}` });
     const deleteBtn = ui.createElement('button', { className: 'wae-mark-row-delete', text: '\u00d7', attrs: { type: 'button', title: 'Remove from list' } });
     mainLine.append(nameEl, coordEl, deleteBtn);
+
+    // Feature request: clicking the row (name/coords line, same as the
+    // main abuse-report table's own onRowClick) pans/zooms the map there
+    // and pops the InfoWindow -- see waeGoToMarkedWayspot()'s own comment.
+    // deleteBtn's own listener below calls stopPropagation() before this
+    // ever sees the click, so removing an entry doesn't also navigate to
+    // it on the way out.
+    mainLine.addEventListener('click', () => waeGoToMarkedWayspot(item));
 
     const noteEl = ui.createElement('div', {
       className: `wae-mark-row-note${item.note ? '' : ' wae-mark-row-note-empty'}`,
@@ -5446,9 +6052,84 @@
     render();
     waeMarkListRenderHook = render;
 
+    // Feature request: Favorite Users, in this same modal (see that
+    // feature's own top-of-section comment, search "Favorite Users list"
+    // further up this file) rather than a modal of its own -- its own
+    // ui.section() below for visual separation from the Marked Wayspots
+    // list just built above, since this modal's own title only names the
+    // latter.
+    waeRenderFavoriteUsersSection(ui, body);
+
     return {
       onOk() { return true; }, // no-op -- every action above already saves on its own
     };
+  }
+
+  // Feature request: the Favorite Users list itself -- click a username
+  // in the side panel (waeStartSidePanelDetailsWatcher()) to toggle it
+  // in/out, shown here wrapped in its own ui.section() within the Marked
+  // Wayspots modal (called from waeRenderMarkedWayspotListSection() right
+  // above, not given a modal of its own). No per-entry note or Copy
+  // All/coordinates the way Marked Wayspots rows have -- a username is
+  // just a name to remember, nothing here to copy into an abuse-report
+  // form the way that list's own entries are for.
+  function waeRenderFavoriteUsersSection(ui, body) {
+    const listContainer = ui.createElement('div', { className: 'wae-favorite-user-list' });
+    const emptyEl = ui.createElement('div', {
+      className: 'wae-sub',
+      text: 'No favorite users yet -- click a username in the Wayfarer side panel to add one.',
+    });
+    const clearAllBtn = ui.button({ text: 'Clear All', variant: 'danger', disabled: true });
+
+    function render() {
+      listContainer.innerHTML = '';
+      const list = waeLoadFavoriteUsers();
+      clearAllBtn.disabled = !list.length;
+      if (!list.length) {
+        listContainer.append(emptyEl);
+        return;
+      }
+      // Colored the same as a favorited username reads in the live side
+      // panel (waeApplyFavoriteUsernameStyle()) -- re-fetched fresh here
+      // rather than once outside the loop since it's cheap and this stays
+      // correct even if the color's changed since this modal was opened.
+      const color = waeLoadAppearance().favoriteUserColor;
+      for (const item of list) {
+        const row = ui.createElement('div', { className: 'wae-favorite-user-row' });
+        const nameEl = ui.createElement('span', {
+          className: 'wae-favorite-user-name',
+          text: item.username,
+          style: { color, fontWeight: '700' },
+        });
+        const removeBtn = ui.createElement('button', {
+          className: 'wae-favorite-user-remove',
+          text: '\u00d7',
+          attrs: { type: 'button', title: 'Remove from favorites' },
+        });
+        removeBtn.addEventListener('click', () => {
+          waeToggleFavoriteUser(item.username);
+          render();
+        });
+        row.append(nameEl, removeBtn);
+        listContainer.append(row);
+      }
+    }
+
+    clearAllBtn.addEventListener('click', () => {
+      if (!waeLoadFavoriteUsers().length) return;
+      if (!confirm('Clear your entire favorite-users list? This cannot be undone.')) return;
+      waeSaveFavoriteUsers([]);
+      render();
+    });
+
+    const section = ui.section({
+      title: 'Favorite Users',
+      hint: 'Click a username in the Wayfarer side panel to add or remove it here. Color is set in Marker Style.',
+      children: [ui.buttonRow([clearAllBtn]), listContainer],
+    });
+    body.append(section);
+    render();
+    waeFavoriteUsersRenderHook = render;
   }
 
   let waeMarkListController = null;
@@ -5467,6 +6148,7 @@
       onClose() {
         waeMarkListController = null;
         waeMarkListRenderHook = null;
+        waeFavoriteUsersRenderHook = null;
       },
     });
   }
@@ -5575,7 +6257,9 @@
         styleBorderOpacityRange.valueEl.textContent = `${Math.round(d.borderOpacity * 100)}%`;
         styleClickableToggle.input.checked = d.clickable;
         styleMarkColorInput.value = d.markColor;
+        styleFavoriteUserColorInput.value = d.favoriteUserColor;
         waeRenderMarkedWayspotMarkers();
+        waeRestyleCurrentFavoriteUsername();
       },
     });
     const styleClickableToggle = ui.checkboxRow({
@@ -5598,6 +6282,17 @@
         waeRenderMarkedWayspotMarkers();
       },
     });
+    // Feature request: color for a favorited submitter's username in the
+    // side panel (see waeStartSidePanelDetailsWatcher()'s own comment) --
+    // restyles whatever username is currently on screen immediately on
+    // change, same reasoning as markColor's own onInput just above.
+    const styleFavoriteUserColorInput = ui.colorInput({
+      value: initialAppearance.favoriteUserColor,
+      onInput: (v) => {
+        updateAppearance({ favoriteUserColor: v });
+        waeRestyleCurrentFavoriteUsername();
+      },
+    });
     const styleSection = ui.section({
       title: 'Marker Style',
       hint: 'Color/size for the map markers this plugin draws (single reports and clusters). Changes apply immediately.',
@@ -5611,6 +6306,7 @@
         ui.fieldRow({ label: 'Ring opacity', input: styleBorderOpacityRange.row }),
         styleClickableToggle.row,
         ui.fieldRow({ label: 'Marked Wayspot color', input: styleMarkColorInput, help: 'The dot shown for entries on your Marked Wayspots list.' }),
+        ui.fieldRow({ label: 'Favorite user color', input: styleFavoriteUserColorInput, help: 'A submitter\u2019s username in the side panel, once favorited.' }),
         ui.buttonRow([resetStyleBtn]),
       ],
     });
@@ -5781,48 +6477,11 @@
       scanBtn.disabled = true;
       progressEl.textContent = 'Scanning imported emails...';
       try {
-        // Fetched BEFORE the rebuild below wipes them -- carries starred
-        // flags forward across a re-scan, which the full-rebuild-from-
-        // scratch approach (see the comment a few lines down) would
-        // otherwise silently lose every single time, same as it would
-        // any other flag not sourced fresh from the emails themselves.
-        const previousRecords = await getAllExtractedRecords();
-        const starredKeys = new Set(previousRecords.filter((r) => r.starred).map(waeStarredKey));
-        // CSV-imported rows (see waeParseCsvImport()) don't come from a
-        // scanned email at all, so there's nothing for a re-scan to
-        // re-derive them from -- unlike every other row, wiping them in
-        // the rebuild below would be permanent, not just "re-scan to get
-        // them back". Set aside here and re-added after the rebuild
-        // completes, same idea as the starred carry-over just above but
-        // for whole rows rather than one field on rows that do get
-        // re-derived.
-        const csvRecords = previousRecords.filter((r) => r.source === 'csv');
-
-        const { extracted, ticketDetails } = await scanImportedEmails((done, total) => {
+        const { extractedCount, ticketCount, missingCoords } = await waeScanAndPersist((done, total) => {
           progressEl.textContent = `Scanning imported emails... ${done}/${total}`;
         });
-        if (starredKeys.size) {
-          for (const r of extracted) {
-            if (starredKeys.has(waeStarredKey(r))) r.starred = true;
-          }
-        }
-        // Rebuild from scratch rather than upsert: a ticket's row count can
-        // change between scans (a multi-location ticket now yields several
-        // "conv:X:0" / "conv:X:1" / ... rows instead of one "conv:X" row),
-        // and upserting alone would leave the old id's row behind as a
-        // stale duplicate. Source data is the already-imported emails, so
-        // a full rebuild is cheap and side-steps that entirely. Both
-        // stores rebuild together -- ticketDetails is the per-ticket raw
-        // text extractedReports' rows now reference via ticketKey rather
-        // than each carrying their own copy (see EXTRACT_DB_VERSION note).
-        await clearExtractedRecords();
-        await clearTicketDetails();
-        await putExtractedRecords([...extracted, ...csvRecords]);
-        await putTicketDetails(ticketDetails);
         progressEl.textContent = '';
-        const ticketCount = new Set(extracted.map((r) => r.conversationId || r.sourceEmailId)).size;
-        log(logEl, `✓ Scanned: found ${extracted.length} location(s) across ${ticketCount} abuse report ticket(s).`, 'ok');
-        const missingCoords = extracted.filter((r) => r.latitude === null).length;
+        log(logEl, `✓ Scanned: found ${extractedCount} location(s) across ${ticketCount} abuse report ticket(s).`, 'ok');
         if (missingCoords) {
           log(logEl, `⚠ ${missingCoords} report(s) had no parseable coordinates -- check the raw columns in the CSV.`, 'warn');
         }
@@ -6160,6 +6819,32 @@
     waeUnregisterAppearance = null;
     wfmmWindow.WFMM.layers.unregister(WAE_LAYER_ID);
   }
+
+  // ---------------------------------------------------------------------
+  // External API -- lets the companion Abuse Email Importer script trigger
+  // a real scan directly, for its own "scan after import" checkbox: a
+  // successful Gmail sync/.eml import over there can call this to get the
+  // freshly-imported emails scanned immediately, rather than leaving that
+  // as a separate manual step in THIS script's own panel. Mirrors that
+  // script's own wfmmWindow.WayfarerAbuseEmailImporter (this script reads
+  // FROM that one; that one now calls INTO this one) -- same reasoning on
+  // wfmmWindow vs window applies in reverse here: this script itself isn't
+  // sandboxed (@grant none, @inject-into page runs it in the real page
+  // context already), but the importer script IS (@grant
+  // GM_xmlhttpRequest/unsafeWindow), so ITS copy of `window` is a separate
+  // sandbox object -- it can only ever reach this through wfmmWindow, the
+  // one object both scripts' own top-of-file comments already point at the
+  // real, shared page window for exactly this reason.
+  // scanImportedEmails here is intentionally waeScanAndPersist, not the
+  // like-named lower-level function a few hundred lines up that only
+  // parses emails into rows without saving them anywhere -- an external
+  // caller has no other way to reach the save step, and "scan" from
+  // outside this file should mean the same thing it does when this
+  // script's own Scan button is clicked.
+  // ---------------------------------------------------------------------
+  wfmmWindow.WayfarerAbuseReportExtractor = {
+    scanImportedEmails: (onProgress) => waeScanAndPersist(onProgress),
+  };
 
   // ---------------------------------------------------------------------
   // Map Mods plugin manager registration -- see the importer script's own

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Email Importer
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      4.10.2
+// @version      4.11.0
 // @description  Imports Niantic Support "Reporting Abuse in Wayfarer" tickets from Gmail via OAuth, or from .eml files -- using a port of bilde2910/OPR-Tools' email parser -- and stores them for the Abuse Report Extractor script (and other consumers) to search.
 // @author       Frankmans
 // @grant        GM_xmlhttpRequest
@@ -26,6 +26,24 @@
 // exception, not an oversight.
 
 /*
+ * v4.11.0 CHANGE FROM v4.10.2 (feature request): new "Also scan for
+ * reports after importing" checkbox, saved in WFMM.settings alongside
+ * auto-sync's own settings (same registry, same reasoning -- see
+ * WEI_SETTINGS_DEFAULTS' own comment). When on, a successful Gmail sync
+ * (manual or a background auto-sync tick), .eml drop/pick, or backup-JSON
+ * restore that actually added/updated at least one email now immediately
+ * calls into the companion Abuse Report Extractor script's own new
+ * wfmmWindow.WayfarerAbuseReportExtractor.scanImportedEmails() (that
+ * script's own v1.53.7) right afterward -- one less manual step than
+ * opening that script's panel and clicking its Scan button every time.
+ * weiTriggerScanIfEnabled() is the one place this lives, called from
+ * every import path rather than duplicated at each; it no-ops quietly if
+ * the setting's off, and logs (once, not on every import) rather than
+ * throwing if the companion script isn't installed/loaded -- same
+ * restraint publishPoiToMap()'s own no-op warning already uses for a
+ * missing Base. Nothing about the underlying import/sync paths themselves
+ * changed.
+ *
  * v4.10.2 CHANGE FROM v4.10.1: one wording update to match the companion
  * script's own rename (its v1.45.0): "Open the Abuse Report Extractor to
  * scan them." -> "Open Abuse Reports to scan them." in the .eml-import
@@ -859,6 +877,8 @@
   // at all.
   const WEI_SETTINGS_DEFAULTS = Object.freeze({
     autoSync: { enabled: false, intervalMin: 15 },
+    // Added in v4.11.0 -- see this file's own changelog entry above.
+    scanAfterImport: false,
   });
   function loadAutoSyncSettings() {
     const saved = wfmmWindow.WFMM.settings.get(PLUGIN_ID, 'autoSync', WEI_SETTINGS_DEFAULTS.autoSync) || {};
@@ -872,6 +892,12 @@
       enabled: !!enabled,
       intervalMin: Number(intervalMin) || WEI_SETTINGS_DEFAULTS.autoSync.intervalMin,
     });
+  }
+  function loadScanAfterImport() {
+    return !!wfmmWindow.WFMM.settings.get(PLUGIN_ID, 'scanAfterImport', WEI_SETTINGS_DEFAULTS.scanAfterImport);
+  }
+  function saveScanAfterImport(enabled) {
+    wfmmWindow.WFMM.settings.set(PLUGIN_ID, 'scanAfterImport', !!enabled);
   }
 
   // WFMM.ui, set while the panel is open, and the currently-open panel's
@@ -929,6 +955,41 @@
       weiUI.gmailStatusEl.textContent = (lastSync
         ? `Not connected this session. Last synced ${new Date(Number(lastSync)).toLocaleString()}.`
         : 'Not connected.') + autoSuffix;
+    }
+  }
+
+  // Feature request (v4.11.0): with the "Also scan for reports after
+  // importing" checkbox on, every import path below (Gmail sync, .eml
+  // drop/pick, backup-JSON restore) calls this right after actually
+  // storing at least one new/updated email, asking the companion Abuse
+  // Report Extractor script to scan immediately rather than leaving that
+  // as a separate manual step in that script's own panel. One shared
+  // function rather than the setting check and the bridge call duplicated
+  // at each of those call sites. Warns once (not on every import) if the
+  // companion script isn't installed/hasn't loaded, same restraint
+  // publishPoiToMap()'s own no-op warning already uses for a missing
+  // Base -- this checks wfmmWindow.WayfarerAbuseReportExtractor, that
+  // script's own new external entry point (see its v1.53.7 changelog),
+  // published on wfmmWindow for the identical sandboxing reason this
+  // file's own wfmmWindow.WayfarerAbuseEmailImporter assignment further
+  // down exists (see that assignment's own comment) -- just reached in
+  // the opposite direction here.
+  let weiScanBridgeWarned = false;
+  async function weiTriggerScanIfEnabled() {
+    if (!loadScanAfterImport()) return;
+    const bridge = wfmmWindow.WayfarerAbuseReportExtractor;
+    if (!bridge || typeof bridge.scanImportedEmails !== 'function') {
+      if (!weiScanBridgeWarned) {
+        weiScanBridgeWarned = true;
+        weiLog('Scan-after-import is on, but the Abuse Report Extractor script wasn\u2019t detected -- skipping.', 'skip');
+      }
+      return;
+    }
+    try {
+      await bridge.scanImportedEmails();
+      weiLog('\u2713 Scanned for abuse reports.', 'ok');
+    } catch (e) {
+      weiLog(`Scan-after-import failed: ${e.message || e}`, 'err');
     }
   }
 
@@ -993,6 +1054,7 @@
       const abuseCount = countAbuseReports(records);
       const abuseSuffix = abuseCount ? `, ${abuseCount} abuse report ticket${abuseCount === 1 ? '' : 's'}` : '';
       weiLog(`✓ Imported ${records.length} file(s): ${inserted} new, ${updated} updated${abuseSuffix}`, 'ok');
+      await weiTriggerScanIfEnabled();
     }
     if (parseErrors) weiLog(`${parseErrors} file(s) could not be parsed as MIME email`, 'err');
     await refreshCount();
@@ -1099,6 +1161,7 @@
         const abuseCount = countAbuseReports(records);
         const abuseSuffix = abuseCount ? `, ${abuseCount} abuse report ticket${abuseCount === 1 ? '' : 's'}` : '';
         weiLog(`✓ ${auto ? 'Auto-sync: synced' : 'Synced'} ${records.length} message(s) from Gmail: ${inserted} new, ${updated} updated${abuseSuffix}`, 'ok');
+        await weiTriggerScanIfEnabled();
       }
       if (authExpiredSeen) weiLog('Gmail token expired mid-sync -- run Sync again to resume', 'err');
       const totalFetchErrors = Array.from(fetchErrorCounts.values()).reduce((a, b) => a + b, 0);
@@ -1163,6 +1226,20 @@
     weiUiApi = ui;
 
     const countEl = ui.createElement('div', { className: 'wei-sub', text: 'Loading...' });
+
+    // Feature request (v4.11.0): saved via loadScanAfterImport()/
+    // saveScanAfterImport() (own small wrapper around the same
+    // WFMM.settings registry autoSync already uses -- see
+    // WEI_SETTINGS_DEFAULTS' own comment), read by weiTriggerScanIfEnabled(),
+    // which every import path below (Gmail sync, .eml drop/pick, backup
+    // restore) already calls. Placed above every section rather than
+    // inside just one of them since it applies to all of those paths, not
+    // only Gmail or only .eml.
+    const scanAfterImportToggle = ui.checkboxRow({
+      label: 'Also scan for reports after importing',
+      checked: loadScanAfterImport(),
+      onChange: (checked) => saveScanAfterImport(checked),
+    });
 
     // -- Connect Gmail --
     const clientIdInput = ui.textInput({
@@ -1289,6 +1366,7 @@
         if (!Array.isArray(emails)) { weiLog('That file doesn\u2019t look like a valid backup', 'err'); return; }
         const { inserted, updated } = await WSTStorage.putEmails(emails);
         weiLog(`✓ Restored backup: ${inserted} new, ${updated} updated`, 'ok');
+        if (inserted || updated) await weiTriggerScanIfEnabled();
         await refreshCount();
       } catch (e) {
         weiLog(`Could not read that backup file: ${e.message || e}`, 'err');
@@ -1312,7 +1390,7 @@
       children: [backupBtnRow, backupInput, logEl],
     });
 
-    modal.body.append(countEl, gmailSection, emlSection, backupSection);
+    modal.body.append(countEl, scanAfterImportToggle.row, gmailSection, emlSection, backupSection);
 
     weiUI = { countEl, gmailStatusEl, progressEl, syncBtn, fullResyncBtn, logEl };
 
