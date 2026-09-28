@@ -57,9 +57,12 @@ entry for both scripts now: **Abuse Reports**.
 
 ![The Settings side panel showing a single "Abuse Reports" entry](docs/images/settings-side-panel.svg)
 
-**Inside the Abuse Reports panel.** Two small icons sit next to the
-summary line, top-right: an envelope (opens the Email Importer's own
-panel) and a cog (opens Marker Style settings, see below).
+**Inside the Abuse Reports panel.** Three small icons sit next to the
+summary line, top-right: a list icon (opens the **Marked Wayspots** list
+— and the Favorite Users list under it — see "Marked Wayspots" below),
+an envelope (opens the Email Importer's own panel) and a cog (opens
+Marker Style settings, see below). The mockup below predates the list
+icon and shows only the envelope and cog.
 
 ![The Abuse Reports panel header with envelope and cog icons](docs/images/panel-header-icons.svg)
 
@@ -141,7 +144,10 @@ time the page loads and kept in memory only, for the session.
    dropzone. Turn on auto-sync if you want it to check periodically
    without you opening the panel. Close it to land back on Abuse
    Reports.
-3. Back in the Abuse Reports panel, click **Scan Imported Emails**.
+3. Back in the Abuse Reports panel, click **Scan Imported Emails** — or
+   skip this step entirely by ticking **Also scan for reports after
+   importing** in the importer's panel (see "Scan after import" below),
+   which does it for you after every import.
 4. Review the table — one row per reported Wayspot, so a ticket that
    reports several (or has more added in a later reply) shows several
    rows sharing the same `Conversation ID`. Rows missing a name or
@@ -150,6 +156,9 @@ time the page loads and kept in memory only, for the session.
    **Abuse Report Crosses** in the native Layers menu to see them
    plotted directly on the map instead (see "Plotting on the map"
    below).
+
+The table's **column widths are adjustable** — see "Resizing table
+columns" below.
 
 The **Conversation** and **Status** column headers are clickable to sort
 — click again to flip ascending/descending, click the other header to
@@ -176,6 +185,28 @@ where its own `window` isn't the same object as the page's, so
 invisible to it; the script just quietly falls back to its older,
 pre-Plugin-Manager self-starting behavior instead, which is why nothing
 seems broken. If you're on an older version than that, update.
+
+## Scan after import
+
+The importer's panel has an **Also scan for reports after importing**
+checkbox. With it on, any import that actually adds or updates at least
+one email — a Gmail sync (manual, or a background auto-sync tick), a
+dropped/picked `.eml` file, or a backup-JSON restore — immediately asks
+the extractor to scan, so new tickets show up in the table and on the
+map without opening the Abuse Reports panel and clicking **Scan
+Imported Emails** yourself. It's the exact same scan that button runs
+(starred rows and imported-CSV rows are carried across it the same way),
+and it works with the Abuse Reports panel closed: any map crosses that
+are showing (mapview/submit or review page) redraw with the new data.
+The setting is saved. If the extractor isn't installed or hasn't loaded,
+the importer logs a single "wasn't detected -- skipping" line rather
+than failing.
+
+Under the hood the extractor publishes
+`window.WayfarerAbuseReportExtractor.scanImportedEmails()` for this —
+the mirror image of `window.WayfarerAbuseEmailImporter`, which the
+extractor already reads from — so the two scripts still only talk to
+each other through the shared page window.
 
 ## What counts as an "abuse report" email
 
@@ -399,6 +430,14 @@ except for the Gmail API calls you make yourself:
   automatically — but it's why a 12-location ticket doesn't store its
   ~2.4KB of raw text twelve times over.
 
+Your preferences and the two scratch lists don't live in IndexedDB at
+all: Marker Style settings (including the Marked Wayspot and Favorite
+user colors), the close-panel-on-jump checkbox, the table's column
+widths, the copy-with-notes checkbox, the scan-after-import checkbox,
+the Marked Wayspots list and the Favorite Users list are all kept in the
+suite's own settings store (`WFMM.settings`), so they're included in
+WFMM's **Settings > Backups** export/import.
+
 Both panels have **Export backup JSON** / **Import backup JSON** /
 **Clear** buttons for their respective stores. Clearing extracted data
 doesn't touch the imported emails — re-scan any time to rebuild it.
@@ -481,8 +520,13 @@ into individual X markers as you zoom in close enough to tell them apart
 — clustering is based on actual on-screen distance at the current zoom,
 not a fixed real-world radius, so it adapts correctly whether you're
 looking at the whole country or one neighborhood. Click an individual
-marker for its name, coordinates, comment, and ticket ID; click a
-cluster to zoom in on it. The layer's on/off state is remembered by the
+marker for its name, coordinates, comment, and ticket ID (followed by
+the date of that ticket's last interaction, same format as above);
+click a cluster to zoom in on it. A cluster whose reports all sit at
+the same (or near-identical) coordinates can never be split apart by
+zooming, so once the map is already at the deepest zoom a cluster click
+uses, clicking it opens a popup listing every ticket in it — ticket
+number, Wayspot name and last-interaction date — instead. The layer's on/off state is remembered by the
 suite itself and re-attaches automatically next time a map-having page
 loads if you left it on — including right away on a fresh page load, no
 need to open the panel or touch the toggle first; markers stay in sync
@@ -514,7 +558,12 @@ Independent of the crosses layer being on at all: click any Wayspot on
 the map (this plugin's own or an ordinary one) and, if it's within 20m
 of one of this plugin's extracted locations, its native details card in
 the side panel gets a `#<ticket>` line added just above the status
-badge — multiple matching tickets show comma-separated. This uses the
+badge — multiple matching tickets show comma-separated. The line ends
+with the **date of the last interaction** on the ticket(s), taken from
+the same newest-message timestamp as the table's Last Response column
+(short date in the line, full date and time on hover); when several
+tickets match, only the single most recent date is shown, not one per
+ticket. A ticket with no parseable date shows no date. This uses the
 same public side-panel service Base's own code builds that card with, so
 it adds to the real card rather than replacing it or drawing a
 lookalike; nothing shows if there's no match, same as before this
@@ -546,7 +595,9 @@ setting under Marker Style — see that section below for why.
 Opened via the small cog icon next to the Abuse Reports panel's summary
 line (see "Where to find things" above), this section covers: color,
 size, fill opacity, ring color/width/opacity for the cluster badges, and
-a **Clickable markers (mapview/submit only)** toggle (turn it off to let
+a **Marked Wayspot color** and a **Favorite user color** (see "Marked
+Wayspots" and "Favorite users" below), and a **Clickable markers
+(mapview/submit only)** toggle (turn it off to let
 clicks pass through to whatever's underneath — the map itself, or a
 Wayspot marker at the same spot — instead of opening this plugin's own
 popup). As the label says, that toggle only ever governs the
@@ -614,6 +665,110 @@ to visibly hang the panel while opening. It's now grid-bucketed (only
 compares records in the same ~111m neighborhood, not every pair) and
 skipped entirely when nothing's changed since last time.
 
+## Resizing table columns
+
+Drag the border between two column headers in the abuse-report table to
+resize them; the cursor turns into a resize arrow over the border. A drag
+only trades width between the two columns it sits between, so the table
+always stays exactly full-width — no horizontal scrollbar — and no column
+can be squeezed below a small minimum. There's no handle after the last
+column (nothing to its right to trade with). Widths are remembered per
+column and carry across sessions; they're stored with the suite's
+settings, so they also travel with **Settings > Backups** (see "Data
+storage & privacy").
+
+## Marked Wayspots
+
+A separate scratch list for Wayspots you're about to report yourself —
+distinct from the ticket table above, which is about reports already
+filed. Nothing on it reads from or writes to the extracted-ticket data.
+
+**Adding.** Click a Wayspot on the map and, in its details card in the
+side panel, there's a small note field and a **+ add to abuse report
+draft** button. Type a note first if you like (up to 300 characters),
+then click the button — it flashes **✓ Added**. Adding a Wayspot that's
+already on the list (matched by coordinates, not name) doesn't create a
+second entry: it overwrites that entry's note with whatever's in the
+field this time — including clearing it if the field is empty — and
+flashes **✓ Updated** instead. A Wayspot's name is only ever filled in
+or upgraded this way, never blanked; an "Untitled location" is stored
+with no name and shown as "(unnamed)". The same note field and button
+also appear on the review page — see "Abuse helper on the review page".
+
+**The list.** Open it with the list icon in the Abuse Reports panel
+header (titled **Abuse Reports - Marked Wayspots**):
+
+- A **Report abuse via Wayfarer Help Center** link to Niantic's
+  "Reporting Abuse in Wayfarer" article, where the copied text is meant
+  to be pasted.
+- **Copy All** puts one line per entry on the clipboard, formatted
+  `Name, lat, lng (note)` — coordinates to six decimals, the
+  parenthesised note only when there is one.
+- **Include notes when copying** (checked by default) turns that note
+  off, giving plain `Name, lat, lng` lines. Saved, and it also governs
+  the copy icon on the review page.
+- **Clear All** empties the list (asks for confirmation first).
+- Each row shows the name and coordinates. **Click the row** to jump the
+  map there (centering, zooming in, and opening an info popup with the
+  name, coordinates and note). Click a row's **note** to edit it in
+  place — click anywhere outside the box to save — and click **×** to
+  remove the entry.
+
+**On the map.** Every entry also gets a cross-shaped marker on the
+mapview/submit map, in its own color (default blue, changed with
+**Marked Wayspot color** in Marker Style) and sized by the same **Cross
+size** slider as the abuse-report crosses; click one for its name,
+coordinates and note. They aren't clustered. They follow the **Abuse
+Report Crosses** checkbox in the Layers menu — untick it and they hide
+along with the abuse-report crosses, tick it again and they come back.
+
+The list is saved with the suite's settings (so it's included in
+**Settings > Backups**), not in IndexedDB.
+
+## Favorite users
+
+When Wayfarer shows a **Submitted by <username>** line in the side panel
+(for instance while reviewing a nomination), the username itself is
+clickable: click it to mark that user as a favorite, click again to
+remove them. A favorited username turns bold and takes on a color you
+choose with **Favorite user color** in Marker Style (default amber; it
+updates immediately, and **Reset to default** restores it). Names are
+matched ignoring case and surrounding spaces, so the same person is the
+same favorite however it's capitalised.
+
+Favorites are listed in a **Favorite Users** section in the same window
+as the Marked Wayspots list, each in the favorite color with an **×** to
+remove it, plus a **Clear All**. Only the username is clickable — the
+"Submitted by" prefix stays plain text — and the feature only appears
+where the side panel actually shows that line. Like the Marked Wayspots
+list, it's stored with the suite's settings.
+
+## Abuse helper on the review page
+
+This folds in what the standalone **Wayfarer Abuse Text Formatter**
+script did, so you no longer need it — uninstall it once this is
+running, or you'll see both its text line and this. On
+`https://wayfarer.scopely.com/new/review`, every review candidate (new
+Wayspot, photo or edit) gets a small row containing:
+
+- a **copy icon** — instead of showing the text, it copies
+  `Name, lat, lng` in exactly the same format as the Marked Wayspots
+  list's Copy All (with the note you've typed in the row's own field
+  appended when **Include notes when copying** is on). The icon turns
+  into a check mark briefly to confirm;
+- the same **note field** and **+ add to abuse report draft** button as
+  the side panel, adding the candidate to the Marked Wayspots list
+  (overwriting the note if it's already there);
+- an **Abuse form** link to the same Help Center article as the list's,
+  opening in a new tab so the review in progress isn't lost.
+
+The candidate is read from the review page's own data request
+(`GET /api/v1/vault/review`) — the same way the old script did it — and
+the row is placed where that script put its text: before the first
+`.mt-2` element on a new/photo card, and as the second child of
+`.review-edit-info` on an edit card. Captcha responses are ignored. The
+row only appears while the plugin is enabled in the Plugin Manager.
+
 ## Why no `@require` for the suite
 
 Earlier versions of both scripts `@require`d Tntnnbltn's Base script
@@ -651,6 +806,11 @@ Gmail  ──┐
                           CSV export
 ```
 
+The two scripts also call each other through the shared page window:
+the extractor reads `window.WayfarerAbuseEmailImporter`, and the
+importer calls `window.WayfarerAbuseReportExtractor.scanImportedEmails()`
+for scan-after-import (see "Scan after import").
+
 `opr-email-lib.js` is a vanilla-JS port of
 [bilde2910/OPR-Tools](https://github.com/bilde2910/OPR-Tools)'s
 `src/email` module (parsing, classification, Helpshift thread
@@ -659,14 +819,14 @@ needed since it's plain `@require`-able JS.
 
 ## Versions covered by this README
 
-- `wayfarer-abuse-email-importer.user.js` — v4.10.2
-- `wayfarer-abuse-report-extractor.user.js` — v1.49.1
+- `wayfarer-abuse-email-importer.user.js` — v4.11.0
+- `wayfarer-abuse-report-extractor.user.js` — v1.57.1
 - Verified against `wayfarer-map-mods.user.js` v4.3.0 (the consolidated
   suite both scripts depend on — see Requirements above).
 
 Full version-by-version detail lives in the changelog comment block at
 the top of each `.user.js` file. This README is fully caught up as of
-extractor v1.49.1, including everything added between v1.26.1 (this
+extractor v1.57.1 and importer v4.11.0, including everything added between v1.26.1 (this
 file's previous checkpoint) and now: the star/favorite column and Last
 Response column (v1.31.0/v1.28.0), Import CSV (v1.34.0), the auto-close
 checkbox (v1.27.0), live Wayspot ticket annotation (v1.30.0), the
@@ -677,6 +837,17 @@ and the Email Importer's envelope-icon integration (v1.44.0, importer
 v4.10.0+). Since then: the review toggle bar's position-tracking fix
 (v1.47.0), cluster clicks jumping to a fixed zoom 20 (v1.48.0),
 review-page markers being permanently click-through (v1.49.0), and
-search matching a leading "#" the same as no "#" (v1.49.1). Smaller
+search matching a leading "#" the same as no "#" (v1.49.1). Then, in
+order: the review toggle bar returning to the page's own layout (v1.50.0)
+and the same-coordinates cluster popup (v1.50.4); the Marked Wayspots
+list with its side-panel button, note field, help-center link, map
+crosses and duplicate-overwrite behavior (v1.51.0–v1.53.5, v1.53.4 tying
+the crosses to the Layers checkbox); last-interaction dates after ticket
+numbers (v1.53.9); resizable table columns (v1.54.0); Favorite users and
+their color setting (v1.55.0–v1.55.2); the copy-with-or-without-notes
+checkbox (v1.56.0); the review-page abuse helper replacing the Abuse
+Text Formatter script, with its "Abuse form" link (v1.57.0–v1.57.1);
+and, on the importer side, scan-after-import (importer v4.11.0, extractor
+v1.53.7). Smaller
 internal/performance-only changes in between aren't each individually
 called out here — see the changelog block itself for those.
