@@ -61,10 +61,9 @@ entry for both scripts now: **Abuse Reports**.
 summary line, top-right: a list icon (opens the **Marked Wayspots** list
 — and the Favorite Users list under it — see "Marked Wayspots" below),
 an envelope (opens the Email Importer's own panel) and a cog (opens
-Marker Style settings, see below). The mockup below predates the list
-icon and shows only the envelope and cog.
+Marker Style settings, see below).
 
-![The Abuse Reports panel header with envelope and cog icons](docs/images/panel-header-icons.svg)
+![The Abuse Reports panel header with list, envelope and cog icons](docs/images/panel-header-icons.svg)
 
 **Showing crosses on the map.** This plugin has no "Show on Map" button
 of its own anymore (see "Plotting on the map" below for why) — it's the
@@ -73,12 +72,12 @@ same place every other map layer is toggled.
 
 ![The native Layers menu with the Abuse Report Crosses checkbox](docs/images/layers-menu.svg)
 
-**On the review page.** A separate small on/off bar sits directly above
+**On the review page.** A separate small on/off bar sits directly below
 whichever map the review page itself is showing — not the Layers menu,
 not the Settings panel. See "On the review page" below for why it's kept
 apart.
 
-![The toggle bar above the review page's map](docs/images/review-toggle-bar.svg)
+![The toggle bar below the review page's map](docs/images/review-toggle-bar.svg)
 
 ## Requirements
 
@@ -201,6 +200,8 @@ are showing (mapview/submit or review page) redraw with the new data.
 The setting is saved. If the extractor isn't installed or hasn't loaded,
 the importer logs a single "wasn't detected -- skipping" line rather
 than failing.
+
+![The Email Importer panel with the scan-after-import checkbox](docs/images/importer-scan-checkbox.svg)
 
 Under the hood the extractor publishes
 `window.WayfarerAbuseReportExtractor.scanImportedEmails()` for this —
@@ -563,7 +564,13 @@ with the **date of the last interaction** on the ticket(s), taken from
 the same newest-message timestamp as the table's Last Response column
 (short date in the line, full date and time on hover); when several
 tickets match, only the single most recent date is shown, not one per
-ticket. A ticket with no parseable date shows no date. This uses the
+ticket. A ticket with no parseable date shows no date.
+
+![A Wayspot's side-panel card with the ticket line and date, the note field and add button, and a favorited submitter](docs/images/side-panel-mark-row.svg)
+
+(The note field, the **+ add to abuse report draft** button and the
+clickable submitter name in that mockup are covered under "Marked
+Wayspots" and "Favorite users" below.) This uses the
 same public side-panel service Base's own code builds that card with, so
 it adds to the real card rather than replacing it or drawing a
 lookalike; nothing shows if there's no match, same as before this
@@ -577,7 +584,7 @@ show too), so you can see nearby prior abuse reports right while
 reviewing a nomination. This is deliberately **not** the same on/off
 switch as the Layers-menu checkbox above, and it's **not** reachable from
 the Settings side panel either — see "Where to find things" for the
-small toggle bar that sits directly above the review page's own map
+small toggle bar that sits directly below the review page's own map
 instead. Two reasons for the separation: Base's own map-tracking
 (`WFMM.map`) never covers the review route in the first place, so this
 needed its own map lookup regardless; and keeping the Settings side
@@ -677,6 +684,8 @@ column and carry across sessions; they're stored with the suite's
 settings, so they also travel with **Settings > Backups** (see "Data
 storage & privacy").
 
+![Dragging the border between two column headers to resize them](docs/images/resizable-columns.svg)
+
 ## Marked Wayspots
 
 A separate scratch list for Wayspots you're about to report yourself —
@@ -698,6 +707,8 @@ also appear on the review page — see "Abuse helper on the review page".
 **The list.** Open it with the list icon in the Abuse Reports panel
 header (titled **Abuse Reports - Marked Wayspots**):
 
+![The Marked Wayspots list window, with the Favorite Users section below the list](docs/images/marked-wayspots-list.svg)
+
 - A **Report abuse via Wayfarer Help Center** link to Niantic's
   "Reporting Abuse in Wayfarer" article, where the copied text is meant
   to be pasted.
@@ -714,7 +725,11 @@ header (titled **Abuse Reports - Marked Wayspots**):
   place — click anywhere outside the box to save — and click **×** to
   remove the entry.
 
-**On the map.** Every entry also gets a cross-shaped marker on the
+**On the map.**
+
+![Red abuse-report crosses, blue Marked Wayspot crosses and the Layers menu checkbox that controls both](docs/images/map-markers.svg)
+
+Every entry also gets a cross-shaped marker on the
 mapview/submit map, in its own color (default blue, changed with
 **Marked Wayspot color** in Marker Style) and sized by the same **Cross
 size** slider as the abuse-report crosses; click one for its name,
@@ -750,6 +765,8 @@ script did, so you no longer need it — uninstall it once this is
 running, or you'll see both its text line and this. On
 `https://wayfarer.scopely.com/new/review`, every review candidate (new
 Wayspot, photo or edit) gets a small row containing:
+
+![The review-page row: copy icon, note field, add to abuse report draft button and Abuse form link](docs/images/review-abuse-row.svg)
 
 - a **copy icon** — instead of showing the text, it copies
   `Name, lat, lng` in exactly the same format as the Marked Wayspots
