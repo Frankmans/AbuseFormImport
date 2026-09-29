@@ -331,7 +331,7 @@ example, not just after a failed attempt:
 
 ```
 Latitude,Longitude,Name,Comment,Conversation ID
-52.006199,4.535424,Example Wayspot,Optional note,12345
+1.234567,1.234567,Example Wayspot,Optional note,12345
 ```
 
 Imported rows show up in the table and on the map like any other, with
