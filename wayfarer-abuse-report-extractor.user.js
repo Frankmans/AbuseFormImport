@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.60.3
+// @version      1.60.5
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -3251,7 +3251,14 @@
        The "+" itself is styled separately (.wae-detail-mark-btn, in the
        side-panel-details section below) since it lives in the Wayspot
        details side panel, not this panel. */
-    .wae-mark-list{ max-height:320px; overflow-y:auto; margin-top:8px; }
+    /* This dialog had no width of its own (only #wae-panel did), so it sized to
+       its content -- a long Wayspot name widened the row past the dialog's
+       max width, and the trailing \u00d7 got pushed out under the list's scrollbar
+       instead of the name being ellipsized. Fixed width + every flex ancestor
+       allowed to shrink (min-width:0) means the name truncates and the \u00d7
+       always stays inside the visible row. */
+    #wae-mark-list .wfmapmods-modal-dialog{ width:480px; max-width:calc(100vw - 24px); }
+    .wae-mark-list{ max-height:320px; overflow-y:auto; overflow-x:hidden; scrollbar-gutter:stable; padding-right:8px; min-width:0; box-sizing:border-box; margin-top:8px; }
     /* The on-map dot for a Marked Wayspots entry (waeRenderMarkedWayspotMarkers()) --
        same absolute-positioned/centered pattern as .wae-pulse-marker,
        just its own class since it lives in a different pane
@@ -3261,11 +3268,11 @@
     .wae-mark-marker{ position:absolute; transform:translate(-50%, -50%); cursor:pointer; line-height:0; }
     .wae-mark-marker svg{ display:block; }
     .wae-mark-form-link{ display:block; font-size:12px; margin-bottom:6px; }
-    .wae-mark-row{ border:1px solid var(--wfmm-border, #e5e7eb); border-radius:6px; padding:6px 8px; margin-bottom:6px; }
-    .wae-mark-row-main{ display:flex; align-items:center; gap:8px; cursor:pointer; }
+    .wae-mark-row{ border:1px solid var(--wfmm-border, #e5e7eb); border-radius:6px; padding:6px 8px; margin-bottom:6px; min-width:0; max-width:100%; box-sizing:border-box; }
+    .wae-mark-row-main{ display:flex; align-items:center; gap:8px; cursor:pointer; min-width:0; }
     .wae-mark-row-main:hover .wae-mark-row-name{ text-decoration:underline; }
     .wae-mark-row-name{ font-weight:600; font-size:12px; flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .wae-mark-row-coord{ font-size:11px; color:var(--wfmm-muted-text, #667085); flex-shrink:0; }
+    .wae-mark-row-coord{ font-size:11px; color:var(--wfmm-muted-text, #667085); flex-shrink:0; white-space:nowrap; }
     .wae-mark-row-delete{ flex-shrink:0; border:none; background:none; color:var(--wfmm-muted-text, #667085); font-size:16px; line-height:1; cursor:pointer; padding:0 2px; }
     .wae-mark-row-delete:hover{ color:#dc2626; }
     .wae-mark-row-note{ margin-top:4px; font-size:11px; color:var(--wfmm-muted-text, #667085); cursor:pointer; word-break:break-word; white-space:pre-wrap; }
@@ -3278,9 +3285,9 @@
        above) since favorite users can carry a note too. */
     .wae-favorite-user-row{
       border:1px solid var(--wfmm-border, #e5e7eb); border-radius:6px;
-      padding:6px 8px; margin-bottom:6px;
+      padding:6px 8px; margin-bottom:6px; min-width:0; max-width:100%; box-sizing:border-box;
     }
-    .wae-favorite-user-row-main{ display:flex; align-items:center; gap:8px; }
+    .wae-favorite-user-row-main{ display:flex; align-items:center; gap:8px; min-width:0; }
     .wae-favorite-user-checkbox{ flex-shrink:0; margin:0; cursor:pointer; }
     .wae-favorite-user-name{ font-size:12px; flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .wae-favorite-user-remove{ flex-shrink:0; border:none; background:none; color:var(--wfmm-muted-text, #667085); font-size:16px; line-height:1; cursor:pointer; padding:0 2px; }
@@ -3335,7 +3342,11 @@
     .wae-log div.ok{ color:#16a34a; }
     .wae-log div.warn{ color:#b45309; }
     .wae-log div.err{ color:#dc2626; }
-    .wae-search-input{ margin:6px 0; }
+    .wae-search-wrap{ position:relative; margin:6px 0; }
+    .wae-search-wrap .wae-search-input{ margin:0; width:100%; box-sizing:border-box; padding-right:34px; }
+    .wae-search-clear{ position:absolute; top:50%; right:8px; transform:translateY(-50%); display:none; align-items:center; justify-content:center; width:22px; height:22px; padding:0; border:0; border-radius:50%; background:transparent; color:inherit; opacity:.55; cursor:pointer; font-size:16px; line-height:1; }
+    .wae-search-clear:hover{ opacity:1; background:rgba(128,128,128,.2); }
+    .wae-search-wrap.wae-has-text .wae-search-clear{ display:flex; }
     /* Live Wayspot ticket annotation -- see waeStartSidePanelDetailsWatcher()'s
        own comment. Styled as a small badge-ish line (not plain text, and
        not one of the wae-status-badge pills either) so it reads as "this
@@ -5102,6 +5113,19 @@
       className: 'wfmm-input wfmm-input-large wae-search-input',
       placeholder: 'Search name, ticket, location/report text\u2026',
     });
+    // waeSearchQuery outlives the panel (the dialog is torn down on close and
+    // rebuilt on open), so put the text back in the box -- otherwise the table
+    // stays filtered by a query the person can't see or clear.
+    searchInput.value = waeSearchQuery;
+
+    const searchWrap = ui.createElement('div', { className: 'wae-search-wrap' });
+    const searchClearBtn = ui.createElement('button', { className: 'wae-search-clear', text: '\u2715' });
+    searchClearBtn.type = 'button';
+    searchClearBtn.title = 'Clear search';
+    searchClearBtn.setAttribute('aria-label', 'Clear search');
+    searchWrap.append(searchInput, searchClearBtn);
+    const waeSyncSearchClear = () => searchWrap.classList.toggle('wae-has-text', !!searchInput.value);
+    waeSyncSearchClear();
 
     const autoCloseToggle = ui.checkboxRow({
       label: 'Close this panel when a row jumps the map to its location',
@@ -5182,18 +5206,29 @@
     panelHeaderActions.append(markListBtn, emailImporterBtn, markerStyleBtn);
     panelHeaderRow.append(countEl, panelHeaderActions);
 
-    modal.body.append(panelHeaderRow, buttonRowEl, csvHint, csvFileInput, progressEl, searchInput, autoCloseToggle.row, tableContainer, logEl);
+    modal.body.append(panelHeaderRow, buttonRowEl, csvHint, csvFileInput, progressEl, searchWrap, autoCloseToggle.row, tableContainer, logEl);
 
     waeUI = { countEl, tableContainer, logEl, scanBtn, exportBtn, clearBtn, searchInput };
 
     let waeSearchDebounceTimer = null;
     searchInput.addEventListener('input', () => {
+      waeSyncSearchClear();
       clearTimeout(waeSearchDebounceTimer);
       waeSearchDebounceTimer = setTimeout(() => {
         waeSearchQuery = searchInput.value;
         waeCurrentPage = 1;
         waeRenderFilteredTable();
       }, 200);
+    });
+
+    searchClearBtn.addEventListener('click', () => {
+      clearTimeout(waeSearchDebounceTimer); // don't let a pending debounce re-apply the old text
+      searchInput.value = '';
+      waeSyncSearchClear();
+      waeSearchQuery = '';
+      waeCurrentPage = 1;
+      waeRenderFilteredTable();
+      searchInput.focus();
     });
 
     scanBtn.addEventListener('click', async () => {
