@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.60.1
+// @version      1.60.2
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -3251,7 +3251,19 @@
        The "+" itself is styled separately (.wae-detail-mark-btn, in the
        side-panel-details section below) since it lives in the Wayspot
        details side panel, not this panel. */
-    .wae-mark-list{ max-height:320px; overflow-y:auto; margin-top:8px; }
+    // Bugfix (reported): with the list actually scrolling (more rows than
+    // fit in max-height), a non-overlay scrollbar (the default on
+    // Windows/Linux; macOS and mobile browsers' own overlay scrollbars
+    // don't take up any layout space and were never affected) sat right
+    // on top of each row's own "\u00d7" remove button, which only had this
+    // container's own 8px right padding between it and the edge --
+    // nowhere near a typical ~17px scrollbar's width. This padding-right
+    // is unconditional (reserved whether or not the list has actually
+    // grown past max-height yet), so rows also don't shift left the
+    // moment a scrollbar appears -- same reasoning as the newer
+    // scrollbar-gutter:stable property, without needing every browser to
+    // support it yet.
+    .wae-mark-list{ max-height:320px; overflow-y:auto; margin-top:8px; padding-right:14px; }
     /* The on-map dot for a Marked Wayspots entry (waeRenderMarkedWayspotMarkers()) --
        same absolute-positioned/centered pattern as .wae-pulse-marker,
        just its own class since it lives in a different pane
