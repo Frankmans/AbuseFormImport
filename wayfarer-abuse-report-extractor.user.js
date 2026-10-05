@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.60.5
+// @version      1.61.0
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -568,8 +568,8 @@
   // columns now instead of nine; percentages rebalanced accordingly, with
   // the space that freed up going mostly to Wayspot Name.
   const WAE_TABLE_COLUMN_DEFAULTS = {
-    starred: 6, conversation: 12, name: 34, coordinates: 16,
-    status: 16, lastResponse: 16,
+    starred: 6, conversation: 12, name: 32, coordinates: 15,
+    status: 14, lastResponse: 13, edit: 8,
   };
   // Floor on any one column's share -- keeps a fat-fingered drag from
   // shrinking a column to nothing (and, since a drag only ever trades
@@ -584,6 +584,14 @@
       for (const key of Object.keys(widths)) {
         if (Number.isFinite(saved[key]) && saved[key] >= WAE_TABLE_MIN_COLUMN_PERCENT) widths[key] = saved[key];
       }
+    }
+    // Widths saved before the pencil column existed sum to 100 without
+    // it, so merging in its default overshoots -- rescale so the row
+    // always totals exactly 100%, as waeMakeTableColumnsResizable()
+    // assumes.
+    const total = Object.values(widths).reduce((a, b) => a + b, 0);
+    if (total > 0 && Math.abs(total - 100) > 0.01) {
+      for (const key of Object.keys(widths)) widths[key] = (widths[key] * 100) / total;
     }
     return widths;
   }
@@ -2849,8 +2857,28 @@
     // for whole rows rather than one field on rows that do get
     // re-derived.
     const csvRecords = previousRecords.filter((r) => r.source === 'csv');
+    // Same idea for rows the user edited by hand (pencil column): the
+    // scan would otherwise re-derive the ORIGINAL values and silently
+    // throw the edit away. editedFromKey is the row's waeStarredKey()
+    // from BEFORE its first edit, so the matching freshly-scanned row
+    // can be dropped (instead of showing up next to the edited copy as
+    // a duplicate) even when the edit changed the coordinates.
+    // CSV-imported rows are already carried above, so they're excluded.
+    const editedRecords = previousRecords.filter((r) => r.edited && r.source !== 'csv');
 
-    const { extracted, ticketDetails } = await scanImportedEmails(onProgress);
+    const { extracted: scanned, ticketDetails } = await scanImportedEmails(onProgress);
+    const editedOrigKeys = new Set(editedRecords.map((r) => r.editedFromKey).filter(Boolean));
+    const extracted = editedOrigKeys.size
+      ? scanned.filter((r) => !editedOrigKeys.has(waeStarredKey(r)))
+      : scanned;
+    // An edited row keeps its old id, which a re-scan may have reused
+    // for a different row ("conv:X:0" style suffixes can shift) --
+    // upserting by id would then overwrite one of them. Re-id on clash.
+    const takenIds = new Set(extracted.map((r) => r.id));
+    for (const r of editedRecords) {
+      if (takenIds.has(r.id)) r.id = `${r.id}:edited:${Date.now().toString(36)}`;
+      takenIds.add(r.id);
+    }
     if (starredKeys.size) {
       for (const r of extracted) {
         if (starredKeys.has(waeStarredKey(r))) r.starred = true;
@@ -2867,11 +2895,11 @@
     // than each carrying their own copy (see EXTRACT_DB_VERSION note).
     await clearExtractedRecords();
     await clearTicketDetails();
-    await putExtractedRecords([...extracted, ...csvRecords]);
+    await putExtractedRecords([...extracted, ...csvRecords, ...editedRecords]);
     await putTicketDetails(ticketDetails);
 
-    const ticketCount = new Set(extracted.map((r) => r.conversationId || r.sourceEmailId)).size;
-    const missingCoords = extracted.filter((r) => r.latitude === null).length;
+    const ticketCount = new Set(extracted.concat(editedRecords).map((r) => r.conversationId || r.sourceEmailId)).size;
+    const missingCoords = extracted.concat(editedRecords).filter((r) => r.latitude === null).length;
 
     await refreshPanel(); // no-op if the panel isn't open -- see its own comment
     if (!waeUI) {
@@ -2881,7 +2909,7 @@
       if (WAE_PULSES.map && isMapPulsesEnabled()) waeSafeRefreshPulses();
       if (WAE_REVIEW_PULSES.map) waeSafeRefreshReviewPulses();
     }
-    return { extractedCount: extracted.length, ticketCount, missingCoords };
+    return { extractedCount: extracted.length + editedRecords.length, ticketCount, missingCoords };
   }
 
   // ---------------------------------------------------------------------
@@ -3397,6 +3425,24 @@
       font-size:15px; line-height:1; color:#d97706;
     }
     .wae-star-toggle:hover{ color:#b45309; }
+    /* Pencil / save / cancel buttons in the last column, same plain-glyph
+       convention as the star toggle. */
+    .wae-edit-cell{ text-align:center; white-space:nowrap; }
+    .wae-edit-btn{
+      background:none; border:none; padding:0 2px; margin:0; cursor:pointer;
+      font-size:14px; line-height:1; color:#6b7280;
+    }
+    .wae-edit-btn:hover{ color:#2563eb; }
+    .wae-edit-btn.wae-edit-save{ color:#16a34a; font-weight:700; }
+    .wae-edit-btn.wae-edit-cancel{ color:#b91c1c; }
+    .wae-edited-mark{ color:#2563eb; font-size:10px; margin-left:2px; cursor:help; }
+    tr.wae-row-editing td{ background:#eff6ff; }
+    .wae-edit-input{
+      width:100%; box-sizing:border-box; min-width:0; font:inherit; font-size:12px;
+      padding:2px 4px; border:1px solid #9ca3af; border-radius:4px; background:#fff; color:#111827;
+    }
+    .wae-edit-input + .wae-edit-input{ margin-top:3px; }
+    .wae-edit-input.wae-invalid{ border-color:#dc2626; background:#fef2f2; }
     /* BUGFIX v1.25.0: WFMM.ui.table()'s own base CSS (.wfmm-table) has no
        table-layout:fixed and no per-cell max-width/overflow -- columns
        size purely to content, so one long unbroken string (e.g. a URL)
@@ -3727,6 +3773,164 @@
     });
   }
 
+  // ---------------------------------------------------------------------
+  // Row editing (pencil column). Rows are "locked" by default; the pencil
+  // at the end of a row unlocks that one row, turning each of its cells
+  // into an input. Only one row is editable at a time -- starting another
+  // edit discards the first one's unsaved draft. The draft lives here
+  // (not in the DOM) so a re-render caused by paging/sorting/searching
+  // doesn't lose what was typed.
+  //
+  // Saving mutates the record in place (same object waeAllRecords and
+  // waeRecordsById already share -- same pattern as the star toggle),
+  // marks it `edited` with `editedFromKey` (its identity BEFORE the
+  // first edit, see waeScanAndPersist()) so a later re-scan carries the
+  // edit across instead of wiping it, and upserts it to storage.
+  // ---------------------------------------------------------------------
+  let waeEditingId = null;
+  let waeEditDraft = null;
+
+  function waeToDatetimeLocalValue(ms) {
+    if (!Number.isFinite(ms)) return '';
+    const d = new Date(ms);
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+
+  function waeStartEdit(record) {
+    waeEditingId = record.id;
+    waeEditDraft = {
+      conversationId: record.conversationId || '',
+      wayspotName: record.wayspotName || '',
+      comment: record.comment || '',
+      coordinates: (Number.isFinite(record.latitude) && Number.isFinite(record.longitude))
+        ? `${record.latitude.toFixed(6)}, ${record.longitude.toFixed(6)}`
+        : '',
+      ticketStatus: record.ticketStatus,
+      lastResponse: waeToDatetimeLocalValue(record.lastResponseAt),
+    };
+    waeRenderFilteredTable();
+    const first = waeUI && waeUI.tableContainer.querySelector('.wae-edit-input[data-field="wayspotName"]');
+    if (first) first.focus();
+  }
+
+  function waeCancelEdit() {
+    waeEditingId = null;
+    waeEditDraft = null;
+    waeRenderFilteredTable();
+  }
+
+  // Returns { latitude, longitude } or null when the text isn't valid.
+  // Blank means "no coordinates" (both null), same as a scanned row
+  // whose email had none.
+  function waeParseCoordinateInput(text) {
+    const t = (text || '').trim();
+    if (!t) return { latitude: null, longitude: null };
+    const parts = t.split(/[\s,;]+/).filter(Boolean);
+    if (parts.length !== 2) return null;
+    const lat = Number(parts[0]);
+    const lng = Number(parts[1]);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) return null;
+    return { latitude: lat, longitude: lng };
+  }
+
+  async function waeSaveEdit() {
+    const record = waeRecordsById.get(waeEditingId);
+    if (!record || !waeEditDraft) { waeCancelEdit(); return; }
+    const draft = waeEditDraft;
+
+    const coords = waeParseCoordinateInput(draft.coordinates);
+    if (!coords) {
+      const input = waeUI && waeUI.tableContainer.querySelector('.wae-edit-input[data-field="coordinates"]');
+      if (input) { input.classList.add('wae-invalid'); input.focus(); }
+      if (waeUI) log(waeUI.logEl, '\u2717 Coordinates must be "lat, lng" (e.g. 52.221500, 6.893700) or left blank.', 'err');
+      return;
+    }
+    let lastResponseAt = null;
+    if (draft.lastResponse) {
+      const ms = new Date(draft.lastResponse).getTime();
+      if (!Number.isFinite(ms)) {
+        const input = waeUI && waeUI.tableContainer.querySelector('.wae-edit-input[data-field="lastResponse"]');
+        if (input) { input.classList.add('wae-invalid'); input.focus(); }
+        return;
+      }
+      lastResponseAt = ms;
+    }
+
+    // Identity before the FIRST edit only -- see waeScanAndPersist().
+    if (!record.edited && record.source !== 'csv') record.editedFromKey = waeStarredKey(record);
+    record.edited = true;
+    record.editedAt = Date.now();
+    record.conversationId = draft.conversationId.trim() || null;
+    record.wayspotName = draft.wayspotName.trim() || null;
+    record.comment = draft.comment.trim() || null;
+    record.latitude = coords.latitude;
+    record.longitude = coords.longitude;
+    record.ticketStatus = draft.ticketStatus;
+    record.lastResponseAt = lastResponseAt;
+    delete record._waeHaystack; // search text cache -- see waeMatchesQuery()
+
+    waeEditingId = null;
+    waeEditDraft = null;
+
+    // Fresh array reference invalidates every cache keyed on
+    // waeAllRecords identity (sort/filter, stats, nearby index).
+    waeAllRecords = waeAllRecords.slice();
+    waeRecordsLoadPromise = Promise.resolve(waeAllRecords);
+    waeNearbyMap = waeFindNearbyDuplicates(waeAllRecords);
+    waeNearbyMapFingerprint = waeRecordsFingerprint(waeAllRecords);
+    waeRenderFilteredTable();
+    if (WAE_PULSES.map && isMapPulsesEnabled()) waeSafeRefreshPulses();
+    if (WAE_REVIEW_PULSES.map) waeSafeRefreshReviewPulses();
+
+    try {
+      await putExtractedRecords([record]);
+    } catch (e) {
+      if (waeUI) log(waeUI.logEl, `\u2717 Could not save edit: ${e.message || e}`, 'err');
+    }
+  }
+
+  // One input/select bound to a draft field. Enter saves, Escape cancels.
+  function waeBuildEditInput(field, { type = 'text', placeholder = '', title = '' } = {}) {
+    const input = waeUiApi.createElement('input', {
+      className: 'wae-edit-input',
+      attrs: { type, placeholder, title, 'data-field': field },
+    });
+    input.value = waeEditDraft[field] ?? '';
+    input.addEventListener('input', () => {
+      waeEditDraft[field] = input.value;
+      input.classList.remove('wae-invalid');
+    });
+    input.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') { ev.preventDefault(); waeSaveEdit(); }
+      else if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); waeCancelEdit(); }
+    });
+    return input;
+  }
+
+  function waeBuildStatusSelect() {
+    const select = waeUiApi.createElement('select', {
+      className: 'wae-edit-input',
+      attrs: { 'data-field': 'ticketStatus' },
+    });
+    const keys = Object.keys(WAE_STATUS_BADGES);
+    // A status this plugin doesn't recognize is kept as an option so
+    // opening and saving a row never silently changes it.
+    if (waeEditDraft.ticketStatus && !keys.includes(waeEditDraft.ticketStatus)) keys.push(waeEditDraft.ticketStatus);
+    for (const key of keys) {
+      const opt = document.createElement('option');
+      opt.value = key;
+      opt.textContent = waeStatusLabel(key);
+      select.appendChild(opt);
+    }
+    select.value = waeEditDraft.ticketStatus;
+    select.addEventListener('change', () => { waeEditDraft.ticketStatus = select.value; });
+    select.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); waeCancelEdit(); }
+    });
+    return select;
+  }
+
   // Builds the table (or an empty-state) for the current page, using
   // WFMM.ui.table()/pager()/emptyState() instead of an innerHTML string --
   // see the v1.22.0 changelog note. table()'s own onRowClick fires for
@@ -3742,6 +3946,8 @@
           : 'No abuse reports extracted yet -- click "Scan Imported Emails".'
       );
     }
+
+    if (waeEditingId && !waeRecordsById.has(waeEditingId)) { waeEditingId = null; waeEditDraft = null; }
 
     const totalPages = Math.max(1, Math.ceil(sorted.length / WAE_PAGE_SIZE));
     if (waeCurrentPage > totalPages) waeCurrentPage = totalPages;
@@ -3773,6 +3979,7 @@
       {
         key: 'conversation', label: 'Conversation', sortable: true,
         render: (r) => {
+          if (waeEditingId === r.id) return waeBuildEditInput('conversationId', { placeholder: 'Conversation ID' });
           const v = r.conversationId || r.sourceEmailId;
           return waeUiApi.createElement('span', { text: v, attrs: { title: v } });
         },
@@ -3790,6 +3997,12 @@
         // instead of one when there's a note to show.
         key: 'name', label: 'Wayspot Name',
         render: (r) => {
+          if (waeEditingId === r.id) {
+            const box = waeUiApi.createElement('div', { className: 'wae-edit-cell' });
+            box.appendChild(waeBuildEditInput('wayspotName', { placeholder: 'Wayspot name' }));
+            box.appendChild(waeBuildEditInput('comment', { placeholder: 'Note (optional)' }));
+            return box;
+          }
           const name = r.wayspotName || '(none found)';
           const titleParts = [name];
           if (r.comment) titleParts.push(`Note: ${r.comment}`);
@@ -3821,6 +4034,7 @@
         // full-on-hover convention as Last Response's own column.
         key: 'coordinates', label: 'Coordinates',
         render: (r) => {
+          if (waeEditingId === r.id) return waeBuildEditInput('coordinates', { placeholder: 'lat, lng', title: 'Latitude, longitude -- e.g. 52.221500, 6.893700' });
           if (r.latitude === null || r.longitude === null) {
             return waeUiApi.createElement('span', { className: 'wae-missing', text: '-' });
           }
@@ -3829,14 +4043,50 @@
           return waeUiApi.createElement('span', { text: short, attrs: { title: full } });
         },
       },
-      { key: 'status', label: 'Status', sortable: true, render: (r) => waeStatusBadgeEl(r.ticketStatus) },
+      {
+        key: 'status', label: 'Status', sortable: true,
+        render: (r) => (waeEditingId === r.id ? waeBuildStatusSelect() : waeStatusBadgeEl(r.ticketStatus)),
+      },
       {
         key: 'lastResponse', label: 'Last Response', sortable: true,
         render: (r) => {
+          if (waeEditingId === r.id) return waeBuildEditInput('lastResponse', { type: 'datetime-local' });
           const f = waeFormatLastResponse(r.lastResponseAt);
           return f
             ? waeUiApi.createElement('span', { text: f.short, attrs: { title: f.full } })
             : waeUiApi.createElement('span', { className: 'wae-missing', text: '-' });
+        },
+      },
+      {
+        // Pencil: unlocks this row for editing. While editing, it's
+        // replaced by save (check) and cancel (x). Clicks are handled in
+        // onRowClick below via the .wae-edit-btn class, same pattern as
+        // the star toggle.
+        key: 'edit', label: '', cellClassName: 'wae-edit-cell',
+        render: (r) => {
+          const wrap = waeUiApi.createElement('span', {});
+          if (waeEditingId === r.id) {
+            wrap.appendChild(waeUiApi.createElement('button', {
+              className: 'wae-edit-btn wae-edit-save', text: '\u2713',
+              attrs: { type: 'button', title: 'Save changes', 'data-action': 'save' },
+            }));
+            wrap.appendChild(waeUiApi.createElement('button', {
+              className: 'wae-edit-btn wae-edit-cancel', text: '\u2715',
+              attrs: { type: 'button', title: 'Discard changes', 'data-action': 'cancel' },
+            }));
+          } else {
+            wrap.appendChild(waeUiApi.createElement('button', {
+              className: 'wae-edit-btn', text: '\u270E',
+              attrs: { type: 'button', title: r.edited ? 'Edit this row (edited by hand)' : 'Edit this row', 'data-action': 'edit' },
+            }));
+            if (r.edited) {
+              wrap.appendChild(waeUiApi.createElement('span', {
+                className: 'wae-edited-mark', text: '\u25CF',
+                attrs: { title: 'Edited by hand -- kept across re-scans' },
+              }));
+            }
+          }
+          return wrap;
         },
       },
     ];
@@ -3881,6 +4131,18 @@
           });
           return;
         }
+        const editBtn = event.target.closest('.wae-edit-btn');
+        if (editBtn) {
+          event.stopPropagation();
+          const action = editBtn.dataset.action;
+          if (action === 'edit') waeStartEdit(record);
+          else if (action === 'save') waeSaveEdit();
+          else if (action === 'cancel') waeCancelEdit();
+          return;
+        }
+        // Clicking into an input of the row being edited must not also
+        // jump the map to that row.
+        if (waeEditingId === record.id) return;
         const flagTrigger = event.target.closest('.wae-nearby-trigger');
         if (flagTrigger) {
           event.stopPropagation();
@@ -3902,7 +4164,9 @@
       if (!tr) return;
       const hasCoords = record.latitude !== null && record.longitude !== null;
       const nearby = nearbyMap && nearbyMap.get(record.id);
-      if (hasCoords) {
+      if (waeEditingId === record.id) {
+        tr.classList.add('wae-row-editing');
+      } else if (hasCoords) {
         tr.classList.add('wae-row-clickable');
         tr.title = 'Click to locate on the map';
       }

@@ -156,7 +156,8 @@ time the page loads and kept in memory only, for the session.
    plotted directly on the map instead (see "Plotting on the map"
    below).
 
-The table's **column widths are adjustable** — see "Resizing table
+Each row ends with a pencil (✎) that unlocks it for editing — see
+"Editing a row" below. The table's **column widths are adjustable** — see "Resizing table
 columns" below.
 
 The **Conversation** and **Status** column headers are clickable to sort
@@ -343,6 +344,26 @@ called out by name in the **Clear Extracted Data** confirmation, since
 —unlike scanned data — there's no source email to re-derive an imported
 row from if either of those clears it.
 
+## Editing a row
+
+Every row in the table ends with a pencil (✎). Rows are locked by
+default; click the pencil to unlock that one row, which turns its cells
+into inputs: **Conversation**, **Wayspot Name** (plus a **Note** field
+underneath), **Coordinates** (`lat, lng`, or blank for none), **Status**
+(a dropdown) and **Last Response** (date/time picker). The pencil is
+replaced by **✓** (save) and **✕** (discard); **Enter** saves and
+**Esc** cancels. Only one row is editable at a time — opening another
+discards the first one's unsaved changes. Coordinates that aren't a valid
+`lat, lng` pair are rejected and the field is highlighted.
+
+Saved edits update the table, the map crosses, nearby-ticket flags,
+search and CSV export straight away. An edited row gets a small blue dot
+next to its pencil, and — like starred and CSV-imported rows — is carried
+across **Scan Imported Emails**: the freshly scanned copy of that row is
+dropped in favour of your edited version (matched by its pre-edit
+ticket + coordinates, so it works even if you changed the coordinates).
+**Clear Extracted Data** still wipes everything, edited rows included.
+
 ## CSV columns
 
 `Starred`, `Conversation ID`, `Ticket Status`, `Last Response (UTC)`,
@@ -356,6 +377,9 @@ location in a reply (real example: *"'t Zudn, &lt;lat,lng&gt; (is here:
 context for that entry rather than dropped or turned into a bogus extra
 row. Shown as a hover-for-full-text 💬 in the panel's table since the
 link itself is usually too long to display inline.
+
+A hand-edited row exports its edited values (name, coordinates, status,
+last response and so on), not the original scanned ones.
 
 `Source Email ID` / `Source Filename` list every email that contributed
 to that row (semicolon-joined) — for a long-running ticket merged from
@@ -753,10 +777,23 @@ same favorite however it's capitalised.
 
 Favorites are listed in a **Favorite Users** section in the same window
 as the Marked Wayspots list, each in the favorite color with an **×** to
-remove it, plus a **Clear All**. Only the username is clickable — the
-"Submitted by" prefix stays plain text — and the feature only appears
-where the side panel actually shows that line. Like the Marked Wayspots
-list, it's stored with the suite's settings.
+remove it, plus a **Clear All** (asks for confirmation first). Only the
+username is clickable — the "Submitted by" prefix stays plain text — and
+the feature only appears where the side panel actually shows that line.
+Like the Marked Wayspots list, it's stored with the suite's settings.
+
+Each favorite also has its own **note** underneath the name (up to 1000
+characters): click **Click to add a note…** to open a small text box,
+type, and click anywhere outside it to save. The note is shown in the
+list only — it isn't part of anything you copy.
+
+**Copying usernames.** Every row has a checkbox. **Copy All** copies
+every username, one per line; **Copy Selected** (which shows a count,
+e.g. *Copy Selected (3)*, and stays disabled until something is ticked)
+copies just the ticked ones. Both copy usernames only — never notes —
+and the button briefly reads **Copied!** (or **Copy failed**). Ticked
+boxes are a this-window-session convenience and aren't saved; they reset
+when the window is reopened or when you **Clear All**.
 
 ## Abuse helper on the review page
 
@@ -837,13 +874,18 @@ needed since it's plain `@require`-able JS.
 ## Versions covered by this README
 
 - `wayfarer-abuse-email-importer.user.js` — v4.11.0
-- `wayfarer-abuse-report-extractor.user.js` — v1.57.1
+- `wayfarer-abuse-report-extractor.user.js` — v1.61.0
 - Verified against `wayfarer-map-mods.user.js` v4.3.0 (the consolidated
   suite both scripts depend on — see Requirements above).
 
 Full version-by-version detail lives in the changelog comment block at
-the top of each `.user.js` file. This README is fully caught up as of
-extractor v1.57.1 and importer v4.11.0, including everything added between v1.26.1 (this
+the top of each `.user.js` file. This README is caught up as of
+extractor v1.61.0 and importer v4.11.0 (the v1.58.0–v1.60.5 stretch had
+no changelog block in the file to draw from, so only behavior that could
+be confirmed in the code is documented — see "Starring rows", "Favorite
+users" and the new "Editing a row" section — rather than a
+version-by-version list for those releases), including everything added
+between v1.26.1 (this
 file's previous checkpoint) and now: the star/favorite column and Last
 Response column (v1.31.0/v1.28.0), Import CSV (v1.34.0), the auto-close
 checkbox (v1.27.0), live Wayspot ticket annotation (v1.30.0), the
@@ -865,6 +907,8 @@ their color setting (v1.55.0–v1.55.2); the copy-with-or-without-notes
 checkbox (v1.56.0); the review-page abuse helper replacing the Abuse
 Text Formatter script, with its "Abuse form" link (v1.57.0–v1.57.1);
 and, on the importer side, scan-after-import (importer v4.11.0, extractor
-v1.53.7). Smaller
+v1.53.7). Newest: the pencil column for editing a row, with edits kept
+across re-scans (v1.61.0), and the Favorite Users notes and Copy
+All / Copy Selected controls now documented. Smaller
 internal/performance-only changes in between aren't each individually
 called out here — see the changelog block itself for those.
