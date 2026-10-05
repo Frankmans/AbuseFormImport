@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.61.0
+// @version      1.62.0
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -663,6 +663,15 @@
     // customize anything first.
     favoriteUserColor: '#f59e0b',
     markColor: '#2563eb',
+    // Feature request: separate color for CSV-imported rows' markers.
+    // null (the default) means "same as fillColor" -- it FOLLOWS the
+    // email-marker color, so out of the box the two are identical even
+    // after someone has customized fillColor. Picking a color in Marker
+    // Style stores it here and the two become independent; "Same as
+    // email" (or Reset to default) puts it back to null. Size, cluster
+    // size, opacity and ring settings are deliberately NOT duplicated:
+    // imported markers always use the email markers' own.
+    importColor: null,
   });
   // Combined with autoCloseOnNavigate (see waeAutoCloseOnNavigateEnabled()
   // above) under one WFMM.settings.registerPlugin() call in startPlugin()
@@ -709,6 +718,7 @@
       // than as a separate WFMM.settings key.
       clickable: typeof a.clickable === 'boolean' ? a.clickable : WAE_APPEARANCE_DEFAULTS.clickable,
       markColor: waeNormalizeHexColor(a.markColor, WAE_APPEARANCE_DEFAULTS.markColor),
+      importColor: a.importColor ? waeNormalizeHexColor(a.importColor, null) : null,
       favoriteUserColor: waeNormalizeHexColor(a.favoriteUserColor, WAE_APPEARANCE_DEFAULTS.favoriteUserColor),
     };
   }
@@ -727,9 +737,8 @@
     // Cached SVG icons (WAE_MARKER_ICON/WAE_CLUSTER_ICON, see below) are
     // built from these values -- stale otherwise until the next full page
     // load.
-    WAE_MARKER_ICON = null;
-    WAE_CLUSTER_ICON.normal = null;
-    WAE_CLUSTER_ICON.expanded = null;
+    WAE_MARKER_ICON = {};
+    WAE_CLUSTER_ICON = {};
     // Only live-redraw if pulses are actually already visible -- editing
     // colors shouldn't be what makes the map attach/show pulses if the
     // user never turned "Show on Map" on.
@@ -794,9 +803,19 @@
   // return the raw <svg>...</svg> markup itself (still cached exactly
   // the same way, still invalidated by waeSaveAppearance() the same way)
   // for WaePulseOverlay to drop straight into a div's innerHTML instead.
-  let WAE_MARKER_ICON = null;
-  function waeGetMarkerSvgMarkup() {
-    if (WAE_MARKER_ICON) return WAE_MARKER_ICON;
+  // Keyed by variant ('email' | 'imported') -- same shape/size, only the
+  // color differs. waeIsImportedRecord()/waeIsImportedCluster() decide
+  // which variant a marker gets.
+  let WAE_MARKER_ICON = {};
+  function waeIsImportedRecord(r) { return !!r && r.source === 'csv'; }
+  // A cluster only takes the imported color when EVERY record in it is
+  // imported; a mix with email-sourced reports keeps the email color.
+  function waeIsImportedCluster(cluster) {
+    return !!cluster && cluster.records.length > 0 && cluster.records.every(waeIsImportedRecord);
+  }
+  function waeGetMarkerSvgMarkup(imported) {
+    const variant = imported ? 'imported' : 'email';
+    if (WAE_MARKER_ICON[variant]) return WAE_MARKER_ICON[variant];
     const a = waeLoadAppearance();
     // Kept as a distinct X glyph (not the same filled-circle look as a
     // regular Wayspot/Pok\u00e9stop/Gym marker) so an abuse-report location
@@ -810,11 +829,12 @@
     const half = size / 2;
     const arm = size * 0.35;
     const stroke = Math.max(2, Math.round(a.markerSize * 0.45));
-    WAE_MARKER_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}">`
-      + `<line x1="${half - arm}" y1="${half - arm}" x2="${half + arm}" y2="${half + arm}" stroke="${a.fillColor}" stroke-width="${stroke}" stroke-linecap="round"/>`
-      + `<line x1="${half + arm}" y1="${half - arm}" x2="${half - arm}" y2="${half + arm}" stroke="${a.fillColor}" stroke-width="${stroke}" stroke-linecap="round"/>`
+    const color = imported ? (a.importColor || a.fillColor) : a.fillColor;
+    WAE_MARKER_ICON[variant] = `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}">`
+      + `<line x1="${half - arm}" y1="${half - arm}" x2="${half + arm}" y2="${half + arm}" stroke="${color}" stroke-width="${stroke}" stroke-linecap="round"/>`
+      + `<line x1="${half + arm}" y1="${half - arm}" x2="${half - arm}" y2="${half + arm}" stroke="${color}" stroke-width="${stroke}" stroke-linecap="round"/>`
       + '</svg>';
-    return WAE_MARKER_ICON;
+    return WAE_MARKER_ICON[variant];
   }
 
   // Same color as the single-report marker, just as a filled circle
@@ -835,16 +855,17 @@
   // concentrated, without changing anything about how it looks once
   // you've zoomed in past that floor.
   const WAE_CLUSTER_EXPAND_FACTOR = 1.5;
-  let WAE_CLUSTER_ICON = { normal: null, expanded: null };
-  function waeGetClusterSvgMarkup(expanded) {
-    const cacheKey = expanded ? 'expanded' : 'normal';
+  let WAE_CLUSTER_ICON = {};
+  function waeGetClusterSvgMarkup(expanded, imported) {
+    const cacheKey = `${expanded ? 'expanded' : 'normal'}:${imported ? 'imported' : 'email'}`;
     if (WAE_CLUSTER_ICON[cacheKey]) return WAE_CLUSTER_ICON[cacheKey];
     const a = waeLoadAppearance();
     const r = a.clusterMarkerSize * (expanded ? WAE_CLUSTER_EXPAND_FACTOR : 1);
     const size = (r + a.borderWidth) * 2;
     const c = size / 2;
+    const color = imported ? (a.importColor || a.fillColor) : a.fillColor;
     WAE_CLUSTER_ICON[cacheKey] = `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}">`
-      + `<circle cx="${c}" cy="${c}" r="${r}" fill="${a.fillColor}" fill-opacity="${a.fillOpacity}" stroke="${a.borderColor}" stroke-width="${a.borderWidth}" stroke-opacity="${a.borderOpacity}"/>`
+      + `<circle cx="${c}" cy="${c}" r="${r}" fill="${color}" fill-opacity="${a.fillOpacity}" stroke="${a.borderColor}" stroke-width="${a.borderWidth}" stroke-opacity="${a.borderOpacity}"/>`
       + '</svg>';
     return WAE_CLUSTER_ICON[cacheKey];
   }
@@ -1035,7 +1056,8 @@
         this.cluster = cluster;
         this.latLng = new google.maps.LatLng(cluster.lat, cluster.lng);
         const isClusterMarker = cluster.records.length > 1;
-        const shapeSvg = isClusterMarker ? waeGetClusterSvgMarkup(isExpanded) : waeGetMarkerSvgMarkup();
+        const imported = waeIsImportedCluster(cluster);
+        const shapeSvg = isClusterMarker ? waeGetClusterSvgMarkup(isExpanded, imported) : waeGetMarkerSvgMarkup(imported);
         this._html = isClusterMarker ? `${shapeSvg}<span class="wae-pulse-count">${cluster.records.length}</span>` : shapeSvg;
         this._title = isClusterMarker ? `${cluster.records.length} reports` : (cluster.records[0].wayspotName || '(unnamed report)');
         this._clickable = !!appearance.clickable;
@@ -1113,7 +1135,8 @@
         this.cluster = cluster;
         this.latLng = new google.maps.LatLng(cluster.lat, cluster.lng);
         const isClusterMarker = cluster.records.length > 1;
-        const shapeSvg = isClusterMarker ? waeGetClusterSvgMarkup(isExpanded) : waeGetMarkerSvgMarkup();
+        const imported = waeIsImportedCluster(cluster);
+        const shapeSvg = isClusterMarker ? waeGetClusterSvgMarkup(isExpanded, imported) : waeGetMarkerSvgMarkup(imported);
         this._html = isClusterMarker ? `${shapeSvg}<span class="wae-pulse-count">${cluster.records.length}</span>` : shapeSvg;
         this._title = isClusterMarker ? `${cluster.records.length} reports` : (cluster.records[0].wayspotName || '(unnamed report)');
         // BUGFIX (not upstream, feature request): always false here,
@@ -5187,9 +5210,33 @@
       return next;
     }
     const initialAppearance = waeLoadAppearance();
+    // Declared up front: the email-color handler below needs to keep it
+    // in sync while it's still following that color.
+    let styleImportColorInput = null;
     const styleColorInput = ui.colorInput({
       value: initialAppearance.fillColor,
-      onInput: (v) => updateAppearance({ fillColor: v }),
+      onInput: (v) => {
+        updateAppearance({ fillColor: v });
+        // Imported markers follow the email color until they've been
+        // given a color of their own -- reflect that in their picker.
+        if (styleImportColorInput && !waeLoadAppearance().importColor) styleImportColorInput.value = v;
+      },
+    });
+    // Feature request: separate color for CSV-imported rows' markers.
+    // Shows the email color while unset (importColor null); picking a
+    // color stores it and the two become independent. Everything else
+    // about imported markers (size, cluster size, opacity, ring) is
+    // shared with the email markers, so there are no extra controls.
+    styleImportColorInput = ui.colorInput({
+      value: initialAppearance.importColor || initialAppearance.fillColor,
+      onInput: (v) => updateAppearance({ importColor: v }),
+    });
+    const styleImportSameBtn = ui.button({
+      text: 'Same as email color',
+      onClick: () => {
+        const a = updateAppearance({ importColor: null });
+        styleImportColorInput.value = a.fillColor;
+      },
     });
     const styleSizeRange = ui.rangeInput({
       min: 4, max: 24, step: 1, value: initialAppearance.markerSize,
@@ -5242,6 +5289,7 @@
         const d = waeNormalizeAppearance(WAE_APPEARANCE_DEFAULTS);
         waeSaveAppearance(d);
         styleColorInput.value = d.fillColor;
+        styleImportColorInput.value = d.fillColor; // importColor resets to null = follows the email color
         styleBorderColorInput.value = d.borderColor;
         styleSizeRange.input.value = String(d.markerSize);
         styleSizeRange.valueEl.textContent = `${d.markerSize}px`;
@@ -5295,7 +5343,9 @@
       title: 'Marker Style',
       hint: 'Color/size for the map markers this plugin draws (single reports and clusters). Changes apply immediately.',
       children: [
-        ui.fieldRow({ label: 'Color', input: styleColorInput }),
+        ui.fieldRow({ label: 'Color', input: styleColorInput, help: 'Markers for reports scanned from emails.' }),
+        ui.fieldRow({ label: 'Imported color', input: styleImportColorInput, help: 'Markers for CSV-imported locations. Starts out identical to Color and follows it until you pick your own; size, cluster and ring settings are shared with the email markers.' }),
+        ui.buttonRow([styleImportSameBtn]),
         ui.fieldRow({ label: 'Cross size', input: styleSizeRange.row, help: 'Single-report \u201cX\u201d markers.' }),
         ui.fieldRow({ label: 'Cluster size', input: styleClusterSizeRange.row, help: `Multi-report \u201cheatmap\u201d markers. Automatically shown ${WAE_CLUSTER_EXPAND_FACTOR}\u00d7 bigger at the lowest zoom level.` }),
         ui.fieldRow({ label: 'Fill opacity', input: styleFillOpacityRange.row, help: 'Only visible on cluster markers -- a single X marker is always fully opaque.' }),

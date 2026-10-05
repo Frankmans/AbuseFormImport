@@ -337,7 +337,8 @@ Latitude,Longitude,Name,Comment,Conversation ID
 
 Imported rows show up in the table and on the map like any other, with
 their own **Imported** status badge (purple, distinct from the ticket
-pipeline badges below) — and, since a re-scan otherwise rebuilds the
+pipeline badges below) and their own **Imported color** map markers (see
+"Marker Style") — and, since a re-scan otherwise rebuilds the
 extracted-records table from scratch, they're explicitly carried
 forward across one rather than getting silently wiped. They're also
 called out by name in the **Clear Extracted Data** confirmation, since
@@ -625,9 +626,10 @@ setting under Marker Style — see that section below for why.
 
 Opened via the small cog icon next to the Abuse Reports panel's summary
 line (see "Where to find things" above), this section covers: color,
-size, fill opacity, ring color/width/opacity for the cluster badges, and
-a **Marked Wayspot color** and a **Favorite user color** (see "Marked
-Wayspots" and "Favorite users" below), and a **Clickable markers
+size, fill opacity, ring color/width/opacity for the cluster badges, an
+**Imported color** for CSV-imported locations (see "Imported markers"
+just below), and a **Marked Wayspot color** and a **Favorite user color**
+(see "Marked Wayspots" and "Favorite users" below), and a **Clickable markers
 (mapview/submit only)** toggle (turn it off to let
 clicks pass through to whatever's underneath — the map itself, or a
 Wayspot marker at the same spot — instead of opening this plugin's own
@@ -641,6 +643,20 @@ showing. The individual-report X shape itself stays fixed by design —
 it's meant to read as "a problem here," distinct from an ordinary POI
 dot — only its color and size are adjustable; the cluster badge, already
 a filled circle, gets the full set of controls.
+
+**Imported markers.** Locations brought in with **Import CSV** (the
+purple *Imported* rows) have their own **Imported color** entry in Marker
+Style, next to **Color** (which is for reports scanned from emails). It
+starts out identical to **Color** and *follows* it — change **Color** and
+the imported markers change with it — until you pick a color of your own
+for **Imported color**, at which point the two are independent. **Same as
+email color** (or **Reset to default**) puts it back to following. Only
+the color is separate: imported markers use the exact same **Cross size**,
+**Cluster size**, fill opacity and ring settings as the email markers, so
+the two always scale together. A cluster badge takes the imported color
+only when *every* location in it is imported; a cluster mixing imported
+and email-sourced locations keeps the email color. It applies on both the
+mapview/submit crosses and the review-page markers.
 
 These settings are also registered with `WFMM.markerAppearance` (the
 suite's own marker-styling engine), so this is a real, discoverable style
@@ -874,13 +890,13 @@ needed since it's plain `@require`-able JS.
 ## Versions covered by this README
 
 - `wayfarer-abuse-email-importer.user.js` — v4.11.0
-- `wayfarer-abuse-report-extractor.user.js` — v1.61.0
+- `wayfarer-abuse-report-extractor.user.js` — v1.62.0
 - Verified against `wayfarer-map-mods.user.js` v4.3.0 (the consolidated
   suite both scripts depend on — see Requirements above).
 
 Full version-by-version detail lives in the changelog comment block at
 the top of each `.user.js` file. This README is caught up as of
-extractor v1.61.0 and importer v4.11.0 (the v1.58.0–v1.60.5 stretch had
+extractor v1.62.0 and importer v4.11.0 (the v1.58.0–v1.60.5 stretch had
 no changelog block in the file to draw from, so only behavior that could
 be confirmed in the code is documented — see "Starring rows", "Favorite
 users" and the new "Editing a row" section — rather than a
@@ -908,7 +924,8 @@ checkbox (v1.56.0); the review-page abuse helper replacing the Abuse
 Text Formatter script, with its "Abuse form" link (v1.57.0–v1.57.1);
 and, on the importer side, scan-after-import (importer v4.11.0, extractor
 v1.53.7). Newest: the pencil column for editing a row, with edits kept
-across re-scans (v1.61.0), and the Favorite Users notes and Copy
+across re-scans (v1.61.0), a separate Imported color for CSV-imported
+markers sharing the email markers' sizing (v1.62.0), and the Favorite Users notes and Copy
 All / Copy Selected controls now documented. Smaller
 internal/performance-only changes in between aren't each individually
 called out here — see the changelog block itself for those.
