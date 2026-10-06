@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.62.0
+// @version      1.62.3
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -127,6 +127,13 @@
       const d = detailsById.get(r.ticketKey) || {};
       return {
         ...r,
+        // Rows stored before v1.62.1 can still carry a "#" in their ticket
+        // id. Cleaned here, on read, so the table, sorting, search, CSV
+        // export and nearby-ticket labels all see the bare number without
+        // touching what's stored. Only values containing "#" are changed.
+        conversationId: typeof r.conversationId === 'string' && r.conversationId.includes('#')
+          ? (r.conversationId.replace(/\D/g, '') || null)
+          : r.conversationId,
         issueType: d.issueType ?? null,
         locationDetails: d.locationDetails ?? null,
         reportDetails: d.reportDetails ?? null,
@@ -2569,7 +2576,26 @@
   // Wayspot that's already on the list overwrites its note (see
   // waeAddMarkedWayspot()). Returns the two elements unattached; each
   // caller decides where they go.
-  function waeBuildMarkControls({ name, lat, lng }) {
+  //
+  // v1.62.3: draftKey (side panel only) keeps a half-typed note alive when
+  // Base rebuilds the details slot for the SAME Wayspot -- which it does
+  // once the map finishes loading after a zoom, replacing this whole row
+  // (and the input with it) mid-typing. The in-progress text, plus whether
+  // the field had focus and where the caret was, is mirrored into
+  // waeNoteDraft and restored onto the replacement input
+  // (waeRestoreNoteFocus(), called by the watcher once the input is back
+  // in the DOM). A different Wayspot's key simply never matches, so a
+  // draft never carries over to another selection.
+  let waeNoteDraft = null; // { key, value, focused, selStart, selEnd }
+
+  function waeRestoreNoteFocus(noteInput, draftKey) {
+    const d = waeNoteDraft;
+    if (!d || d.key !== draftKey || !d.focused) return;
+    noteInput.focus();
+    try { noteInput.setSelectionRange(d.selStart, d.selEnd); } catch (e) { /* not selectable -- ignore */ }
+  }
+
+  function waeBuildMarkControls({ name, lat, lng, draftKey }) {
     const noteInput = document.createElement('input');
     noteInput.type = 'text';
     noteInput.className = 'wae-detail-mark-note';
@@ -2586,6 +2612,38 @@
     noteInput.addEventListener('click', (ev) => ev.stopPropagation());
     noteInput.addEventListener('keydown', (ev) => ev.stopPropagation());
 
+    if (draftKey) {
+      if (waeNoteDraft && waeNoteDraft.key === draftKey) {
+        noteInput.value = waeNoteDraft.value;
+      } else {
+        waeNoteDraft = null; // a different Wayspot -- drop the old draft
+      }
+      const saveDraft = (focused) => {
+        waeNoteDraft = {
+          key: draftKey,
+          value: noteInput.value,
+          focused,
+          selStart: noteInput.selectionStart ?? noteInput.value.length,
+          selEnd: noteInput.selectionEnd ?? noteInput.value.length,
+        };
+      };
+      for (const evName of ['input', 'keyup', 'click', 'focus']) {
+        noteInput.addEventListener(evName, () => saveDraft(true));
+      }
+      noteInput.addEventListener('blur', () => {
+        // A blur caused by Base tearing the slot down also lands here --
+        // in that case the input is no longer connected by the time this
+        // deferred check runs, and focus should be treated as still
+        // wanted on the replacement. A real click-away leaves the input
+        // connected, so that one does clear the focused flag.
+        setTimeout(() => {
+          if (noteInput.isConnected && waeNoteDraft && waeNoteDraft.key === draftKey) {
+            waeNoteDraft.focused = false;
+          }
+        }, 0);
+      });
+    }
+
     const markBtn = document.createElement('button');
     markBtn.type = 'button';
     markBtn.className = 'wae-detail-mark-btn';
@@ -2596,6 +2654,7 @@
       ev.stopPropagation();
       const result = waeAddMarkedWayspot({ name, lat, lng, note: noteInput.value.trim() });
       noteInput.value = '';
+      if (draftKey && waeNoteDraft && waeNoteDraft.key === draftKey) waeNoteDraft = null;
       // waeAddMarkedWayspot() decides whether this was a new entry or an
       // overwrite of an already-marked Wayspot's note.
       markBtn.textContent = result === 'updated' ? '\u2713 Updated' : '\u2713 Added';
@@ -2715,10 +2774,12 @@
       // Note field + "+ add to abuse report draft" button now come from
       // waeBuildMarkControls() (shared with the review-page row, see
       // waeBuildReviewAbuseRow()) rather than being built inline here.
-      const { noteInput, markBtn } = waeBuildMarkControls({ name, lat, lng });
+      const draftKey = `${lat},${lng}`;
+      const { noteInput, markBtn } = waeBuildMarkControls({ name, lat, lng, draftKey });
       markRow.append(noteInput, markBtn);
       statusRow.parentNode.insertBefore(markRow, statusRow);
       statusRow.parentNode.insertBefore(markBtn, statusRow);
+      waeRestoreNoteFocus(noteInput, draftKey);
     });
   }
 
@@ -3237,7 +3298,11 @@
         skipped++;
         continue;
       }
-      const conversationId = indexOf.conversationId !== undefined ? (cells[indexOf.conversationId] || '').trim() || null : null;
+      // Ticket ids are numeric -- strip anything else a CSV might carry
+      // along with them (a leading "#", "Ticket #", stray whitespace) so
+      // only the digits are stored. No digits at all -> null, same as an
+      // empty cell.
+      const conversationId = indexOf.conversationId !== undefined ? (cells[indexOf.conversationId] || '').replace(/\D/g, '') || null : null;
       // A stable id (ticket + rounded coordinates) when the row supplies
       // its own Conversation ID, so re-importing the same file updates
       // those rows instead of duplicating them -- there's no other
