@@ -113,30 +113,33 @@ Only needed if you want automatic sync instead of (or alongside) dropping
 
 ![The project screen](docs/images/create-project.png)
    
-3. **APIs & Services (shows in the menu on the top left) -> Library**: <ins>enable</ins> the **Gmail API**.
+2. **APIs & Services (shows in the menu on the top left) -> Library**: <ins>enable</ins> the **Gmail API**.
 
 ![The library selection](docs/images/show-library.png)
 ![Select gmail API](docs/images/gmail-api.png)
 ![Click enable](docs/images/enable-gmail.png)
 
-4. **APIs & Services -> OAuth consent screen**: set it up as External. If
-   it's left in "Testing" mode (the default, and fine for personal use),
-   add your own Google account under **Test users** or sign-in will be
-   refused. Scope needed: `gmail.readonly`.
+3. **APIs & Services -> OAuth consent screen**: set it up as External. 
 
 ![Add OAuth screen](docs/images/select-oauth.png)
 ![Get started](docs/images/click-get-started.png)
 ![External audience](docs/images/oauth-info.png)
 ![Add contact e-mail](docs/images/contact-email.png)
 ![Accept](docs/images/accept.png)
+
+4. When in "Testing" mode (the default, and fine for personal use),
+   add <ins>your own Google account</ins> under **Test users** or sign-in will be
+   refused. Scope needed: `gmail.readonly`.
+
+![Test users](docs/images/Add-test-user.png)   
    
-6. **APIs & Services -> Credentials -> Create Credentials -> OAuth client
+5. **APIs & Services -> Credentials -> Create Credentials -> OAuth client
    ID**. Application type: **Web application**.
 
 ![Web application](docs/images/credentials.png)
 ![Create ID](docs/images/oauth-clientid.png)
    
-8. Under **Authorized JavaScript origins**, add
+6. Under **Authorized JavaScript origins**, add
    `https://wayfarer.scopely.com`. No redirect URI is needed — this
    uses Google Identity Services' popup token flow, not a redirect flow.
    If you set this up before Wayfarer moved off `wayfarer.nianticlabs.com`,
@@ -146,7 +149,7 @@ Only needed if you want automatic sync instead of (or alongside) dropping
 
 ![URI](docs/images/Javascript.png)
    
-10. Copy the resulting Client ID (ends in `.apps.googleusercontent.com`)
+7. Copy the resulting Client ID (ends in `.apps.googleusercontent.com`)
    into the **Connect Gmail** field in the importer's panel (click on Abuse Reports in the panel on the right, and then on the envelop icon). It's saved
    in `localStorage` so you only paste it once; it's not a secret.
 
