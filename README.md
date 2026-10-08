@@ -96,7 +96,7 @@ apart.
 
 ## Install
 
-1. Install the wayfarer-map-mods suite first, if you haven't already.
+1. Install the [wayfarer-map-mods suite](https://gitlab.com/Tntnnbltn/wayfarer-map-mods) first, if you haven't already.
 2. Install the [importer](https://raw.githubusercontent.com/Frankmans/AbuseFormImport/refs/heads/main/wayfarer-abuse-email-importer.user.js)
 3. Install the [extractor](https://raw.githubusercontent.com/Frankmans/AbuseFormImport/refs/heads/main/wayfarer-abuse-report-extractor.user.js)
 
