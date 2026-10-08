@@ -111,22 +111,33 @@ Only needed if you want automatic sync instead of (or alongside) dropping
 `.eml` files by hand:
 
 1. Go to the [Google Cloud Console](https://console.cloud.google.com/),
-   create or pick a project.
-2. **APIs & Services -> Library**: enable the **Gmail API**.
-3. **APIs & Services -> OAuth consent screen**: set it up as External. If
+   create or pick a project (name does not matter).
+
+![The project screen](docs/images/create-project.png)
+   
+3. **APIs & Services (shows in the menu on the top left) -> Library**: <ins>enable</ins> the **Gmail API**.
+
+![The library selection](docs/images/show-library.png)
+![Select gmail API](docs/images/gmail-api.png)
+
+4. **APIs & Services -> OAuth consent screen**: set it up as External. If
    it's left in "Testing" mode (the default, and fine for personal use),
    add your own Google account under **Test users** or sign-in will be
    refused. Scope needed: `gmail.readonly`.
-4. **APIs & Services -> Credentials -> Create Credentials -> OAuth client
+
+
+
+   
+6. **APIs & Services -> Credentials -> Create Credentials -> OAuth client
    ID**. Application type: **Web application**.
-5. Under **Authorized JavaScript origins**, add
+7. Under **Authorized JavaScript origins**, add
    `https://wayfarer.scopely.com`. No redirect URI is needed — this
    uses Google Identity Services' popup token flow, not a redirect flow.
    If you set this up before Wayfarer moved off `wayfarer.nianticlabs.com`,
    add the new origin to the existing OAuth client rather than making a
    new one — Google validates against the page's actual origin at request
    time, so the old entry alone will now fail silently.
-6. Copy the resulting Client ID (ends in `.apps.googleusercontent.com`)
+8. Copy the resulting Client ID (ends in `.apps.googleusercontent.com`)
    into the **Connect Gmail** field in the importer's panel. It's saved
    in `localStorage` so you only paste it once; it's not a secret.
 
