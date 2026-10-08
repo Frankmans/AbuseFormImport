@@ -1,4 +1,4 @@
-# Wayfarer Abuse Report Tools
+<img width="1671" height="1062" alt="image" src="https://github.com/user-attachments/assets/07e3f1ac-097b-41aa-94f6-a9b9d07798e2" /># Wayfarer Abuse Report Tools
 
 Two companion Tampermonkey userscripts that pull Niantic Support's
 "Reporting Abuse in Wayfarer" Helpshift ticket emails out of Gmail (or
@@ -119,27 +119,42 @@ Only needed if you want automatic sync instead of (or alongside) dropping
 
 ![The library selection](docs/images/show-library.png)
 ![Select gmail API](docs/images/gmail-api.png)
+![Click enable](docs/images/enable-gmail.png)
 
 4. **APIs & Services -> OAuth consent screen**: set it up as External. If
    it's left in "Testing" mode (the default, and fine for personal use),
    add your own Google account under **Test users** or sign-in will be
    refused. Scope needed: `gmail.readonly`.
 
-
-
+![Add OAuth screen](docs/images/select-oauth.png)
+![Get started](docs/images/click-get-started.png)
+![OAuth info](docs/images/oauth-info.png)
+![External audience](docs/images/set-audience.png)
+![Add contact e-mail](docs/images/contact-email.png)
+![Accept](docs/images/accept.png)
    
 6. **APIs & Services -> Credentials -> Create Credentials -> OAuth client
    ID**. Application type: **Web application**.
-7. Under **Authorized JavaScript origins**, add
+
+![Web application](docs/images/credentials.png)
+![Create ID](docs/images/oauth-clientid.png)
+   
+8. Under **Authorized JavaScript origins**, add
    `https://wayfarer.scopely.com`. No redirect URI is needed — this
    uses Google Identity Services' popup token flow, not a redirect flow.
    If you set this up before Wayfarer moved off `wayfarer.nianticlabs.com`,
    add the new origin to the existing OAuth client rather than making a
    new one — Google validates against the page's actual origin at request
    time, so the old entry alone will now fail silently.
-8. Copy the resulting Client ID (ends in `.apps.googleusercontent.com`)
-   into the **Connect Gmail** field in the importer's panel. It's saved
+
+![URI](docs/images/Javascript.png)
+   
+10. Copy the resulting Client ID (ends in `.apps.googleusercontent.com`)
+   into the **Connect Gmail** field in the importer's panel (click on Abuse Reports in the panel on the right, and then on the envelop icon). It's saved
    in `localStorage` so you only paste it once; it's not a secret.
+
+![ClientID](docs/images/clientID.png)
+![Copy clientID](docs/images/Copy-into-plugin.png)
 
 The access token itself is never persisted — it's requested fresh each
 time the page loads and kept in memory only, for the session.
