@@ -1,4 +1,4 @@
-<img width="1671" height="1062" alt="image" src="https://github.com/user-attachments/assets/07e3f1ac-097b-41aa-94f6-a9b9d07798e2" /># Wayfarer Abuse Report Tools
+# Wayfarer Abuse Report Tools
 
 Two companion Tampermonkey userscripts that pull Niantic Support's
 "Reporting Abuse in Wayfarer" Helpshift ticket emails out of Gmail (or
