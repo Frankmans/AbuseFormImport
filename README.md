@@ -97,10 +97,8 @@ apart.
 ## Install
 
 1. Install the wayfarer-map-mods suite first, if you haven't already.
-2. Install the importer:
-   `https://raw.githubusercontent.com/Frankmans/AbuseFormImport/refs/heads/main/wayfarer-abuse-email-importer.user.js`
-3. Install the extractor:
-   `https://raw.githubusercontent.com/Frankmans/AbuseFormImport/refs/heads/main/wayfarer-abuse-report-extractor.user.js`
+2. Install the [importer](https://raw.githubusercontent.com/Frankmans/AbuseFormImport/refs/heads/main/wayfarer-abuse-email-importer.user.js)
+3. Install the [extractor](https://raw.githubusercontent.com/Frankmans/AbuseFormImport/refs/heads/main/wayfarer-abuse-report-extractor.user.js)
 
 `opr-email-lib.js` and `wst-storage.js` come along automatically via
 `@require` — there's nothing to separately install for those two.
