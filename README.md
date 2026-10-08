@@ -128,7 +128,6 @@ Only needed if you want automatic sync instead of (or alongside) dropping
 
 ![Add OAuth screen](docs/images/select-oauth.png)
 ![Get started](docs/images/click-get-started.png)
-![OAuth info](docs/images/oauth-info.png)
 ![External audience](docs/images/set-audience.png)
 ![Add contact e-mail](docs/images/contact-email.png)
 ![Accept](docs/images/accept.png)
