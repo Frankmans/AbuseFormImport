@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.62.3
+// @version      1.63.1
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -96,6 +96,18 @@
     });
   }
 
+  async function deleteRecordsFromStore(storeName, ids) {
+    if (!ids.length) return;
+    const db = await openExtractDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(storeName, 'readwrite');
+      const store = tx.objectStore(storeName);
+      for (const id of ids) store.delete(id);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
   async function clearStore(storeName) {
     const db = await openExtractDb();
     return new Promise((resolve, reject) => {
@@ -108,6 +120,7 @@
 
   function putExtractedRecords(records) { return putRecordsToStore(EXTRACT_STORE_NAME, records); }
   function putTicketDetails(records) { return putRecordsToStore(TICKET_DETAILS_STORE_NAME, records); }
+  function deleteExtractedRecords(ids) { return deleteRecordsFromStore(EXTRACT_STORE_NAME, ids); }
   function clearExtractedRecords() { return clearStore(EXTRACT_STORE_NAME); }
   function clearTicketDetails() { return clearStore(TICKET_DETAILS_STORE_NAME); }
 
@@ -2950,7 +2963,14 @@
     // CSV-imported rows are already carried above, so they're excluded.
     const editedRecords = previousRecords.filter((r) => r.edited && r.source !== 'csv');
 
-    const { extracted: scanned, ticketDetails } = await scanImportedEmails(onProgress);
+    const { extracted: scannedAll, ticketDetails } = await scanImportedEmails(onProgress);
+    // Rows the user deleted by hand (see waeDeleteRecord()): a scan would
+    // otherwise re-derive them from the source emails and bring them
+    // straight back, so their identity keys are remembered and skipped.
+    const deletedKeys = new Set(waeLoadDeletedRowKeys());
+    const scanned = deletedKeys.size
+      ? scannedAll.filter((r) => !deletedKeys.has(waeStarredKey(r)))
+      : scannedAll;
     const editedOrigKeys = new Set(editedRecords.map((r) => r.editedFromKey).filter(Boolean));
     const extracted = editedOrigKeys.size
       ? scanned.filter((r) => !editedOrigKeys.has(waeStarredKey(r)))
@@ -3520,9 +3540,11 @@
       background:none; border:none; padding:0 2px; margin:0; cursor:pointer;
       font-size:14px; line-height:1; color:#6b7280;
     }
+    .wae-edit-actions{ display:flex; flex-direction:column; align-items:center; gap:3px; }
     .wae-edit-btn:hover{ color:#2563eb; }
     .wae-edit-btn.wae-edit-save{ color:#16a34a; font-weight:700; }
-    .wae-edit-btn.wae-edit-cancel{ color:#b91c1c; }
+    .wae-edit-btn.wae-edit-cancel{ color:#6b7280; }
+    .wae-edit-btn.wae-edit-delete{ color:#b91c1c; font-weight:700; }
     .wae-edited-mark{ color:#2563eb; font-size:10px; margin-left:2px; cursor:help; }
     tr.wae-row-editing td{ background:#eff6ff; }
     .wae-edit-input{
@@ -3802,8 +3824,19 @@
       // it to the nearest ALREADY-positioned ancestor instead, which
       // could be the table or scroll wrapper depending on what table()'s
       // own markup happens to do upstream of this.
-      if (!th.style.position) th.style.position = 'relative';
+      // Only anchors the handle itself if this header cell isn't already
+      // a positioned element. Header cells of a sticky header are
+      // `position: sticky` (already a containing block for the absolute
+      // handle) -- forcing `relative` inline on them used to override
+      // that, so every header cell but the last scrolled away with the
+      // rows while the last one stayed stuck at the top as a white block
+      // covering the first visible row's pencil. The table is still
+      // detached from the document here, so computed style can't be read
+      // yet; the check runs once it has been attached.
       th.appendChild(handle);
+      requestAnimationFrame(() => {
+        if (th.isConnected && getComputedStyle(th).position === 'static') th.style.position = 'relative';
+      });
 
       handle.addEventListener('mousedown', (ev) => {
         // Stops this from also reaching whatever sort-on-click handling
@@ -3978,6 +4011,70 @@
     }
   }
 
+  // Keys of rows deleted by hand, so a re-scan doesn't resurrect them.
+  // Stored with the suite's settings (same mechanism as the Marked
+  // Wayspots list), so they also travel with Settings > Backups.
+  const WAE_DELETED_ROWS_SETTINGS_KEY = 'deletedRowKeys';
+
+  function waeLoadDeletedRowKeys() {
+    try {
+      const list = wfmmWindow.WFMM.settings.get(PLUGIN_ID, WAE_DELETED_ROWS_SETTINGS_KEY, []);
+      return Array.isArray(list) ? list : [];
+    } catch (e) {
+      return [];
+    }
+  }
+
+  function waeSaveDeletedRowKeys(list) {
+    try {
+      wfmmWindow.WFMM.settings.set(PLUGIN_ID, WAE_DELETED_ROWS_SETTINGS_KEY, list);
+    } catch (e) { /* ignore -- next mutation attempt will just try again */ }
+  }
+
+  // Deletes one row for good (the x next to the pencil while editing).
+  // Scanned rows are remembered by their pre-edit identity (editedFromKey
+  // if they were edited, otherwise their current key) so the matching
+  // freshly-scanned row is skipped on the next scan. CSV-imported rows
+  // have no source email, so there is nothing to suppress for them.
+  async function waeDeleteRecord(record) {
+    if (!record) return;
+    const label = record.wayspotName || (record.conversationId ? `ticket ${record.conversationId}` : 'this row');
+    const csvNote = record.source === 'csv'
+      ? ' It was imported from a CSV, so it cannot be recovered by re-scanning.'
+      : ' It will stay hidden when you re-scan; Clear Extracted Data brings deleted rows back on the next scan.';
+    if (!confirm(`Delete "${label}"?${csvNote}`)) return;
+
+    if (record.source !== 'csv') {
+      const key = record.editedFromKey || waeStarredKey(record);
+      const keys = waeLoadDeletedRowKeys();
+      if (!keys.includes(key)) {
+        keys.push(key);
+        waeSaveDeletedRowKeys(keys);
+      }
+    }
+
+    waeEditingId = null;
+    waeEditDraft = null;
+
+    // Fresh array reference invalidates every cache keyed on
+    // waeAllRecords identity (sort/filter, stats, nearby index).
+    waeAllRecords = waeAllRecords.filter((r) => r.id !== record.id);
+    waeRecordsById.delete(record.id);
+    waeRecordsLoadPromise = Promise.resolve(waeAllRecords);
+    waeNearbyMap = waeFindNearbyDuplicates(waeAllRecords);
+    waeNearbyMapFingerprint = waeRecordsFingerprint(waeAllRecords);
+    waeRenderFilteredTable();
+    if (WAE_PULSES.map && isMapPulsesEnabled()) waeSafeRefreshPulses();
+    if (WAE_REVIEW_PULSES.map) waeSafeRefreshReviewPulses();
+
+    try {
+      await deleteExtractedRecords([record.id]);
+      if (waeUI) log(waeUI.logEl, `\u2713 Deleted "${label}".`, 'ok');
+    } catch (e) {
+      if (waeUI) log(waeUI.logEl, `\u2717 Could not delete row: ${e.message || e}`, 'err');
+    }
+  }
+
   // One input/select bound to a draft field. Enter saves, Escape cancels.
   function waeBuildEditInput(field, { type = 'text', placeholder = '', title = '' } = {}) {
     const input = waeUiApi.createElement('input', {
@@ -4147,20 +4244,28 @@
       },
       {
         // Pencil: unlocks this row for editing. While editing, it's
-        // replaced by save (check) and cancel (x). Clicks are handled in
+        // replaced by save (check), discard (undo arrow) and delete (x).
+        // Clicks are handled in
         // onRowClick below via the .wae-edit-btn class, same pattern as
         // the star toggle.
         key: 'edit', label: '', cellClassName: 'wae-edit-cell',
         render: (r) => {
           const wrap = waeUiApi.createElement('span', {});
           if (waeEditingId === r.id) {
+            // Stacked, not side by side: the pencil column is narrow and
+            // three buttons in a row got clipped (the delete x vanished).
+            wrap.className = 'wae-edit-actions';
             wrap.appendChild(waeUiApi.createElement('button', {
               className: 'wae-edit-btn wae-edit-save', text: '\u2713',
               attrs: { type: 'button', title: 'Save changes', 'data-action': 'save' },
             }));
             wrap.appendChild(waeUiApi.createElement('button', {
-              className: 'wae-edit-btn wae-edit-cancel', text: '\u2715',
-              attrs: { type: 'button', title: 'Discard changes', 'data-action': 'cancel' },
+              className: 'wae-edit-btn wae-edit-cancel', text: '\u21A9',
+              attrs: { type: 'button', title: 'Discard changes (Esc)', 'data-action': 'cancel' },
+            }));
+            wrap.appendChild(waeUiApi.createElement('button', {
+              className: 'wae-edit-btn wae-edit-delete', text: '\u2715',
+              attrs: { type: 'button', title: 'Delete this entry', 'data-action': 'delete' },
             }));
           } else {
             wrap.appendChild(waeUiApi.createElement('button', {
@@ -4226,6 +4331,7 @@
           if (action === 'edit') waeStartEdit(record);
           else if (action === 'save') waeSaveEdit();
           else if (action === 'cancel') waeCancelEdit();
+          else if (action === 'delete') waeDeleteRecord(record);
           return;
         }
         // Clicking into an input of the row being edited must not also
@@ -5700,6 +5806,7 @@
       try {
         await clearExtractedRecords();
         await clearTicketDetails();
+        waeSaveDeletedRowKeys([]); // a fresh scan after a full clear restores rows deleted by hand too
         log(logEl, '✓ Cleared extracted-report storage.', 'ok');
       } catch (e) {
         log(logEl, `✗ Clear failed: ${e.message || e}`, 'err');
