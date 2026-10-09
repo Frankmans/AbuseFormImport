@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.63.1
+// @version      1.63.2
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -4038,11 +4038,22 @@
   // have no source email, so there is nothing to suppress for them.
   async function waeDeleteRecord(record) {
     if (!record) return;
-    const label = record.wayspotName || (record.conversationId ? `ticket ${record.conversationId}` : 'this row');
+    const label = record.wayspotName || '(unnamed)';
+    // A ticket can hold several rows (one per reported Wayspot), and
+    // this only ever removes the one row -- the prompt says so, and how
+    // many sibling rows of the same ticket are left untouched.
+    const ticketId = record.conversationId;
+    const siblings = ticketId
+      ? waeAllRecords.filter((r) => r.id !== record.id && r.conversationId === ticketId).length
+      : 0;
+    const scope = ticketId
+      ? `This deletes only this single row, not the whole ticket (${ticketId}).`
+        + (siblings ? ` The ${siblings} other row${siblings === 1 ? '' : 's'} of this ticket will be kept.` : '')
+      : 'This deletes only this single row.';
     const csvNote = record.source === 'csv'
       ? ' It was imported from a CSV, so it cannot be recovered by re-scanning.'
       : ' It will stay hidden when you re-scan; Clear Extracted Data brings deleted rows back on the next scan.';
-    if (!confirm(`Delete "${label}"?${csvNote}`)) return;
+    if (!confirm(`Delete the row "${label}"?\n\n${scope}${csvNote}`)) return;
 
     if (record.source !== 'csv') {
       const key = record.editedFromKey || waeStarredKey(record);
