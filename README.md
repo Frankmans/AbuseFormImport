@@ -223,6 +223,7 @@ The review page has its own small on/off bar below the map (on by default), sepa
 Click the cog icon in the Abuse Reports panel header to open Marker Style. It covers:
 
 - **Color**, **size** and **fill opacity** of the map markers, plus ring color, width and opacity for cluster badges. The X shape of individual reports is fixed, so only its color and size are adjustable.
+- **On the review maps** the crosses (abuse reports and your abuse report draft) are always 3px larger than **Cross size**, following it as you change it, and are drawn on top of the Wayspot markers there. They are click-through, so a click still reaches the Wayspot underneath.
 - **Imported color** for CSV-imported locations. It follows **Color** until you pick one of your own. **Same as email color** or **Reset to default** returns it to following. A cluster only takes the imported color when *every* location in it is imported.
 - **Marked Wayspot color** and **Favorite user color** (see below).
 - **Clickable markers (mapview/submit only)**: turn this off to let clicks pass through to whatever is underneath instead of opening this plugin's popup.
@@ -257,6 +258,8 @@ A separate scratch list for Wayspots you're about to report yourself. It is inde
 
 Every entry also gets a cross marker on the map view, in its own color (default blue, changed with **Marked Wayspot color** in Marker Style) and sized by the same **Cross size** slider. Click one for its details. These markers follow the **Abuse Report Crosses** checkbox in the Layers menu.
 
+The same markers also show on the review maps, so a Wayspot already on your draft is visible while you review next to it. There they are drawn like the report crosses on those maps (3px larger than on the map view, on top of the Wayspot markers, click-through) and follow the **Abuse report markers** toggle under the map instead of the Layers menu.
+
 The list is saved with the suite's settings, so it is included in **Settings > Backups**.
 
 ## Favorite users
@@ -286,7 +289,7 @@ The row only appears while the plugin is enabled in the Plugin Manager.
 
 When you click a nearby Wayspot on a review's map (the duplicate-check map, or the edit-location, edit-info and photo maps), the info window that opens gets the same **Note (optional)** field and **+ add to abuse report draft** button the side panel and the review-page row have. Use it when you spot an abusive or fake Wayspot while reviewing something else. It goes straight onto your Marked Wayspots list, with the same behavior as everywhere else: adding a Wayspot that's already on the list updates its note instead of creating a second entry.
 
-- **Turning it off.** Switch off the **Abuse report markers** toggle under the review map, which hides the markers and these controls together. Or untick **Show add-to-draft controls in review map info windows** in the Marked Wayspots list (the list icon in the Abuse Reports panel header) to hide only the controls. Either applies immediately, including to a window that is already open. The note-and-add row for the nomination itself (above the review card) is separate and stays as it is.
+- **Turning it off.** Switch off the **Abuse report markers** toggle under the review map, which hides the report markers, your draft markers and these controls together. Or untick **Show add-to-draft controls in review map info windows** in the Marker Style settings (the cog icon in the Abuse Reports panel header) to hide only the controls. Either applies immediately, including to a window that is already open. The note-and-add row for the nomination itself (above the review card) is separate and stays as it is.
 - **Windows that don't get the controls.** The controls need to know exactly which Wayspot a window is about. Wayfarer's own windows are matched against the nearby Wayspots in the review itself, which always works unless two of them share the same title and photo. Wayfarer Map Mods' own windows (the ones with a **Mark as duplicate** button, and all edit and photo reviews) are read from their map link, so they only get the controls while **Display map shortcuts on info window of duplicates** is on in Wayfarer Map Mods' Review Map Enhancements settings. When a window can't be identified it gets no controls, rather than a guess.
 - **Re-opening.** The controls are rebuilt whenever a window shows a different Wayspot, so a note typed for one Wayspot never carries over to the next.
 

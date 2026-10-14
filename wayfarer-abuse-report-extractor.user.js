@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.64.1
+// @version      1.67.1
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -492,7 +492,7 @@
   // WFMM.layers, or attachSettingsActions() at all, in either direction.
   // See the "Review page support" section (right after waeStopMapTracking())
   // for the map-discovery/toggle/refresh logic itself.
-  const WAE_REVIEW_PULSES = { map: null, host: null, markersById: new Map(), infoWindow: null };
+  const WAE_REVIEW_PULSES = { map: null, host: null, markersById: new Map(), draftsById: new Map(), infoWindow: null };
   let waeAllRecords = [];
   let waeRecordsById = new Map();
   // BUGFIX (not upstream, feature request): waeAllRecords used to only
@@ -645,6 +645,13 @@
   // colorInput/numberInput/rangeInput controls the suite's own settings
   // screens use. Same underlying engine, same look, own section -- not a
   // literal new row in that one hardcoded grid.
+  // v1.67.0: on the review maps every cross (abuse reports AND the abuse
+  // draft's Marked Wayspots) is drawn this many px larger than the
+  // map-view one. Derived from the same Cross size setting, not a setting
+  // of its own, so the review maps always follow it. The extra size is
+  // there because those crosses sit among (and, before this version,
+  // beneath) the much bigger Wayspot markers.
+  const WAE_REVIEW_MARKER_SIZE_BONUS = 3;
   const WAE_APPEARANCE_STYLE_KEY = 'wae:abuse-report';
   const WAE_APPEARANCE_DEFAULTS = Object.freeze({
     // BUGFIX (not upstream, feature request): standard defaults as of
@@ -705,7 +712,7 @@
     copyIncludeNotes: true,
     // v1.64.0: whether the note field + "+ add to abuse report draft"
     // button also appear inside the review map's info windows -- see
-    // waeReviewIwSync().
+    // waeReviewIwSyncNow(). Checkbox: Marker Style settings.
     reviewMapAbuseControls: true,
   });
   // Set once at startPlugin() (WFMM.markerAppearance.registerStyle()'s
@@ -767,6 +774,7 @@
     // colors shouldn't be what makes the map attach/show pulses if the
     // user never turned "Show on Map" on.
     if (WAE_PULSES.map && isMapPulsesEnabled()) waeSafeRefreshPulses();
+    if (WAE_REVIEW_PULSES.map && waeReviewPulsesEnabled()) waeSafeRefreshReviewPulses(); // v1.67.0: review crosses derive from Cross size
   }
 
   const WAE_PAGE_SIZE = 200;
@@ -837,10 +845,11 @@
   function waeIsImportedCluster(cluster) {
     return !!cluster && cluster.records.length > 0 && cluster.records.every(waeIsImportedRecord);
   }
-  function waeGetMarkerSvgMarkup(imported) {
-    const variant = imported ? 'imported' : 'email';
+  function waeGetMarkerSvgMarkup(imported, forReview) {
+    const variant = `${forReview ? 'review-' : ''}${imported ? 'imported' : 'email'}`;
     if (WAE_MARKER_ICON[variant]) return WAE_MARKER_ICON[variant];
     const a = waeLoadAppearance();
+    const markerSize = a.markerSize + (forReview ? WAE_REVIEW_MARKER_SIZE_BONUS : 0); // v1.67.0
     // Kept as a distinct X glyph (not the same filled-circle look as a
     // regular Wayspot/Pok\u00e9stop/Gym marker) so an abuse-report location
     // still reads as "a problem here", not just another POI dot -- only
@@ -849,10 +858,10 @@
     // apply to this shape (an X has no fill region or ring) -- they only
     // affect the cluster icon below, which IS a filled circle with a
     // ring, matching WFMM's own "generic" marker shape exactly.
-    const size = a.markerSize * 2;
+    const size = markerSize * 2;
     const half = size / 2;
     const arm = size * 0.35;
-    const stroke = Math.max(2, Math.round(a.markerSize * 0.45));
+    const stroke = Math.max(2, Math.round(markerSize * 0.45));
     const color = imported ? (a.importColor || a.fillColor) : a.fillColor;
     WAE_MARKER_ICON[variant] = `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}">`
       + `<line x1="${half - arm}" y1="${half - arm}" x2="${half + arm}" y2="${half + arm}" stroke="${color}" stroke-width="${stroke}" stroke-linecap="round"/>`
@@ -1116,7 +1125,7 @@
       }
       onAdd() {
         const div = document.createElement('div');
-        div.className = 'wae-pulse-marker';
+        div.className = 'wae-pulse-marker wae-pulse-review';
         div.addEventListener('click', (ev) => {
           ev.stopPropagation();
           const c = this.cluster;
@@ -1132,7 +1141,14 @@
         });
         this.div = div;
         this.applyToDiv();
-        this.getPanes().overlayLayer.appendChild(div);
+        // v1.67.0: markerLayer, the pane Google's own markers render in,
+        // with a top-most z-index (.wae-pulse-review) -- NOT overlayLayer
+        // like the map-view crosses: that pane sits beneath the markers,
+        // which left these hidden behind the Wayspots they mark. Safe to
+        // put on top because they are never clickable here (see
+        // setCluster(): _clickable is always false), so nothing underneath
+        // loses a click, and info windows (floatPane) still open above.
+        this.getPanes().markerLayer.appendChild(div);
         this.draw();
       }
       draw() {
@@ -1154,13 +1170,14 @@
         this.div.innerHTML = this._html;
         this.div.title = this._title;
         this.div.classList.toggle('wae-pulse-clickable', this._clickable);
+        this.div.classList.toggle('wae-pulse-draft', !!this._isDraft);
       }
       setCluster(cluster, isExpanded, appearance) {
         this.cluster = cluster;
         this.latLng = new google.maps.LatLng(cluster.lat, cluster.lng);
         const isClusterMarker = cluster.records.length > 1;
         const imported = waeIsImportedCluster(cluster);
-        const shapeSvg = isClusterMarker ? waeGetClusterSvgMarkup(isExpanded, imported) : waeGetMarkerSvgMarkup(imported);
+        const shapeSvg = isClusterMarker ? waeGetClusterSvgMarkup(isExpanded, imported) : waeGetMarkerSvgMarkup(imported, true); // true: review maps draw 3px larger (v1.67.0)
         this._html = isClusterMarker ? `${shapeSvg}<span class="wae-pulse-count">${cluster.records.length}</span>` : shapeSvg;
         this._title = isClusterMarker ? `${cluster.records.length} reports` : (cluster.records[0].wayspotName || '(unnamed report)');
         // BUGFIX (not upstream, feature request): always false here,
@@ -1173,6 +1190,23 @@
         // crosses (WaePulseOverlayCtor's own setCluster(), earlier in
         // this file) still follow that setting normally -- this is the
         // one place the two surfaces are meant to diverge on it.
+        this._clickable = false;
+        this.applyToDiv();
+        this.draw();
+      }
+      // v1.65.1: a Marked Wayspot (abuse draft entry) drawn by this very
+      // class -- same div/CSS class, same pane (overlayLayer), same
+      // positioning and click-through behavior as the report crosses
+      // above, so it renders exactly like them; the only differences are
+      // the shape's source (waeGetMarkedWayspotSvgMarkup(), the same X
+      // in the Marked Wayspot color) and that there is no cluster behind
+      // it, which also makes this class's click handler a no-op for it.
+      setDraftItem(item, color) {
+        this.cluster = null;
+        this._isDraft = true; // stacked just above the report crosses, see .wae-pulse-draft
+        this.latLng = new google.maps.LatLng(item.lat, item.lng);
+        this._html = waeGetMarkedWayspotSvgMarkup(color, true); // true: review maps draw 3px larger (v1.67.0)
+        this._title = item.name || '(unnamed)';
         this._clickable = false;
         this.applyToDiv();
         this.draw();
@@ -1408,6 +1442,58 @@
     }
     WAE_REVIEW_PULSES.markersById.clear();
     if (WAE_REVIEW_PULSES.infoWindow) WAE_REVIEW_PULSES.infoWindow.close();
+    waeClearReviewDraftMarkers(); // v1.65.1: toggle Off, map detached, route left -- the draft markers go with them
+  }
+
+  function waeClearReviewDraftMarkers() {
+    for (const overlay of WAE_REVIEW_PULSES.draftsById.values()) {
+      try { overlay.setMap(null); } catch (e) { /* ignore */ }
+    }
+    WAE_REVIEW_PULSES.draftsById.clear();
+  }
+
+  // v1.65.1: the Marked Wayspots (abuse draft) on the review map, drawn
+  // with the report markers' own overlay class (see setDraftItem() in
+  // WaeReviewPulseOverlayCtor) so they render the same way, and on the
+  // same switch: the "Abuse report markers" toggle under the map. Never
+  // throws -- it runs right after the report markers are drawn (see
+  // waeRefreshReviewPulses()) and on every draft list change (see
+  // waeRenderMarkedWayspotMarkers()), and a problem here must not be able
+  // to get in the way of either.
+  function waeRenderReviewDraftMarkers() {
+    try {
+      const map = WAE_REVIEW_PULSES.map;
+      const drafts = WAE_REVIEW_PULSES.draftsById;
+      if (!map || !waeReviewPulsesEnabled() || !waeEnsureReviewPulseOverlayCtor()) {
+        waeClearReviewDraftMarkers();
+        return;
+      }
+      const color = waeLoadAppearance().markColor;
+      const seen = new Set();
+      for (const item of waeLoadMarkedWayspots()) {
+        if (!Number.isFinite(item.lat) || !Number.isFinite(item.lng)) continue;
+        seen.add(item.id);
+        try {
+          let overlay = drafts.get(item.id);
+          if (!overlay) {
+            overlay = new WaeReviewPulseOverlayCtor();
+            drafts.set(item.id, overlay);
+          }
+          overlay.setDraftItem(item, color);
+          overlay.setMap(map);
+        } catch (e) {
+          console.warn('[Wayfarer Map Mods - Abuse Reports] Skipped rendering one review draft marker:', e);
+        }
+      }
+      for (const [id, overlay] of drafts) {
+        if (!seen.has(id)) {
+          try { overlay.setMap(null); } catch (e) { /* ignore */ }
+          drafts.delete(id);
+        }
+      }
+    } catch (e) {
+      console.warn('[Wayfarer Map Mods - Abuse Reports] Review draft marker refresh failed:', e);
+    }
   }
 
   // BUGFIX (not upstream, feature request): this used to hide crosses
@@ -1612,6 +1698,7 @@
         console.warn('[Wayfarer Map Mods - Abuse Reports] Skipped rendering one review cluster:', e);
       }
     }
+    waeRenderReviewDraftMarkers(); // v1.65.1: last, so the report markers above never depend on it
   }
 
   // Same 'projection_changed' wait as waeSafeRefreshPulses() above, for
@@ -2188,7 +2275,7 @@
       bar = document.createElement('div');
       bar.id = WAE_REVIEW_TOGGLE_ID;
       bar.className = 'wae-review-toggle-bar';
-      bar.title = 'Shows abuse report markers on this map and the add-to-abuse-report-draft controls in its info windows';
+      bar.title = 'Shows abuse report markers and your abuse report draft markers on this map, plus the add-to-draft controls in its info windows';
       const label = document.createElement('span');
       label.className = 'wae-review-toggle-label';
       label.textContent = 'Abuse report markers';
@@ -2504,12 +2591,18 @@
   let waeReviewIwObserver = null;
   let waeReviewIwQueued = false;
 
-  // Off when either the checkbox in the Marked Wayspots list says so OR
-  // the "Abuse report markers" toggle under the review map is Off -- that
-  // toggle is the one switch for everything this plugin adds to that map.
+  // The checkbox itself (Marker Style settings, see
+  // waeRenderMarkerStyleSection()) -- just the person's choice, nothing
+  // else folded in, which is what that checkbox should show.
+  function waeReviewMapControlsSetting() {
+    return wfmmWindow.WFMM.settings.get(PLUGIN_ID, 'reviewMapAbuseControls', true) !== false;
+  }
+
+  // Off when either that setting says so OR the "Abuse report markers"
+  // toggle under the review map is Off -- that toggle is the one switch
+  // for everything this plugin adds to that map.
   function waeReviewMapControlsEnabled() {
-    return waeReviewPulsesEnabled()
-      && wfmmWindow.WFMM.settings.get(PLUGIN_ID, 'reviewMapAbuseControls', true) !== false;
+    return waeReviewPulsesEnabled() && waeReviewMapControlsSetting();
   }
 
   function waeReviewIwNormalizeText(value) {
@@ -3663,6 +3756,12 @@
     .wae-pulse-marker{ position:absolute; transform:translate(-50%, -50%); pointer-events:none; line-height:0; }
     .wae-pulse-marker.wae-pulse-clickable{ pointer-events:auto; cursor:pointer; }
     .wae-pulse-marker svg{ display:block; }
+    /* v1.67.0: the review maps' crosses live in Google's markerLayer (see
+       WaeReviewPulseOverlayCtor.onAdd()) and must out-stack the Wayspot
+       markers there; an abuse draft cross sits just above a report cross
+       at the same spot. Both are click-through, so this blocks nothing. */
+    .wae-pulse-marker.wae-pulse-review{ z-index:2147483000; }
+    .wae-pulse-marker.wae-pulse-review.wae-pulse-draft{ z-index:2147483001; }
     /* The invisible click-target twin WaePulseOverlayCtor's applyToDiv()
        creates in overlayMouseTarget -- see that class's own comment for
        why a second element is needed at all. opacity:0 (not visibility
@@ -5013,8 +5112,8 @@
   // already threaded in as a parameter here. Self-contained rather than
   // one more place waeSaveAppearance() has to remember to reach into.
   let WAE_MARK_ICON = { color: null, markerSize: null, svg: null };
-  function waeGetMarkedWayspotSvgMarkup(color) {
-    const markerSize = waeLoadAppearance().markerSize;
+  function waeGetMarkedWayspotSvgMarkup(color, forReview) {
+    const markerSize = waeLoadAppearance().markerSize + (forReview ? WAE_REVIEW_MARKER_SIZE_BONUS : 0); // v1.67.0
     if (WAE_MARK_ICON.color === color && WAE_MARK_ICON.markerSize === markerSize) {
       return WAE_MARK_ICON.svg;
     }
@@ -5145,6 +5244,7 @@
   // realistically never large enough that redrawing the whole thing on
   // every one of those triggers is worth debouncing against a map pan.
   function waeRenderMarkedWayspotMarkers() {
+    waeRenderReviewDraftMarkers(); // v1.65.1: the review map shows the same list -- every caller of this refreshes both
     const map = WAE_PULSES.map;
     // Gated on isMapPulsesEnabled() (the "Abuse Report Crosses" Layers-menu
     // checkbox) same as the abuse-report crosses/clusters themselves --
@@ -5323,16 +5423,6 @@
       checked: waeCopyIncludesNotes(),
       onChange: (checked) => wfmmWindow.WFMM.settings.set(PLUGIN_ID, 'copyIncludeNotes', checked),
     });
-    // v1.64.0: the review map's info-window controls -- applied straight
-    // away (adds them to / removes them from any window already open).
-    const reviewMapToggle = ui.checkboxRow({
-      label: 'Show add-to-draft controls in review map info windows',
-      checked: waeReviewMapControlsEnabled(),
-      onChange: (checked) => {
-        wfmmWindow.WFMM.settings.set(PLUGIN_ID, 'reviewMapAbuseControls', checked);
-        waeReviewIwSchedule();
-      },
-    });
 
     function render() {
       listContainer.innerHTML = '';
@@ -5368,7 +5458,7 @@
       render();
     });
 
-    body.append(formLinkEl, buttonRow, copyNotesToggle.row, reviewMapToggle.row, listContainer);
+    body.append(formLinkEl, buttonRow, copyNotesToggle.row, listContainer);
     render();
     waeMarkListRenderHook = render;
 
@@ -5718,6 +5808,20 @@
       checked: initialAppearance.clickable,
       onChange: (checked) => updateAppearance({ clickable: checked }),
     });
+    // v1.64.0, moved here in v1.67.1 from the Marked Wayspots list (it is a
+    // general setting, not part of the draft list): the review map's
+    // info-window controls. Not part of the marker appearance, so "Reset
+    // to default" below deliberately leaves it alone. Applied straight
+    // away (adds the controls to / removes them from any window that is
+    // already open).
+    const styleReviewControlsToggle = ui.checkboxRow({
+      label: 'Show add-to-draft controls in review map info windows',
+      checked: waeReviewMapControlsSetting(),
+      onChange: (checked) => {
+        wfmmWindow.WFMM.settings.set(PLUGIN_ID, 'reviewMapAbuseControls', checked);
+        waeReviewIwSchedule();
+      },
+    });
     // Feature request: color for the separate Marked Wayspots dots (see
     // waeRenderMarkedWayspotMarkers()) -- a distinct field/control from
     // fillColor above since it's a genuinely different marker type (this
@@ -5751,13 +5855,14 @@
         ui.fieldRow({ label: 'Color', input: styleColorInput, help: 'Markers for reports scanned from emails.' }),
         ui.fieldRow({ label: 'Imported color', input: styleImportColorInput, help: 'Markers for CSV-imported locations. Starts out identical to Color and follows it until you pick your own; size, cluster and ring settings are shared with the email markers.' }),
         ui.buttonRow([styleImportSameBtn]),
-        ui.fieldRow({ label: 'Cross size', input: styleSizeRange.row, help: 'Single-report \u201cX\u201d markers.' }),
+        ui.fieldRow({ label: 'Cross size', input: styleSizeRange.row, help: 'Single-report \u201cX\u201d markers. On the review maps they are drawn 3px larger.' }),
         ui.fieldRow({ label: 'Cluster size', input: styleClusterSizeRange.row, help: `Multi-report \u201cheatmap\u201d markers. Automatically shown ${WAE_CLUSTER_EXPAND_FACTOR}\u00d7 bigger at the lowest zoom level.` }),
         ui.fieldRow({ label: 'Fill opacity', input: styleFillOpacityRange.row, help: 'Only visible on cluster markers -- a single X marker is always fully opaque.' }),
         ui.fieldRow({ label: 'Ring color', input: styleBorderColorInput, help: 'Cluster markers only.' }),
         ui.fieldRow({ label: 'Ring width', input: styleBorderWidthRange.row }),
         ui.fieldRow({ label: 'Ring opacity', input: styleBorderOpacityRange.row }),
         styleClickableToggle.row,
+        styleReviewControlsToggle.row,
         ui.fieldRow({ label: 'Marked Wayspot color', input: styleMarkColorInput, help: 'The cross shown for entries on your Marked Wayspots list.' }),
         ui.fieldRow({ label: 'Favorite user color', input: styleFavoriteUserColorInput, help: 'A submitter\u2019s username in the side panel, once favorited.' }),
         ui.buttonRow([resetStyleBtn]),
