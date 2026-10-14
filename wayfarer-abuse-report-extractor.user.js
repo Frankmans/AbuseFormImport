@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.63.2
+// @version      1.64.1
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -703,6 +703,10 @@
     // Feature request: whether the Marked Wayspots list's "Copy All"
     // appends each entry's note -- see waeCopyIncludesNotes().
     copyIncludeNotes: true,
+    // v1.64.0: whether the note field + "+ add to abuse report draft"
+    // button also appear inside the review map's info windows -- see
+    // waeReviewIwSync().
+    reviewMapAbuseControls: true,
   });
   // Set once at startPlugin() (WFMM.markerAppearance.registerStyle()'s
   // return value) and called at stopPlugin() -- registerStyle() throws
@@ -2184,6 +2188,7 @@
       bar = document.createElement('div');
       bar.id = WAE_REVIEW_TOGGLE_ID;
       bar.className = 'wae-review-toggle-bar';
+      bar.title = 'Shows abuse report markers on this map and the add-to-abuse-report-draft controls in its info windows';
       const label = document.createElement('span');
       label.className = 'wae-review-toggle-label';
       label.textContent = 'Abuse report markers';
@@ -2196,6 +2201,7 @@
         waeSetReviewPulsesEnabled(!waeReviewPulsesEnabled());
         waeUpdateReviewToggleUi();
         waeSafeRefreshReviewPulses();
+        waeReviewIwSchedule(); // also adds/removes the add-to-draft controls in open info windows
       });
       bar.appendChild(label);
       bar.appendChild(btn);
@@ -2284,6 +2290,7 @@
   let waeReviewRouteLeaveUnsub = null;
 
   function waeReviewOnRouteEnter() {
+    waeReviewIwStart();
     waeReviewMapSearchAttempts = 0;
     waeScheduleReviewMapSearch();
     if (!waeReviewPeriodicRecheckTimer) {
@@ -2292,6 +2299,7 @@
   }
 
   function waeReviewOnRouteLeave() {
+    waeReviewIwStop();
     waeStopReviewMapSearch();
     if (waeReviewPeriodicRecheckTimer) { clearInterval(waeReviewPeriodicRecheckTimer); waeReviewPeriodicRecheckTimer = null; }
     waeSetReviewMap(null, null);
@@ -2430,10 +2438,15 @@
       if (!json || json.captcha) return;
       const c = json.result;
       if (!c) return;
+      // The nearby Wayspots the review map is about to show -- kept so
+      // their info windows can be matched back to coordinates (see
+      // waeReviewIwResolvePoi()).
+      waeCaptureReviewNearbyPortals(c);
       if (c.type === 'NEW' || c.type === 'PHOTO' || c.type === 'EDIT') {
         waeLatestReviewCandidate = { type: c.type, title: c.title, lat: c.lat, lng: c.lng };
         waeInsertReviewAbuseRow(waeLatestReviewCandidate);
       }
+      waeReviewIwSchedule(); // a different review means different (or no) nearby Wayspots
     } catch (e) { /* not a review response we can use -- ignore */ }
   }
 
@@ -2452,6 +2465,192 @@
     };
   }
   waeInstallReviewCandidateHook();
+
+  // ---------------------------------------------------------------------
+  // Abuse draft controls inside the review map's info windows (v1.64.0).
+  // The same note field + "+ add to abuse report draft" button the side
+  // panel and the review-page row above already have, added to the info
+  // window that opens when you click a nearby Wayspot on the review map
+  // (duplicates, edit-location, edit-info and photo reviews alike), so a
+  // Wayspot spotted there can go straight onto the Marked Wayspots list.
+  //
+  // Built the way Wayfarer Map Mods builds its own "open in map view"
+  // link in those same windows (review-map-enhancements, native-info-
+  // window-link.js and wayspot-info-window.js): a MutationObserver
+  // decorates each .agm-info-window-content as it appears. Nothing here
+  // calls into or patches the suite; it only reads the DOM the suite and
+  // Wayfarer already render, plus the review response this file already
+  // intercepts.
+  //
+  // Two kinds of window turn up on that map, and the hard part for both
+  // is knowing WHICH Wayspot a window is about -- there is no data
+  // attribute for it:
+  //   - Wayfarer's own windows (the review response's nearbyPortals):
+  //     only a title and a photo, no coordinates anywhere in the DOM.
+  //     Matched back to the portal list captured from the review
+  //     response (waeCaptureReviewNearbyPortals()) by photo first, then
+  //     by a title that is unique in that list -- the same order the
+  //     suite itself uses to find the Wayspot behind the same windows.
+  //   - The suite's own windows (Wayspots it adds that the response
+  //     missed, and every edit/photo review): the suite's "open in map
+  //     view" link in the window has the exact lat/lng in its href, so
+  //     that is read. It is also the fallback for a Wayfarer window that
+  //     can't be matched. If that link is switched off in the suite's own
+  //     settings there is no position to read, so such a window simply
+  //     gets no controls rather than a guess.
+  // ---------------------------------------------------------------------
+  const WAE_REVIEW_IW_CLASS = 'wae-review-iw-abuse';
+  let waeReviewNearbyPortals = []; // [{ name, titleKey, imageUrl, lat, lng }] from the latest review response
+  let waeReviewIwObserver = null;
+  let waeReviewIwQueued = false;
+
+  // Off when either the checkbox in the Marked Wayspots list says so OR
+  // the "Abuse report markers" toggle under the review map is Off -- that
+  // toggle is the one switch for everything this plugin adds to that map.
+  function waeReviewMapControlsEnabled() {
+    return waeReviewPulsesEnabled()
+      && wfmmWindow.WFMM.settings.get(PLUGIN_ID, 'reviewMapAbuseControls', true) !== false;
+  }
+
+  function waeReviewIwNormalizeText(value) {
+    return String(value || '').replace(/\s+/g, ' ').trim();
+  }
+
+  // Same tolerance the suite applies when comparing Wayspot photo URLs:
+  // http vs https and a trailing "=s<size>" resize suffix don't matter.
+  function waeReviewIwNormalizeImageUrl(value) {
+    const url = String(value || '').trim();
+    if (!url) return '';
+    const secure = url.startsWith('http://') ? `https://${url.slice('http://'.length)}` : url;
+    return secure.replace(/=s\d+$/i, '');
+  }
+
+  function waeIsValidLatLng(lat, lng) {
+    return Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180;
+  }
+
+  function waeCaptureReviewNearbyPortals(result) {
+    const portals = Array.isArray(result?.nearbyPortals) ? result.nearbyPortals : [];
+    waeReviewNearbyPortals = portals.map((p) => {
+      const name = typeof p?.title === 'string' ? p.title.trim() : '';
+      return {
+        name,
+        titleKey: waeReviewIwNormalizeText(name).toLowerCase(),
+        imageUrl: waeReviewIwNormalizeImageUrl(p?.imageUrl),
+        lat: Number(p?.lat),
+        lng: Number(p?.lng),
+      };
+    }).filter((p) => waeIsValidLatLng(p.lat, p.lng));
+  }
+
+  function waeReviewIwMatchPortal(content, titleKey) {
+    if (!waeReviewNearbyPortals.length) return null;
+    const img = content.querySelector('img.wf-image-modal') || content.querySelector('img[wf-image-modal]');
+    const imageUrl = waeReviewIwNormalizeImageUrl(img?.currentSrc || img?.src);
+    if (imageUrl) {
+      const byImage = waeReviewNearbyPortals.filter((p) => p.imageUrl && p.imageUrl === imageUrl);
+      if (byImage.length === 1) return byImage[0];
+    }
+    if (!titleKey) return null;
+    const byTitle = waeReviewNearbyPortals.filter((p) => p.titleKey === titleKey);
+    return byTitle.length === 1 ? byTitle[0] : null;
+  }
+
+  // The suite's map link is /new/mapview?lat=..&lng=..&z=18&poi=<guid>.
+  function waeReviewIwCoordsFromLink(content) {
+    const link = content.querySelector('a[data-wfmm-poi-guid]');
+    if (!link) return null;
+    try {
+      const params = new URL(link.getAttribute('href') || '', window.location.origin).searchParams;
+      if (!params.has('lat') || !params.has('lng')) return null;
+      const lat = Number(params.get('lat'));
+      const lng = Number(params.get('lng'));
+      return waeIsValidLatLng(lat, lng) ? { lat, lng } : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // -> { name, lat, lng } or null when this window's Wayspot can't be
+  // pinned down. Name follows the rule used everywhere else in this file:
+  // no real title -> blank (the list/copy formatting then shows
+  // "(unnamed)").
+  function waeReviewIwResolvePoi(content) {
+    const owned = content.classList.contains('wfmm-review-owned-info-window');
+    const titleEl = owned
+      ? content.querySelector('.wfmm-review-owned-info-window__title')
+      : (content.querySelector(':scope > div > .font-medium') || content.querySelector('.font-medium'));
+    const domTitle = waeReviewIwNormalizeText(titleEl?.textContent);
+    if (!owned) {
+      const portal = waeReviewIwMatchPortal(content, domTitle.toLowerCase());
+      if (portal) return { name: portal.name, lat: portal.lat, lng: portal.lng };
+    }
+    const coords = waeReviewIwCoordsFromLink(content);
+    if (!coords) return null;
+    const untitled = domTitle === 'Untitled Wayspot' || domTitle === 'Untitled location';
+    return { name: untitled ? '' : domTitle, lat: coords.lat, lng: coords.lng };
+  }
+
+  function waeReviewIwRemoveControls(content) {
+    content.querySelectorAll(`:scope > .${WAE_REVIEW_IW_CLASS}`).forEach((el) => el.remove());
+  }
+
+  function waeReviewIwBuildControls(poi, key) {
+    const wrap = document.createElement('div');
+    wrap.className = WAE_REVIEW_IW_CLASS;
+    wrap.dataset.waeKey = key;
+    const { noteInput, markBtn } = waeBuildMarkControls({ name: poi.name, lat: poi.lat, lng: poi.lng });
+    wrap.append(noteInput, markBtn);
+    // Same as the suite's own link in these windows: keep presses here
+    // from reaching the map or Wayfarer's own handlers behind the window.
+    for (const evName of ['pointerdown', 'mousedown', 'touchstart', 'dblclick', 'keyup']) {
+      wrap.addEventListener(evName, (ev) => ev.stopPropagation());
+    }
+    return wrap;
+  }
+
+  function waeReviewIwSyncNow() {
+    waeReviewIwQueued = false;
+    if (!waeReviewIwObserver) return;
+    const enabled = waeReviewMapControlsEnabled();
+    for (const content of document.querySelectorAll('.agm-info-window-content')) {
+      const existing = content.querySelector(`:scope > .${WAE_REVIEW_IW_CLASS}`);
+      const poi = enabled ? waeReviewIwResolvePoi(content) : null;
+      if (!poi) {
+        if (existing) waeReviewIwRemoveControls(content);
+        continue;
+      }
+      const key = `${poi.lat.toFixed(6)},${poi.lng.toFixed(6)}|${poi.name}`;
+      if (existing && existing.dataset.waeKey === key) continue; // nothing changed -- leave a half-typed note alone
+      waeReviewIwRemoveControls(content);
+      content.append(waeReviewIwBuildControls(poi, key));
+    }
+  }
+
+  // Batched: a burst of DOM changes (map tiles loading, Angular
+  // re-rendering) costs one pass, run before the next paint so the
+  // controls never visibly pop in a frame late.
+  function waeReviewIwSchedule() {
+    if (!waeReviewIwObserver || waeReviewIwQueued) return;
+    waeReviewIwQueued = true;
+    queueMicrotask(waeReviewIwSyncNow);
+  }
+
+  function waeReviewIwStart() {
+    if (waeReviewIwObserver) return;
+    waeReviewIwObserver = new MutationObserver(waeReviewIwSchedule);
+    waeReviewIwObserver.observe(document.documentElement, { childList: true, subtree: true });
+    waeReviewIwSchedule();
+  }
+
+  function waeReviewIwStop() {
+    waeReviewIwObserver?.disconnect();
+    waeReviewIwObserver = null;
+    waeReviewIwQueued = false;
+    waeReviewNearbyPortals = [];
+    document.querySelectorAll(`.${WAE_REVIEW_IW_CLASS}`).forEach((el) => el.remove());
+  }
+  // ---- end of the review map info window controls ----
 
   function waeStopReviewTracking() {
     waeReviewRouteEnterUnsub?.();
@@ -3502,7 +3701,14 @@
       flex:1 1 auto; min-width:0; padding:4px 6px;
       font-size:11px; font-family:Roboto, Arial, sans-serif;
       border:1px solid #c7d2fe; border-radius:5px; box-sizing:border-box;
+      /* Explicit, not inherited: Wayfarer's dark theme hands inputs a
+         light-grey text color while the field's own background stays
+         white, which made typed notes nearly unreadable (v1.64.1).
+         !important because the host page's own input rules can be
+         more specific than a single class selector. */
+      color:#111827 !important; background:#fff !important;
     }
+    .wae-detail-mark-note::placeholder{ color:#6b7280 !important; opacity:1; }
     .wae-detail-mark-btn{
       flex:0 0 auto; padding:4px 8px; white-space:nowrap;
       font-size:11px; font-weight:600; font-family:Roboto, Arial, sans-serif;
@@ -3523,6 +3729,13 @@
     .wae-review-copy-btn:hover{ background:#e0e7ff; }
     .wae-review-form-link{ flex:0 0 auto; font-size:12px; white-space:nowrap; }
     .wae-review-copy-btn.wae-copied{ color:#16a34a; background:#f0fdf4; border-color:#bbf7d0; }
+    /* Note field + button inside a review map info window (see
+       waeReviewIwSyncNow()). Stacked and sized to line up with the
+       180px photo the suite's own windows show; reuses the side
+       panel's field/button styles above. */
+    .wae-review-iw-abuse{ display:flex; flex-direction:column; gap:4px; box-sizing:border-box; width:100%; min-width:160px; max-width:200px; margin:6px auto 0; }
+    .wae-review-iw-abuse .wae-detail-mark-note{ width:100%; flex:0 0 auto; }
+    .wae-review-iw-abuse .wae-detail-mark-btn{ width:100%; flex:0 0 auto; white-space:normal; }
     .wae-detail-mark-btn:disabled{ color:#16a34a; background:#f0fdf4; border-color:#bbf7d0; cursor:default; }
     /* Star toggle -- matches Report History's own \u2605/\u2606 button
        convention (plain glyph, no pill/border) rather than inventing a
@@ -5110,6 +5323,16 @@
       checked: waeCopyIncludesNotes(),
       onChange: (checked) => wfmmWindow.WFMM.settings.set(PLUGIN_ID, 'copyIncludeNotes', checked),
     });
+    // v1.64.0: the review map's info-window controls -- applied straight
+    // away (adds them to / removes them from any window already open).
+    const reviewMapToggle = ui.checkboxRow({
+      label: 'Show add-to-draft controls in review map info windows',
+      checked: waeReviewMapControlsEnabled(),
+      onChange: (checked) => {
+        wfmmWindow.WFMM.settings.set(PLUGIN_ID, 'reviewMapAbuseControls', checked);
+        waeReviewIwSchedule();
+      },
+    });
 
     function render() {
       listContainer.innerHTML = '';
@@ -5145,7 +5368,7 @@
       render();
     });
 
-    body.append(formLinkEl, buttonRow, copyNotesToggle.row, listContainer);
+    body.append(formLinkEl, buttonRow, copyNotesToggle.row, reviewMapToggle.row, listContainer);
     render();
     waeMarkListRenderHook = render;
 

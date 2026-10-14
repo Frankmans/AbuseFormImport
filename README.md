@@ -157,15 +157,21 @@ Locations within one ticket are never flagged against each other.
 - Click a row's ★ cell to star it. Click the ★ column header to sort (ascending shows starred rows first). Starred rows stay starred when you re-scan.
 - The **Last Response** column shows the newest message across every email imported for that ticket. It is sortable, and rows without a parseable date always sort last. In the CSV it appears as `Last Response (UTC)`, in ISO 8601 format.
 
-## Editing a row
+## Editing and deleting a row
 
 Every row ends with a pencil (✎). Rows are locked by default. Click the pencil to unlock that row, which turns its cells into inputs: **Conversation**, **Wayspot Name** (with a **Note** field underneath), **Coordinates** (`lat, lng`, or blank for none), **Status** (dropdown) and **Last Response** (date/time picker).
 
-- **✓** saves and **✕** discards. **Enter** also saves and **Esc** also cancels.
-- Only one row is editable at a time. Opening another discards the first one's unsaved changes.
-- Coordinates that aren't a valid `lat, lng` pair are rejected and the field is highlighted.
+While a row is unlocked, three buttons replace the pencil:
 
-Saved edits update the table, map crosses, nearby-ticket flags, search and CSV export straight away. An edited row shows a small blue dot next to its pencil and is kept when you re-scan, even if you changed its coordinates. **Clear Extracted Data** wipes everything, including edited rows.
+- **✓** saves your changes (**Enter** does the same).
+- **↩** discards your changes and locks the row again (**Esc** does the same).
+- **✕** deletes this one row (a single Wayspot, not the whole ticket), after a confirmation. Other rows of the same ticket are kept.
+
+Only one row is editable at a time. Opening another discards the first one's unsaved changes. Coordinates that aren't a valid `lat, lng` pair are rejected and the field is highlighted.
+
+Saved edits update the table, map crosses, nearby-ticket flags, search and CSV export straight away. An edited row shows a small blue dot next to its pencil and is kept when you re-scan, even if you changed its coordinates.
+
+A deleted entry disappears from the table, the map and the CSV export immediately, and stays gone when you re-scan. A row you imported from a CSV can't be recovered once deleted, because it has no source email. **Clear Extracted Data** wipes everything, including edited rows, and also brings manually deleted entries back the next time you scan.
 
 ## Importing locations from elsewhere (CSV)
 
@@ -275,6 +281,14 @@ This replaces the standalone **Wayfarer Abuse Text Formatter** script. Uninstall
 - an **Abuse form** link to the Help Center article, opening in a new tab so your review in progress isn't lost.
 
 The row only appears while the plugin is enabled in the Plugin Manager.
+
+## Abuse draft in review map info windows
+
+When you click a nearby Wayspot on a review's map (the duplicate-check map, or the edit-location, edit-info and photo maps), the info window that opens gets the same **Note (optional)** field and **+ add to abuse report draft** button the side panel and the review-page row have. Use it when you spot an abusive or fake Wayspot while reviewing something else. It goes straight onto your Marked Wayspots list, with the same behavior as everywhere else: adding a Wayspot that's already on the list updates its note instead of creating a second entry.
+
+- **Turning it off.** Switch off the **Abuse report markers** toggle under the review map, which hides the markers and these controls together. Or untick **Show add-to-draft controls in review map info windows** in the Marked Wayspots list (the list icon in the Abuse Reports panel header) to hide only the controls. Either applies immediately, including to a window that is already open. The note-and-add row for the nomination itself (above the review card) is separate and stays as it is.
+- **Windows that don't get the controls.** The controls need to know exactly which Wayspot a window is about. Wayfarer's own windows are matched against the nearby Wayspots in the review itself, which always works unless two of them share the same title and photo. Wayfarer Map Mods' own windows (the ones with a **Mark as duplicate** button, and all edit and photo reviews) are read from their map link, so they only get the controls while **Display map shortcuts on info window of duplicates** is on in Wayfarer Map Mods' Review Map Enhancements settings. When a window can't be identified it gets no controls, rather than a guess.
+- **Re-opening.** The controls are rebuilt whenever a window shows a different Wayspot, so a note typed for one Wayspot never carries over to the next.
 
 ## CSV columns
 
