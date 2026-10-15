@@ -83,7 +83,7 @@ The diagrams below are illustrative mockups rather than literal screenshots. The
 
 ![The native Layers menu with the Abuse Report Crosses checkbox](docs/images/layers-menu.svg)
 
-**On the review page.** A small on/off bar sits directly below the map on the review page. It is separate from the Layers menu and the Settings panel.
+**On the review page.** A small on/off bar sits directly below the map on the review page. It is separate from the Layers menu and the Settings panel. Next to its On/Off button is the same list icon as in the panel header, which opens the Marked Wayspots list.
 
 ![The toggle bar below the review page's map](docs/images/review-toggle-bar.svg)
 
@@ -230,6 +230,10 @@ Click the cog icon in the Abuse Reports panel header to open Marker Style. It co
 
 Changes apply live to markers already on the map.
 
+## Resizing the panel
+
+When Wayfarer Map Mods' **Make modals resizeable** preference is on, you can drag the corner of the Abuse Reports panel to resize it, and the table follows: make the panel taller to see more rows at once, or shorter to see fewer without the whole panel scrolling. The table shows at most the rows that fit, with a small minimum, and goes back to its normal height if the panel isn't resized.
+
 ## Resizing table columns
 
 Drag the border between two column headers to resize them. A drag trades width between the two neighboring columns, so the table always stays full-width, and no column can be squeezed too small. Widths are remembered across sessions and included in **Settings > Backups**.
@@ -242,7 +246,7 @@ A separate scratch list for Wayspots you're about to report yourself. It is inde
 
 **Adding.** Click a Wayspot on the map. In its details card in the side panel, type an optional note (up to 300 characters) and click **+ add to abuse report draft**. It flashes **✓ Added**. If the Wayspot is already on the list (matched by coordinates, not name), its note is overwritten with whatever is in the field, including being cleared if the field is empty, and the button flashes **✓ Updated**. A Wayspot's name is only ever filled in or improved this way, never blanked. An "Untitled location" shows as "(unnamed)". The same note field and button also appear on the review page.
 
-**The list.** Open it with the list icon in the Abuse Reports panel header (titled **Abuse Reports - Marked Wayspots**):
+**The list.** Open it with the list icon in the Abuse Reports panel header, or, on the review page, with the list icon in the bar under the map (titled **Abuse Reports - Marked Wayspots**):
 
 ![The Marked Wayspots list window, with the Favorite Users section below the list](docs/images/marked-wayspots-list.svg)
 
@@ -250,7 +254,7 @@ A separate scratch list for Wayspots you're about to report yourself. It is inde
 - **Copy All** puts one line per entry on the clipboard as `Name, lat, lng (note)`, with coordinates to six decimals and the note only when there is one.
 - **Include notes when copying** (on by default) removes the notes, giving plain `Name, lat, lng` lines. It is saved, and also applies to the copy icon on the review page.
 - **Clear All** empties the list after confirmation.
-- **Click a row** to jump the map there and open a popup with its name, coordinates and note. Click a row's **note** to edit it in place (click outside the box to save), and click **×** to remove the entry.
+- **Click a row** to jump the map there and open a popup with its name, coordinates and note. On the review page it just pans the review map to that Wayspot, where the draft marker is. Click a row's **note** to edit it in place (click outside the box to save), and click **×** to remove the entry.
 
 **On the map.**
 

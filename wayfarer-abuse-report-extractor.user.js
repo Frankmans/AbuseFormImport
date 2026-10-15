@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.67.1
+// @version      1.69.0
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -2033,6 +2033,10 @@
   // branching would be, at the cost of harmlessly checking one or two
   // extra elements when only one is really present.
   const WAE_REVIEW_TOGGLE_KEY = 'wae_review_pulses_visible';
+  // The list icon on the Abuse Reports panel's header, and (v1.69.0) the
+  // same one on the toggle bar under the review map -- both open the
+  // Marked Wayspots list (waeOpenMarkedWayspotListModal()).
+  const WAE_LIST_ICON_SVG = '<svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"></line><line x1="8" y1="12" x2="21" y2="12"></line><line x1="8" y1="18" x2="21" y2="18"></line><line x1="3" y1="6" x2="3.01" y2="6"></line><line x1="3" y1="12" x2="3.01" y2="12"></line><line x1="3" y1="18" x2="3.01" y2="18"></line></svg>';
   const WAE_REVIEW_TOGGLE_ID = 'wae-review-toggle-bar';
   const WAE_REVIEW_TOGGLE_WRAP_ID = 'wae-review-toggle-wrap';
   // Defaults ON (unlike WAE_LAYER_ID's mapview/submit crosses, which
@@ -2290,8 +2294,26 @@
         waeSafeRefreshReviewPulses();
         waeReviewIwSchedule(); // also adds/removes the add-to-draft controls in open info windows
       });
+      // v1.69.0: the Marked Wayspots list is reachable from here too (the
+      // panel it normally lives behind isn't on the review page). Same
+      // icon as the panel header's list button; sits next to On/Off so
+      // the label can keep truncating on its own at the left.
+      const listBtn = document.createElement('button');
+      listBtn.type = 'button';
+      listBtn.className = 'wae-review-toggle-icon-btn';
+      listBtn.title = 'Marked Wayspots List (your abuse report draft)';
+      listBtn.setAttribute('aria-label', 'Open the Marked Wayspots list');
+      listBtn.innerHTML = WAE_LIST_ICON_SVG;
+      listBtn.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        waeOpenMarkedWayspotListModal();
+      });
+      const actions = document.createElement('span');
+      actions.className = 'wae-review-toggle-actions';
+      actions.append(listBtn, btn);
       bar.appendChild(label);
-      bar.appendChild(btn);
+      bar.appendChild(actions);
     }
     waeReviewToggleHost = host;
     waePlaceReviewToggle(host, bar);
@@ -3991,13 +4013,25 @@
     .wae-review-toggle-btn.wae-review-toggle-on{
       background:#16a34a; color:#ffffff; border-color:#15803d;
     }
+    .wae-review-toggle-actions{ display:flex; align-items:center; gap:6px; flex-shrink:0; }
+    .wae-review-toggle-icon-btn{
+      display:inline-flex; align-items:center; justify-content:center;
+      width:26px; height:24px; padding:0; border-radius:6px; cursor:pointer; flex-shrink:0;
+      background:transparent; color:#111827; border:1px solid #d1d5db;
+    }
+    .wae-review-toggle-icon-btn:hover{ background:#f3f4f6; }
+    .wae-review-toggle-icon-btn svg{ display:block; pointer-events:none; }
     @media (prefers-color-scheme: dark){
       .wae-review-toggle-bar{ background:#1f2937; color:#f9fafb; border-color:#4b5563; box-shadow:0 2px 6px rgba(0,0,0,0.5); }
       .wae-review-toggle-btn{ color:#f9fafb; }
       .wae-review-toggle-btn.wae-review-toggle-on{ background:#22c55e; color:#052e16; border-color:#16a34a; }
+      .wae-review-toggle-icon-btn{ color:#f9fafb; border-color:#4b5563; }
+      .wae-review-toggle-icon-btn:hover{ background:#374151; }
     }
     .wae-review-toggle-bar.wae-review-dark{ background:#1f2937; color:#f9fafb; border-color:#4b5563; box-shadow:0 2px 6px rgba(0,0,0,0.5); }
     .wae-review-toggle-bar.wae-review-dark .wae-review-toggle-btn{ color:#f9fafb; }
+    .wae-review-toggle-bar.wae-review-dark .wae-review-toggle-icon-btn{ color:#f9fafb; border-color:#4b5563; }
+    .wae-review-toggle-bar.wae-review-dark .wae-review-toggle-icon-btn:hover{ background:#374151; }
     .wae-review-toggle-bar.wae-review-dark .wae-review-toggle-btn.wae-review-toggle-on{ background:#22c55e; color:#052e16; border-color:#16a34a; }
   `;
 
@@ -4673,6 +4707,8 @@
       },
     });
 
+    wrap.classList.add('wae-table-scroll'); // v1.68.0: what waeFitTableToPanel() resizes
+
     // table() has no per-row className/title option -- applied directly
     // to the rendered <tr> elements afterward instead, matched back up to
     // pageRecords by index (same order table() rendered them in).
@@ -4807,6 +4843,88 @@
     return waeStatsCache;
   }
 
+  // ---------------------------------------------------------------------
+  // v1.68.0: the table follows the panel's size. Its height used to be a
+  // fixed 260px (the max-height passed to ui.table() in
+  // buildTableSection()), so resizing the panel taller just left empty
+  // space under it, and smaller made the whole panel body scroll instead.
+  //
+  // How the suite's resizable modals work (desktop-modal-interactions.js):
+  // dragging the corner handle puts an explicit pixel height on the
+  // dialog element, which is a flex column whose body scrolls. So:
+  //  - dialog has no explicit height (never resized, or phone layout) ->
+  //    the table keeps its stock 260px;
+  //  - dialog has one -> the table gets exactly the space the rest of the
+  //    body leaves free, so it shows more rows when the panel is made
+  //    taller and fewer (down to WAE_TABLE_MIN_HEIGHT) when shorter.
+  // The table's max-height is the suite's own --wfmm-table-max-height CSS
+  // variable on its wrapper (what ui.table({ maxHeight }) sets).
+  //
+  // Re-fitted when: the dialog or any other block in the panel changes
+  // size (ResizeObserver -- covers the resize drag, the progress bar and
+  // log growing, the CSV hint, ...), and after every table render (a
+  // render replaces the wrapper, which starts at the stock height again).
+  // Setting the table's own height never resizes anything observed (the
+  // table container isn't observed, and a resized dialog has a fixed
+  // height), so this can't feed back on itself.
+  // ---------------------------------------------------------------------
+  const WAE_TABLE_BASE_HEIGHT = 260; // px -- unchanged stock height
+  const WAE_TABLE_MIN_HEIGHT = 120;  // px -- header row plus a couple of rows
+  let waePanelFit = null;            // { dialog, body, observer, raf }
+
+  function waeFitTableToPanel() {
+    const fit = waePanelFit;
+    if (!fit || !waeUI) return;
+    const scroller = waeUI.tableContainer.querySelector('.wae-table-scroll');
+    if (!scroller) return;
+    const setHeight = (px) => scroller.style.setProperty('--wfmm-table-max-height', `${px}px`);
+    if (!(parseFloat(fit.dialog.style.height) > 0)) {
+      setHeight(WAE_TABLE_BASE_HEIGHT);
+      return;
+    }
+    const { body } = fit;
+    const last = body.lastElementChild;
+    if (!last) return;
+    // Bottom of the body's content in content coordinates (so a scrolled
+    // body still measures right), plus what sits below it: the last
+    // block's bottom margin and the body's bottom padding.
+    const contentBottom = last.getBoundingClientRect().bottom - body.getBoundingClientRect().top + body.scrollTop
+      + (parseFloat(getComputedStyle(last).marginBottom) || 0)
+      + (parseFloat(getComputedStyle(body).paddingBottom) || 0);
+    const everythingElse = contentBottom - scroller.getBoundingClientRect().height;
+    const available = Math.floor(body.clientHeight - everythingElse);
+    setHeight(Math.max(WAE_TABLE_MIN_HEIGHT, available));
+  }
+
+  // One fit per frame however many resize notifications arrive.
+  function waeSchedulePanelFit() {
+    const fit = waePanelFit;
+    if (!fit || fit.raf) return;
+    fit.raf = requestAnimationFrame(() => {
+      fit.raf = 0;
+      waeFitTableToPanel();
+    });
+  }
+
+  function waeStartPanelFit(modal, tableContainer) {
+    waeStopPanelFit();
+    if (typeof ResizeObserver !== 'function' || !modal.dialog || !modal.body) return;
+    const fit = { dialog: modal.dialog, body: modal.body, observer: null, raf: 0 };
+    fit.observer = new ResizeObserver(() => waeSchedulePanelFit());
+    waePanelFit = fit;
+    fit.observer.observe(modal.dialog);
+    for (const child of modal.body.children) {
+      if (child !== tableContainer) fit.observer.observe(child);
+    }
+  }
+
+  function waeStopPanelFit() {
+    if (!waePanelFit) return;
+    waePanelFit.observer?.disconnect();
+    if (waePanelFit.raf) cancelAnimationFrame(waePanelFit.raf);
+    waePanelFit = null;
+  }
+
   function waeRenderFilteredTable() {
     if (!waeUI) return; // panel isn't open -- nothing to render into
     const q = waeSearchQuery.trim().toLowerCase();
@@ -4814,6 +4932,7 @@
 
     waeUiApi.empty(waeUI.tableContainer);
     waeUI.tableContainer.appendChild(buildTableSection(sorted, !!q, waeNearbyMap));
+    waeFitTableToPanel(); // v1.68.0: the fresh table starts at the stock height
 
     const { withCoords, withName, ticketCount } = waeGetStats();
     const nearbyCount = waeNearbyMap.size;
@@ -5153,6 +5272,19 @@
   // waeGoToLocation()'s waeShowPulseInfoWindow().
   async function waeGoToMarkedWayspot(item) {
     if (!Number.isFinite(item.lat) || !Number.isFinite(item.lng)) return;
+    // v1.69.0: the list can now be opened from the review page too (the
+    // button on the toggle bar under the review map). There the map is the
+    // review map, which waeAttachToMapIfNeeded() below can't find (it
+    // looks for the map view's / submit map), so a row click did nothing.
+    // Pan it instead -- no popup: the draft markers on that map are
+    // click-through and have none. Same minimum zoom as below.
+    const reviewMap = WAE_REVIEW_PULSES.map;
+    if (reviewMap) {
+      reviewMap.setCenter(new google.maps.LatLng(item.lat, item.lng));
+      const rz = reviewMap.getZoom();
+      if (typeof rz === 'number' && rz < 17) reviewMap.setZoom(17);
+      return;
+    }
     const attached = await waeAttachToMapIfNeeded();
     if (!attached) {
       if (waeUI) log(waeUI.logEl, '✗ Could not find the Wayfarer map on this page -- try again from the mapview or the submit-Wayspot map.', 'err');
@@ -5970,7 +6102,7 @@
     // should compete with the table/export/scan controls every time the
     // panel opens.
     const markListBtn = ui.iconButton({
-      iconSvg: '<svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"></line><line x1="8" y1="12" x2="21" y2="12"></line><line x1="8" y1="18" x2="21" y2="18"></line><line x1="3" y1="6" x2="3.01" y2="6"></line><line x1="3" y1="12" x2="3.01" y2="12"></line><line x1="3" y1="18" x2="3.01" y2="18"></line></svg>',
+      iconSvg: WAE_LIST_ICON_SVG,
       title: 'Marked Wayspots List',
       onClick: () => waeOpenMarkedWayspotListModal(),
     });
@@ -6033,6 +6165,7 @@
     modal.body.append(panelHeaderRow, buttonRowEl, csvHint, csvFileInput, progressEl, searchWrap, autoCloseToggle.row, tableContainer, logEl);
 
     waeUI = { countEl, tableContainer, logEl, scanBtn, exportBtn, clearBtn, searchInput };
+    waeStartPanelFit(modal, tableContainer); // v1.68.0
 
     let waeSearchDebounceTimer = null;
     searchInput.addEventListener('input', () => {
@@ -6167,6 +6300,7 @@
     // instead of every close path having to remember to do it.
     return {
       onClose() {
+        waeStopPanelFit();
         waeUI = null;
         waePanelController = null;
         waeCloseNearbyPopover();
