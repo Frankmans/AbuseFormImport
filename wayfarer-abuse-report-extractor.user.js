@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.69.0
+// @version      1.69.1
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV.
 // @author       Frankmans
 // @grant        none
@@ -2353,10 +2353,39 @@
   // recreated -- checking parentElement's id on every call re-wraps a
   // host that came back outside our old wrapper, and is a cheap no-op
   // for one that's still inside it.
+  // v1.69.1: 'width' is no longer in this list. getComputedStyle().width
+  // is the USED width in px at that instant (e.g. "612px", even when the
+  // site's own rule was just "fill the column"), and it was frozen onto
+  // the wrapper once, when the wrapper was created. Whenever the column
+  // later got narrower than it was at that moment (a layout that hadn't
+  // settled yet, a scrollbar appearing, a window/zoom change), the
+  // wrapper kept the old width and pushed the map and the toggle bar out
+  // past the column with a sideways scrollbar -- confirmed by clearing
+  // that inline width in DevTools, which snapped the map straight back.
+  // See waeReviewWrapperWidth() for what is set instead.
   const WAE_REVIEW_WRAP_COPIED_PROPS = [
     'flexGrow', 'flexShrink', 'flexBasis', 'alignSelf', 'justifySelf',
-    'gridColumn', 'gridRow', 'gridArea', 'width', 'minWidth', 'maxWidth',
+    'gridColumn', 'gridRow', 'gridArea', 'minWidth', 'maxWidth',
   ];
+
+  // The wrapper's width, expressed so it can never go stale:
+  //  - the map filled its parent's content width (the normal case): no
+  //    width at all -- a block-level flex container fills its parent by
+  //    default, at whatever size the parent has now or later;
+  //  - the map was narrower than its parent: the same SHARE of the
+  //    parent, as a percentage, so it still scales with the parent;
+  //  - not laid out yet (zero widths): nothing, since no width is better
+  //    than a wrong one frozen in.
+  function waeReviewWrapperWidth(host, parent, hostComputed) {
+    const hostWidth = host.getBoundingClientRect().width;
+    const parentComputed = getComputedStyle(parent);
+    const parentContent = parent.clientWidth
+      - (parseFloat(parentComputed.paddingLeft) || 0) - (parseFloat(parentComputed.paddingRight) || 0);
+    if (!(hostWidth > 0) || !(parentContent > 0)) return '';
+    const outer = hostWidth + (parseFloat(hostComputed.marginLeft) || 0) + (parseFloat(hostComputed.marginRight) || 0);
+    if (Math.abs(outer - parentContent) <= 1.5) return '';
+    return `${((hostWidth / parentContent) * 100).toFixed(2)}%`;
+  }
   function waePlaceReviewToggle(host, bar) {
     let wrap = host.parentElement;
     if (!wrap || wrap.id !== WAE_REVIEW_TOGGLE_WRAP_ID) {
@@ -2366,9 +2395,14 @@
       wrap.id = WAE_REVIEW_TOGGLE_WRAP_ID;
       const hostComputed = getComputedStyle(host);
       for (const prop of WAE_REVIEW_WRAP_COPIED_PROPS) wrap.style[prop] = hostComputed[prop];
+      const wrapWidth = waeReviewWrapperWidth(host, originalParent, hostComputed);
+      if (wrapWidth) wrap.style.width = wrapWidth;
       wrap.style.display = 'flex';
       wrap.style.flexDirection = 'column';
-      wrap.style.minWidth = wrap.style.minWidth || '0'; // avoid flex-content overflow
+      // 'auto' (the computed value for most flex items) would stop a
+      // flex-item wrapper shrinking below its content -- same overflow
+      // risk as the frozen width above
+      if (!wrap.style.minWidth || wrap.style.minWidth === 'auto') wrap.style.minWidth = '0'; // avoid flex-content overflow
       originalParent.insertBefore(wrap, host);
       wrap.appendChild(host);
     }
