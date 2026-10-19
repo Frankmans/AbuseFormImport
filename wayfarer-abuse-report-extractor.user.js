@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.69.1
-// @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV.
+// @version      1.74.0
+// @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV. Can also auto-fill the Help Center abuse form from the Marked Wayspots list.
 // @author       Frankmans
 // @grant        none
 // @match        https://wayfarer.scopely.com/*
+// @match        https://scopelyexplore.helpshift.com/hc/*
 // @require      https://raw.githubusercontent.com/Frankmans/AbuseFormImport/refs/heads/main/opr-email-lib.js
 // @require      https://raw.githubusercontent.com/Frankmans/AbuseFormImport/refs/heads/main/wst-storage.js
 // @run-at       document-start
@@ -16,6 +17,649 @@
 
 (function () {
   'use strict';
+
+  // ---------------------------------------------------------------------
+  // Abuse form auto-fill (v1.70.0) -- the Marked Wayspots list (the abuse
+  // report draft) can open Niantic's "Reporting Abuse in Wayfarer" Help
+  // Center page and fill the form's location field for you, the same way
+  // Wayfarer Map Mods' Report History fills the Pokestop/Gym report form
+  // (src/helpshift/web-reports in that script): the Wayfarer tab opens the
+  // Help Center tab with a session id in the URL hash, the Help Center tab
+  // asks its opener for the data with postMessage, and fills the form when
+  // the answer arrives. Both halves live in this one file: the part
+  // below runs on the Help Center page (this script now also @matches it)
+  // and returns before anything else in the file is touched; the
+  // Wayfarer-side half (waeOpenAbuseFormAutofill() and friends) sits next
+  // to waeCopyToClipboard(), further down.
+  //
+  // Differences from Map Mods' version, on purpose:
+  //  - Fields are found by their LABEL TEXT ("Provide details of the
+  //    location(s)", the exact label the form's own emails carry, see
+  //    opr-email-lib.js parseAbuseReportThread()), not by Helpshift's
+  //    generated slot ids. Those ids differ per form and Map Mods
+  //    hardcodes the Pokestop form's; the abuse form's weren't available
+  //    here, and a label survives Helpshift regenerating the ids.
+  //  - The Help Center URL is the article that WAE_ABUSE_FORM_URL already
+  //    points at, not a contact-us page: the form is reached by its
+  //    "Report an abuse" button at the bottom of that article, so the
+  //    Help Center side clicks it when it sees it (up to
+  //    WAE_AF_TRIGGER_MAX_CLICKS times) and waits for the form to show.
+  //  - The form has steps (article -> name/email -> the report fields):
+  //    the Help Center side keeps polling, fills each field when its step
+  //    shows up, and never needs the steps in a fixed order. Name and
+  //    email come from the settings cog's "Abuse form auto-fill" section.
+  //  - Only fields that are still empty are filled, and nothing is ever
+  //    submitted -- the issue type, the report details and the Submit
+  //    button stay yours.
+  // ---------------------------------------------------------------------
+  const WAE_HS_ORIGIN = 'https://scopelyexplore.helpshift.com';
+  const WAE_WAYFARER_ORIGIN = 'https://wayfarer.scopely.com';
+  const WAE_AF_PROTOCOL = 1;
+  const WAE_AF_MSG_REQUEST = 'wae-abuse-form:request-data';
+  const WAE_AF_MSG_DATA = 'wae-abuse-form:report-data';
+  const WAE_AF_HASH_SESSION = 'waeAbuseSession';
+  const WAE_AF_HASH_ORIGIN = 'waeAbuseOrigin';
+  // Kept in sessionStorage as well as the URL hash: if the Help Center
+  // does a real page load between the article and the form, the hash is
+  // gone but this tab's sessionStorage survives.
+  const WAE_AF_SESSION_KEY = 'wae-abuse-form-session';
+  const WAE_AF_SESSION_TTL_MS = 15 * 60 * 1000;
+  const WAE_AF_LOCATION_LABEL = 'Provide details of the location(s)';
+  // The report step's fields. Their labels can't be read from outside the
+  // components, so each is also matched by its placeholder: the location
+  // field's placeholder starts with "Name of the wayspot 1" (matched on
+  // that start, the rest being an example).
+  const WAE_AF_LOCATION_LABELS = [WAE_AF_LOCATION_LABEL, 'Name of the wayspot 1'];
+  const WAE_AF_REPORT_DETAILS_LABELS = ['Abuse report details', 'Details related with your abuse report'];
+  const WAE_AF_ABUSER_LABELS = ['Provide details of the abuser(s)', '"CodeNameAlias" of the abuser (if known)'];
+  const WAE_AF_ISSUE_LABEL = 'What issue are you reporting?';
+  // Name / email fields of the form's first step. Matched on the WHOLE
+  // label only (never "contains" -- "name" would also hit a Wayspot name).
+  // (The form's inputs carry the placeholders "Enter your name" and
+  // "name@example.com"; their labels can't be read from outside the
+  // component, so the placeholders are matched as well.)
+  const WAE_AF_NAME_LABELS = ['Name', 'Your Name', 'Full Name', 'Your Full Name', 'Enter your name'];
+  const WAE_AF_EMAIL_LABELS = ['Email', 'Your Email', 'E-mail', 'Email Address', 'Your Email Address', 'name@example.com'];
+  // Labels of the form's other fields: a container whose text mentions
+  // one of these is never accepted as the label of the location field.
+  const WAE_AF_OTHER_LABELS = ['Abuse report details', 'What issue are you reporting?', 'Provide details of the abuser(s)'];
+  const WAE_AF_POLL_MS = 500;
+  const WAE_AF_POLL_MAX = 600; // 5 min -- covers a person clicking through a multi-step form
+  const WAE_AF_TRIGGER_MAX_CLICKS = 3;
+  const WAE_AF_TRIGGER_RETRY_MS = 4000;
+  const WAE_AF_DATA_TIMEOUT_MS = 10000;   // no answer from the Wayfarer tab by then -> say so
+  const WAE_AF_NOT_FOUND_POLLS = 20;      // 10s without finding the button -> say so
+  const WAE_AF_FIELD_SELECTOR = 'textarea, input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="button"]):not([type="submit"]):not([type="file"])';
+
+  function waeAfNorm(s) {
+    return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+  }
+
+  // Every element matching `selector`, in the document and inside every
+  // open shadow root -- Helpshift's form is made of web components, same
+  // reason Map Mods' querySelectorDeep() walks shadow roots.
+  function waeAfDeepAll(selector) {
+    const found = [];
+    const queue = [document];
+    const seen = new Set();
+    while (queue.length) {
+      const root = queue.shift();
+      if (!root || seen.has(root)) continue;
+      seen.add(root);
+      root.querySelectorAll?.(selector).forEach((n) => found.push(n));
+      root.querySelectorAll?.('*').forEach((el) => { if (el.shadowRoot) queue.push(el.shadowRoot); });
+    }
+    return found;
+  }
+
+  // Every piece of text that could be this control's label, however the
+  // component happens to attach it: an aria-label/placeholder, a <label>,
+  // or -- for an input slotted into a component, which is how Map Mods'
+  // input[slot="..."] lookups imply this form is built -- the text next
+  // to the <slot> it's assigned to in that component's shadow tree.
+  function waeAfLabelCandidates(el) {
+    const out = [];
+    const add = (v) => {
+      const t = String(v || '').replace(/\s+/g, ' ').trim();
+      if (t && t.length <= 400) out.push(t);
+    };
+    const isShadowRoot = (n) => typeof ShadowRoot !== 'undefined' && n instanceof ShadowRoot;
+    add(el.getAttribute('aria-label'));
+    add(el.getAttribute('placeholder'));
+    add(el.getAttribute('autocomplete'));
+    if ((el.getAttribute('type') || '').toLowerCase() === 'email') add('Email');
+    const root = el.getRootNode();
+    const labelledBy = el.getAttribute('aria-labelledby');
+    if (labelledBy && root.getElementById) {
+      for (const id of labelledBy.split(/\s+/)) add(root.getElementById(id)?.textContent);
+    }
+    if (el.id && root.querySelector) {
+      try { add(root.querySelector(`label[for="${CSS.escape(el.id)}"]`)?.textContent); } catch (e) { /* odd id -- skip */ }
+    }
+    add(el.closest('label')?.textContent);
+    const slotEl = el.assignedSlot;
+    if (slotEl) {
+      // Nearest ancestor inside the component's shadow tree that has any
+      // text of its own (slotted light-DOM nodes aren't part of that
+      // text) -- nearest only, so a container that wraps several fields
+      // never ends up labelling all of them.
+      let n = slotEl.parentNode;
+      for (let i = 0; i < 6 && n && !isShadowRoot(n); i++, n = n.parentNode) {
+        const t = (n.textContent || '').replace(/\s+/g, ' ').trim();
+        if (t) { add(t); break; }
+      }
+      const host = slotEl.getRootNode()?.host;
+      add(host?.getAttribute?.('label'));
+      add(host?.getAttribute?.('aria-label'));
+    }
+    if (isShadowRoot(root)) {
+      add(root.host.getAttribute('label'));
+      add(root.host.getAttribute('aria-label'));
+    }
+    add(el.previousElementSibling?.textContent);
+    return out;
+  }
+
+  // Best field for one of `labels`: an exact label match beats one that
+  // merely contains it (unless exactOnly), and a "contains" match is
+  // refused when the same text also names one of the form's other fields.
+  function waeAfFindField(labels, exactOnly) {
+    const wants = (Array.isArray(labels) ? labels : [labels]).map(waeAfNorm);
+    const others = WAE_AF_OTHER_LABELS.map(waeAfNorm);
+    let best = null;
+    let bestScore = 0;
+    for (const el of waeAfDeepAll(WAE_AF_FIELD_SELECTOR)) {
+      for (const cand of waeAfLabelCandidates(el)) {
+        const c = waeAfNorm(cand);
+        let score = 0;
+        if (wants.includes(c)) score = 2;
+        else if (!exactOnly && wants.some((w) => c.includes(w)) && !others.some((o) => c.includes(o))) score = 1;
+        if (score > bestScore) { best = el; bestScore = score; }
+      }
+    }
+    return best;
+  }
+
+  // The "Report an abuse" button at the bottom of the article. Found by
+  // its text on ANY element (a link, a button, or a custom element the
+  // text is nested in). The article's own text also has an inline link
+  // with the same words ("... click on "Report an abuse" and complete the
+  // form") that does not open the form, so candidates are ranked: not
+  // inside body text (a paragraph, list item, heading) first, then real
+  // buttons, then the biggest on screen, then the one later on the page.
+  function waeAfFindTrigger() {
+    const want = waeAfNorm('Report an abuse');
+    const matches = waeAfDeepAll('*').filter((el) => {
+      if (el === document.body || el === document.documentElement || el.id === 'wae-af-status') return false;
+      const t = el.textContent || '';
+      return t.length < 80 && waeAfNorm(t).includes(want);
+    });
+    const innermost = matches.filter((el) => !matches.some((o) => o !== el && el.contains(o)));
+    const ranked = innermost.map((el, index) => {
+      const target = el.closest('a, button, [role="button"], [role="link"]') || el;
+      const rect = target.getBoundingClientRect?.();
+      return {
+        target,
+        index,
+        inText: !!(el.closest('p, li, blockquote, h1, h2, h3, h4, h5, h6') || target.closest('p, li, blockquote')),
+        isButton: target.matches('button, [role="button"]'),
+        area: rect ? rect.width * rect.height : 0,
+      };
+    });
+    ranked.sort((x, y) => (x.inText - y.inText) || (y.isButton - x.isButton) || (y.area - x.area) || (y.index - x.index));
+    return ranked[0] ? ranked[0].target : null;
+  }
+
+  function waeAfFormVisible() {
+    return !!(waeAfFindField(WAE_AF_LOCATION_LABELS)
+      || waeAfFindField(WAE_AF_NAME_LABELS, true)
+      || waeAfFindField(WAE_AF_EMAIL_LABELS, true));
+  }
+
+  // Three different ways to "click", one per attempt, since a plain
+  // .click() is not enough for every component: (1) .click(); (2) the
+  // whole pointer/mouse event sequence; (3) follow the link's href
+  // ourselves (carrying the session along in the hash).
+  function waeAfActivate(target, attempt, session) {
+    try { target.scrollIntoView?.({ block: 'center' }); } catch (e) { /* ignore */ }
+    console.info(`[Wayfarer Map Mods - Abuse Reports] Clicking "Report an abuse" (try ${attempt}):`, target);
+    if (attempt === 1) { target.click(); return; }
+    if (attempt === 2) {
+      for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+        const Ctor = type.startsWith('pointer') && typeof PointerEvent === 'function' ? PointerEvent : MouseEvent;
+        target.dispatchEvent(new Ctor(type, { bubbles: true, cancelable: true, composed: true, view: window, button: 0 }));
+      }
+      return;
+    }
+    const link = target.closest('a[href]') || target.querySelector?.('a[href]');
+    if (link && link.href) {
+      const url = new URL(link.href, location.href);
+      url.hash = new URLSearchParams({ [WAE_AF_HASH_SESSION]: session.id, [WAE_AF_HASH_ORIGIN]: session.origin }).toString();
+      location.assign(url.toString());
+    } else {
+      target.click();
+    }
+  }
+
+  function waeAfLogTriggerCandidates() {
+    const rows = waeAfDeepAll('*')
+      .filter((el) => { const t = (el.textContent || '').trim(); return t.length > 0 && t.length < 80 && /abuse/i.test(t); })
+      .map((el) => ({ tag: el.tagName.toLowerCase(), text: el.textContent.trim(), html: el.outerHTML.slice(0, 200) }));
+    console.warn('[Wayfarer Map Mods - Abuse Reports] Could not find the "Report an abuse" button. Elements mentioning "abuse":');
+    if (console.table) console.table(rows); else console.warn(rows);
+  }
+
+  // Runs on its own as soon as the Help Center tab opens -- it does NOT
+  // wait for the data from the Wayfarer tab (v1.71.0 clicked only after
+  // that arrived, so a missing answer meant nothing was ever clicked).
+  // Clicks the article's button up to WAE_AF_TRIGGER_MAX_CLICKS times,
+  // spaced out, until some form field appears.
+  function waeAfStartNavigator(session) {
+    let attempts = 0;
+    let clicks = 0;
+    let lastClickAt = 0;
+    const timer = setInterval(() => {
+      attempts += 1;
+      if (attempts > WAE_AF_POLL_MAX || waeAfFormVisible()) { clearInterval(timer); return; }
+      const trigger = waeAfFindTrigger();
+      // The button sits at the very end of the article; scroll there in case the page only renders it once it is near.
+      if (!trigger && attempts % 4 === 1) { try { window.scrollTo(0, document.documentElement.scrollHeight); } catch (e) { /* ignore */ } }
+      if (trigger && clicks < WAE_AF_TRIGGER_MAX_CLICKS && Date.now() - lastClickAt >= WAE_AF_TRIGGER_RETRY_MS) {
+        clicks += 1;
+        lastClickAt = Date.now();
+        waeAfActivate(trigger, clicks, session);
+      } else if (!trigger && attempts === WAE_AF_NOT_FOUND_POLLS && clicks === 0) {
+        waeAfLogTriggerCandidates();
+        waeAfShowStatus('Abuse auto-fill: can\u2019t find the \u201cReport an abuse\u201d button. Click it yourself; the form will still be filled in.', 'error');
+      }
+    }, WAE_AF_POLL_MS);
+  }
+
+  // Native value setter + input/change events, so the component sees a
+  // real edit (Map Mods' dispatchInput() does the same). Never overwrites
+  // text that is already in the field. A single-line <input> can't hold
+  // line breaks, so they become "; " there.
+  function waeAfSetValue(el, value) {
+    if (!el || !value) return false;
+    if (String(el.value || '').trim()) return false;
+    const text = el.tagName === 'INPUT' ? value.replace(/\s*\n\s*/g, '; ') : value;
+    const setter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value')?.set;
+    try { el.focus?.(); } catch (e) { /* ignore */ }
+    if (setter) setter.call(el, text); else el.value = text;
+    el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+    // blur too: the form validates on blur, and a "This is a required
+    // field" message from before the fill would otherwise stay up.
+    try { el.blur?.(); } catch (e) { /* ignore */ }
+    return true;
+  }
+
+  // Fallback for the name / email fields when none of the known labels or
+  // placeholders matched: a text input whose own placeholder / aria-label /
+  // autocomplete / type says it is a name or an email address. Never a
+  // "Wayspot name"-style field.
+  function waeAfFindContactField(kind) {
+    return waeAfDeepAll(WAE_AF_FIELD_SELECTOR).find((el) => {
+      if (String(el.value || '').trim()) return false;
+      const attr = (n) => String(el.getAttribute(n) || '').toLowerCase();
+      const hay = `${attr('placeholder')} ${attr('aria-label')} ${attr('autocomplete')}`;
+      if (kind === 'email') return attr('type') === 'email' || /e-?mail|@/.test(hay);
+      return attr('type') !== 'email' && /\bname\b/.test(hay) && !/wayspot|stop|gym|nomination|location|e-?mail/.test(hay);
+    }) || null;
+  }
+
+  // Innermost short element with exactly this text (a button label, say),
+  // returned as its nearest clickable ancestor.
+  function waeAfFindClickableByText(text) {
+    const want = waeAfNorm(text);
+    const matches = waeAfDeepAll('*').filter((el) => {
+      if (el === document.body || el === document.documentElement || el.id === 'wae-af-status') return false;
+      const t = el.textContent || '';
+      return t.length < 40 && waeAfNorm(t) === want;
+    });
+    const innermost = matches.filter((el) => !matches.some((o) => o !== el && el.contains(o)));
+    const el = innermost[0];
+    return el ? (el.closest('button, a, [role="button"], [role="link"]') || el) : null;
+  }
+
+  function waeAfShowStatus(text, kind) {
+    const mount = () => {
+      let el = document.getElementById('wae-af-status');
+      if (!el) {
+        el = document.createElement('div');
+        el.id = 'wae-af-status';
+        el.title = 'Click to dismiss';
+        el.style.cssText = 'position:fixed;left:12px;bottom:12px;z-index:2147483647;max-width:340px;padding:8px 12px;'
+          + 'border-radius:8px;font:12px/1.4 Roboto,Arial,sans-serif;color:#fff;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.35);';
+        el.addEventListener('click', () => el.remove());
+        document.documentElement.appendChild(el);
+      }
+      el.style.background = kind === 'error' ? '#b91c1c' : kind === 'ok' ? '#15803d' : '#1d4ed8';
+      el.textContent = text;
+      clearTimeout(el._waeTimer);
+      if (kind === 'ok') el._waeTimer = setTimeout(() => el.remove(), 8000);
+    };
+    if (document.documentElement) mount();
+    else document.addEventListener('DOMContentLoaded', mount, { once: true });
+  }
+
+  // { id, origin } from this page's URL hash (or, after a full page load
+  // inside the Help Center, from sessionStorage), or null for an
+  // ordinary visit that wasn't started from Wayfarer -- in which case
+  // this script does nothing at all on the Help Center.
+  function waeAfReadSession() {
+    const params = new URLSearchParams(String(location.hash || '').replace(/^#/, ''));
+    let id = params.get(WAE_AF_HASH_SESSION) || '';
+    let origin = params.get(WAE_AF_HASH_ORIGIN) || '';
+    try {
+      if (id && origin) {
+        sessionStorage.setItem(WAE_AF_SESSION_KEY, JSON.stringify({ id, origin, at: Date.now() }));
+      } else {
+        const saved = JSON.parse(sessionStorage.getItem(WAE_AF_SESSION_KEY) || 'null');
+        if (saved && Date.now() - saved.at < WAE_AF_SESSION_TTL_MS) ({ id, origin } = saved);
+      }
+    } catch (e) { /* storage unavailable -- the hash alone still works */ }
+    if (!id || origin !== WAE_WAYFARER_ORIGIN) return null;
+    return { id, origin };
+  }
+
+  function waeAfClearSession() {
+    try { sessionStorage.removeItem(WAE_AF_SESSION_KEY); } catch (e) { /* ignore */ }
+  }
+
+  function waeAfLogCandidates(what = 'the location field') {
+    const rows = waeAfDeepAll(WAE_AF_FIELD_SELECTOR).map((el) => ({
+      tag: el.tagName.toLowerCase(),
+      slot: el.getAttribute('slot') || '',
+      type: el.getAttribute('type') || '',
+      labelCandidates: waeAfLabelCandidates(el).join(' | '),
+    }));
+    console.warn(`[Wayfarer Map Mods - Abuse Reports] Could not find ${what} by its label. Fields on this page:`);
+    if (console.table) console.table(rows); else console.warn(rows);
+  }
+
+  const waeAfSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  function waeAfPointerSequence(el) {
+    for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+      const Ctor = type.startsWith('pointer') && typeof PointerEvent === 'function' ? PointerEvent : MouseEvent;
+      el.dispatchEvent(new Ctor(type, { bubbles: true, cancelable: true, composed: true, view: window, button: 0 }));
+    }
+  }
+
+  // The "What issue are you reporting?" dropdown (a custom component, a
+  // list of options with check boxes). Map Mods fills its Pokestop form's
+  // dropdowns by setting the component's state directly; this form's
+  // dropdown looks like a multi-select, whose state shape isn't known
+  // here, so this drives it the way a person does instead: open it, click
+  // the option, close it. The option is clicked ONCE (a second click on a
+  // check box would un-tick it), and only retried when the option row
+  // itself reports "not selected".
+  function waeAfFindIssueCombo() {
+    const combos = waeAfDeepAll('[role="combobox"]');
+    const want = waeAfNorm(WAE_AF_ISSUE_LABEL);
+    return combos.find((el) => waeAfNorm(el.getAttribute('aria-label')).includes(want))
+      || waeAfDeepAll('input[placeholder="Search"]')[0]
+      || (combos.length === 1 ? combos[0] : null);
+  }
+
+  async function waeAfSelectIssueByClicks(title) {
+    const want = waeAfNorm(title);
+    const combo = waeAfFindIssueCombo();
+    if (!combo) return 'nocombo';
+    const findOption = () => {
+      const hits = waeAfDeepAll('*').filter((el) => {
+        if (el === combo || combo.contains(el) || el.id === 'wae-af-status') return false;
+        const t = el.textContent || '';
+        return t.length < 120 && waeAfNorm(t) === want;
+      });
+      return hits.find((el) => !hits.some((o) => o !== el && el.contains(o))) || null;
+    };
+    const rowOf = (el) => el.closest('[role="option"], li, label, button') || el;
+    let option = null;
+    for (const mode of ['click', 'sequence']) {
+      if (mode === 'click') combo.click(); else waeAfPointerSequence(combo);
+      for (let i = 0; i < 15 && !option; i++) { await waeAfSleep(100); option = findOption(); }
+      if (option) break;
+    }
+    if (!option) {
+      console.warn('[Wayfarer Map Mods - Abuse Reports] Issue type option not found:', title, '-- options on the page:',
+        waeAfDeepAll('[role="option"], li').map((el) => (el.textContent || '').trim()).filter(Boolean));
+      return 'nooption';
+    }
+    const signal = (row) => {
+      const cb = row.querySelector?.('input[type="checkbox"]');
+      const aria = row.getAttribute?.('aria-selected');
+      return { known: aria != null || !!cb, on: aria === 'true' || !!cb?.checked };
+    };
+    rowOf(option).click();
+    await waeAfSleep(300);
+    const again = findOption();
+    let verified = false;
+    if (again) {
+      const state = signal(rowOf(again));
+      if (state.known && !state.on) { waeAfPointerSequence(rowOf(again)); await waeAfSleep(300); }
+      const after = signal(rowOf(findOption() || again));
+      verified = after.known && after.on;
+    }
+    // close the list again (a multi-select stays open and would sit on top of the fields below)
+    combo.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, composed: true }));
+    await waeAfSleep(200);
+    if (combo.getAttribute('aria-expanded') === 'true') combo.click();
+    // Did the component show the choice? Only a visible signal counts: the
+    // option row reporting itself selected, or the widget's own text /
+    // input now holding the title once the list is closed.
+    if (!verified && !findOption()) {
+      const root = combo.getRootNode();
+      const vals = [...(root.querySelectorAll?.('input') || [])].map((i) => i.value).join(' ');
+      verified = waeAfNorm(`${combo.textContent} ${vals}`).includes(want);
+    }
+    return verified ? 'ok' : 'tried';
+  }
+
+  // First choice, and what Map Mods does for the Pokestop form's dropdowns
+  // (setStaticDropdownByTitleAsync in that script): the dropdown component
+  // keeps its options as JSON in a <script> inside it; the option whose
+  // title matches is put into the component's selectedOption and the
+  // component's own "on-select-dd-field" event is fired. Returns true when
+  // the component took it, false when it didn't, null when no dropdown
+  // here has such an option.
+  async function waeAfSelectIssueDirect(title) {
+    const want = waeAfNorm(title);
+    for (const script of waeAfDeepAll('script[type="application/json"]')) {
+      let options;
+      try { options = JSON.parse(script.textContent || ''); } catch (e) { continue; }
+      if (!Array.isArray(options)) continue;
+      let option = options.find((o) => o && waeAfNorm(o.title) === want);
+      if (!option) {
+        const partial = options.filter((o) => o && typeof o.title === 'string' && waeAfNorm(o.title).includes(want));
+        if (partial.length === 1) [option] = partial;
+      }
+      const host = script.parentElement || script.getRootNode()?.host;
+      if (!option || !host) continue;
+      host.selectedOption = option;
+      if ('isOpened' in host) host.isOpened = false;
+      host.dispatchEvent(new CustomEvent('on-select-dd-field', { detail: { selectedOption: option } }));
+      if (host.updateComplete?.then) await host.updateComplete;
+      return host.selectedOption === option;
+    }
+    return null;
+  }
+
+  // After the last field is filled: bring the form's Submit button into
+  // view (never pressed -- that stays yours), or just the bottom of the
+  // page when no such button is found. Waits a moment first so a dropdown
+  // that was just closed has finished moving the layout around.
+  async function waeAfScrollToSubmit() {
+    await waeAfSleep(300);
+    let button = null;
+    for (const label of ['Submit', 'Submit request', 'Send']) {
+      button = waeAfFindClickableByText(label);
+      if (button) break;
+    }
+    try {
+      if (button) button.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      else window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'smooth' });
+    } catch (e) { /* ignore */ }
+  }
+
+  // 'ok' (selected, and confirmed) | 'tried' (clicked through the list but
+  // could not confirm the choice showed up) | 'nooption' | 'nocombo'.
+  async function waeAfSelectIssue(title) {
+    const direct = await waeAfSelectIssueDirect(title);
+    console.info('[Wayfarer Map Mods - Abuse Reports] Issue type, direct method:', direct === null ? 'no dropdown with that option found' : direct);
+    if (direct === true) return 'ok';
+    const viaClicks = await waeAfSelectIssueByClicks(title);
+    console.info('[Wayfarer Map Mods - Abuse Reports] Issue type, click method:', viaClicks);
+    return viaClicks;
+  }
+
+
+  // Works through the form as it appears, for up to WAE_AF_POLL_MAX polls:
+  // clicks the article's "Report an abuse" button until a form field shows
+  // up (a few times, spaced out -- the first click can land before the
+  // page's own handlers are attached), then fills name and email on the
+  // step that has them and the location field on the step that has that
+  // one -- the person can click Next in between, and each field is filled
+  // at most once. Finishes when the location field has been dealt with.
+  async function waeAfFill(payload) {
+    const text = typeof payload?.locationDetails === 'string' ? payload.locationDetails : '';
+    if (!text) { waeAfShowStatus('Abuse auto-fill: the Marked Wayspots list was empty.', 'error'); return; }
+    const want = { name: String(payload.name || '').trim(), email: String(payload.email || '').trim() };
+    const done = { name: !want.name, email: !want.email };
+    const filledList = [];
+    let sawForm = false;
+    let shown = '';
+    const missing = [!want.name && 'name', !want.email && 'email'].filter(Boolean);
+    const note = missing.length ? ` (no ${missing.join(' or ')} saved in the settings cog, so that is left to you)` : '';
+    let clickedNext = false;
+    const progress = () => {
+      const msg = filledList.length
+        ? `Abuse auto-fill: filled in ${filledList.join(' and ')}; waiting for the location field (click Next/Continue if the form has another step)\u2026`
+        : `Abuse auto-fill: waiting for the form\u2026${note}`;
+      if (msg !== shown) { shown = msg; waeAfShowStatus(msg, 'info'); }
+    };
+    progress();
+
+    for (let attempt = 0; attempt < WAE_AF_POLL_MAX; attempt++) {
+      if (!done.name) {
+        const f = waeAfFindField(WAE_AF_NAME_LABELS, true) || waeAfFindContactField('name');
+        if (f) { sawForm = true; done.name = true; if (waeAfSetValue(f, want.name)) filledList.push('your name'); }
+      }
+      if (!done.email) {
+        const f = waeAfFindField(WAE_AF_EMAIL_LABELS, true) || waeAfFindContactField('email');
+        if (f) { sawForm = true; done.email = true; if (waeAfSetValue(f, want.email)) filledList.push('your email'); }
+      }
+      const loc = waeAfFindField(WAE_AF_LOCATION_LABELS);
+      if (loc) {
+        // The report step: location list, then the optional extras from the
+        // settings cog (details / abuser text, issue type). Empty settings
+        // are left for the person to fill in.
+        const done2 = filledList.length ? [filledList.join(' and ')] : []; // name / email from the previous step
+        const todo = [];
+        const locFilled = waeAfSetValue(loc, text);
+        const n = Number(payload.count) || 0;
+        if (locFilled) done2.push(`the ${n} Wayspot${n === 1 ? '' : 's'} (location field)`);
+        const details = String(payload.reportDetails || '').trim();
+        const abuser = String(payload.abuser || '').trim();
+        if (details) {
+          const f = waeAfFindField(WAE_AF_REPORT_DETAILS_LABELS, true);
+          if (f && waeAfSetValue(f, details)) done2.push('the report details'); else if (!f) todo.push('the report details');
+        } else todo.push('the report details');
+        if (abuser) {
+          const f = waeAfFindField(WAE_AF_ABUSER_LABELS, true);
+          if (f && waeAfSetValue(f, abuser)) done2.push('the abuser details'); else if (!f) todo.push('the abuser details');
+        }
+        const issue = String(payload.issueType || '').trim();
+        if (issue) {
+          waeAfShowStatus('Abuse auto-fill: choosing the issue type\u2026', 'info');
+          const r = await waeAfSelectIssue(issue);
+          if (r === 'ok') done2.push(`the issue type (${issue})`);
+          else if (r === 'tried') todo.push('the issue type (selected it, but could not confirm it — please check)');
+          else todo.push('the issue type');
+        } else todo.push('the issue type');
+        waeAfClearSession();
+        let head = done2.length ? `Abuse auto-fill: filled in ${done2.join(', ')}.` : 'Abuse auto-fill: nothing needed filling in.';
+        if (!locFilled) head += ' The location field already had text, so it was left as it was.';
+        const tail = todo.length ? ` Still yours: ${todo.join(', ')}.` : '';
+        waeAfShowStatus(`${head}${tail} Check everything and submit.`, todo.length ? 'info' : 'ok');
+        await waeAfScrollToSubmit();
+        return;
+      }
+      // Name and email were both entered by us and the location field is
+      // not on this step: press the step's Next button once.
+      if (!clickedNext && want.name && want.email && done.name && done.email && filledList.length) {
+        const next = waeAfFindClickableByText('Next');
+        if (next) {
+          clickedNext = true;
+          await waeAfSleep(400); // let the form register the typed values first
+          console.info('[Wayfarer Map Mods - Abuse Reports] Clicking "Next":', next);
+          next.click();
+        }
+      }
+      if (attempt === WAE_AF_NOT_FOUND_POLLS && ((!done.name && want.name) || (!done.email && want.email))) {
+        waeAfLogCandidates('the name/email fields');
+        waeAfShowStatus('Abuse auto-fill: can\u2019t find the name/email fields (see the console). Fill them in yourself; the location list will still be filled in.', 'error');
+      }
+      progress();
+      await waeAfSleep(WAE_AF_POLL_MS);
+    }
+    waeAfLogCandidates();
+    waeAfShowStatus(sawForm
+      ? 'Abuse auto-fill: could not find the location field. Use "Copy All" in the Marked Wayspots list and paste it in yourself.'
+      : 'Abuse auto-fill: could not find the form (or the "Report an abuse" button). Use "Copy All" in the Marked Wayspots list instead.', 'error');
+  }
+
+  function waeAfStartHelpshiftCompanion() {
+    const session = waeAfReadSession();
+    if (!session) return;
+    waeAfShowStatus('Abuse auto-fill: connecting to the Wayfarer tab\u2026', 'info');
+    if (window.opener == null) {
+      waeAfShowStatus('Abuse auto-fill: lost the connection to the Wayfarer tab. Use "Copy All" there instead.', 'error');
+      return;
+    }
+    let gotData = false;
+    window.addEventListener('message', (event) => {
+      const data = event.data;
+      if (event.source !== window.opener || event.origin !== session.origin) return;
+      if (!data || data.type !== WAE_AF_MSG_DATA || data.protocolVersion !== WAE_AF_PROTOCOL || data.sessionId !== session.id) return;
+      if (gotData) return;
+      gotData = true;
+      clearInterval(retryTimer);
+      waeAfFill(data.payload).catch((e) => {
+        console.warn('[Wayfarer Map Mods - Abuse Reports] Abuse form auto-fill failed:', e);
+        waeAfShowStatus('Abuse auto-fill failed -- see the console. Use "Copy All" in the Marked Wayspots list instead.', 'error');
+      });
+    });
+    const request = () => {
+      try {
+        window.opener.postMessage({ type: WAE_AF_MSG_REQUEST, protocolVersion: WAE_AF_PROTOCOL, sessionId: session.id }, session.origin);
+      } catch (e) { /* opener went away -- the retry below gives up on its own */ }
+    };
+    // Asked again a few times: the Wayfarer tab's listener is up long
+    // before a person can click the button, but one lost message
+    // shouldn't mean a dead tab.
+    let retries = 0;
+    const retryTimer = setInterval(() => {
+      retries += 1;
+      if (gotData || retries >= 5) { clearInterval(retryTimer); return; }
+      request();
+    }, 2000);
+    request();
+    waeAfStartNavigator(session);
+    setTimeout(() => {
+      if (gotData) return;
+      console.warn('[Wayfarer Map Mods - Abuse Reports] No answer from the Wayfarer tab.');
+      waeAfShowStatus('Abuse auto-fill: the Wayfarer tab did not answer. Reload the Wayfarer tab (it needs this script version) and try the button again.', 'error');
+    }, WAE_AF_DATA_TIMEOUT_MS);
+  }
+
+  // The Help Center page runs only the half above and stops here -- none
+  // of the Wayfarer / Map Mods code below applies to it.
+  if (location.origin === WAE_HS_ORIGIN) {
+    waeAfStartHelpshiftCompanion();
+    return;
+  }
 
   // @grant none (see this script's header) means window already IS
   // unsafeWindow -- no sandbox -- per Tampermonkey's own docs, so this is
@@ -714,6 +1358,15 @@
     // button also appear inside the review map's info windows -- see
     // waeReviewIwSyncNow(). Checkbox: Marker Style settings.
     reviewMapAbuseControls: true,
+    // v1.71.0: name/email the abuse form auto-fill puts in the form's
+    // contact fields -- see waeGetReporterContact().
+    reporterName: '',
+    reporterEmail: '',
+    // v1.72.0: the report step's issue type (the option's title as the
+    // form shows it), default text for the report-details / abuser fields.
+    reporterIssueType: 'Fake Nominations or criteria issues',
+    reporterReportDetails: '',
+    reporterAbuser: '',
   });
   // Set once at startPlugin() (WFMM.markerAppearance.registerStyle()'s
   // return value) and called at stopPlugin() -- registerStyle() throws
@@ -5473,6 +6126,91 @@
     }
   }
 
+  // ---------------------------------------------------------------------
+  // Abuse form auto-fill, Wayfarer side (v1.70.0) -- see the comment block
+  // at the very top of this file for the whole picture. Opens the Help
+  // Center article with a one-time session id in the URL hash and answers
+  // that tab's request for data (waeHandleAbuseFormMessage(), installed in
+  // startPlugin()). The text sent is built when the request ARRIVES, not
+  // when the button was clicked, so a note edited while the Help Center
+  // was loading is still included. Same text, same "Include notes when
+  // copying" choice, as Copy All -- that is what the form's location
+  // parser (opr-email-lib.js) reads back out of the ticket email later.
+  // ---------------------------------------------------------------------
+  const waeAbuseFormSessions = new Map(); // sessionId -> { popup, expiresAt }
+  const WAE_DEFAULT_ISSUE_TYPE = 'Fake Nominations or criteria issues';
+  // The options of the form's "What issue are you reporting?" dropdown,
+  // as the form lists them (offered in the settings cog's Issue type menu).
+  const WAE_ISSUE_TYPE_OPTIONS = [
+    'Title/Description/Supporting Information',
+    'Invalid Location Edits',
+    'Fake Nominations or criteria issues',
+    'Photo Issues',
+    'Inappropriate Behavior by an Explorer',
+  ];
+
+  function waeGetReporterContact() {
+    const s = wfmmWindow.WFMM.settings;
+    return {
+      name: String(s.get(PLUGIN_ID, 'reporterName', '') || '').trim(),
+      email: String(s.get(PLUGIN_ID, 'reporterEmail', '') || '').trim(),
+      issueType: String(s.get(PLUGIN_ID, 'reporterIssueType', WAE_DEFAULT_ISSUE_TYPE) || '').trim(),
+      reportDetails: String(s.get(PLUGIN_ID, 'reporterReportDetails', '') || '').trim(),
+      abuser: String(s.get(PLUGIN_ID, 'reporterAbuser', '') || '').trim(),
+    };
+  }
+
+  function waeBuildAbuseFormPayload() {
+    const list = waeLoadMarkedWayspots();
+    const includeNotes = waeCopyIncludesNotes();
+    const contact = waeGetReporterContact();
+    return {
+      name: contact.name,
+      email: contact.email,
+      issueType: contact.issueType,
+      reportDetails: contact.reportDetails,
+      abuser: contact.abuser,
+      count: list.length,
+      locationDetails: list.map((item) => waeFormatMarkedWayspotLine(item, includeNotes)).join('\n'),
+    };
+  }
+
+  // 'opened' | 'empty' | 'blocked'. Must run straight from a click, or the
+  // browser's popup blocker will refuse the window.open() call.
+  function waeOpenAbuseFormAutofill() {
+    if (!waeLoadMarkedWayspots().length) return 'empty';
+    const sessionId = (typeof crypto !== 'undefined' && crypto.randomUUID)
+      ? crypto.randomUUID()
+      : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+    const url = new URL(WAE_ABUSE_FORM_URL);
+    url.hash = new URLSearchParams({
+      [WAE_AF_HASH_SESSION]: sessionId,
+      [WAE_AF_HASH_ORIGIN]: window.location.origin,
+    }).toString();
+    // No "noopener" -- the Help Center tab needs window.opener to ask for
+    // the data.
+    const popup = window.open(url.toString(), '_blank');
+    if (!popup) return 'blocked';
+    const now = Date.now();
+    for (const [id, s] of waeAbuseFormSessions) if (s.expiresAt <= now) waeAbuseFormSessions.delete(id);
+    waeAbuseFormSessions.set(sessionId, { popup, expiresAt: now + WAE_AF_SESSION_TTL_MS });
+    return 'opened';
+  }
+
+  function waeHandleAbuseFormMessage(event) {
+    if (event.origin !== WAE_HS_ORIGIN) return;
+    const data = event.data;
+    if (!data || data.type !== WAE_AF_MSG_REQUEST || data.protocolVersion !== WAE_AF_PROTOCOL) return;
+    const session = waeAbuseFormSessions.get(data.sessionId);
+    if (!session || session.expiresAt <= Date.now() || event.source !== session.popup) return;
+    session.popup.postMessage({
+      type: WAE_AF_MSG_DATA,
+      protocolVersion: WAE_AF_PROTOCOL,
+      sessionId: data.sessionId,
+      payload: waeBuildAbuseFormPayload(),
+    }, WAE_HS_ORIGIN);
+  }
+
   function waeFormatMarkedWayspotLine(item, includeNotes = true) {
     const name = item.name || '(unnamed)';
     const coords = `${Number(item.lat).toFixed(6)}, ${Number(item.lng).toFixed(6)}`;
@@ -5582,8 +6320,13 @@
       },
     });
     const copyAllBtn = ui.button({ text: 'Copy All', disabled: true });
+    // v1.70.0: opens the Help Center abuse form and fills its location
+    // field with the same text Copy All would copy -- see
+    // waeOpenAbuseFormAutofill().
+    const fillFormBtn = ui.button({ text: 'Auto-fill abuse form', disabled: true });
+    fillFormBtn.title = 'Opens the abuse form in a new tab and fills in the location field from this list';
     const clearAllBtn = ui.button({ text: 'Clear All', variant: 'danger', disabled: true });
-    const buttonRow = ui.buttonRow([copyAllBtn, clearAllBtn]);
+    const buttonRow = ui.buttonRow([copyAllBtn, fillFormBtn, clearAllBtn]);
     const copyNotesToggle = ui.checkboxRow({
       label: 'Include notes when copying',
       checked: waeCopyIncludesNotes(),
@@ -5594,6 +6337,7 @@
       listContainer.innerHTML = '';
       const list = waeLoadMarkedWayspots();
       copyAllBtn.disabled = !list.length;
+      fillFormBtn.disabled = !list.length;
       clearAllBtn.disabled = !list.length;
       if (!list.length) {
         listContainer.append(emptyEl);
@@ -5603,7 +6347,7 @@
         listContainer.append(waeBuildMarkedWayspotRow(item, ui, (rowEl) => {
           rowEl.remove();
           if (!waeLoadMarkedWayspots().length) render();
-          else { copyAllBtn.disabled = false; clearAllBtn.disabled = false; }
+          else { copyAllBtn.disabled = false; fillFormBtn.disabled = false; clearAllBtn.disabled = false; }
         }));
       }
     }
@@ -5614,6 +6358,13 @@
       const ok = await waeCopyToClipboard(list.map((item) => waeFormatMarkedWayspotLine(item, waeCopyIncludesNotes())).join('\n'));
       copyAllBtn.textContent = ok ? 'Copied!' : 'Copy failed';
       setTimeout(() => { copyAllBtn.textContent = 'Copy All'; }, 1500);
+    });
+
+    fillFormBtn.addEventListener('click', () => {
+      const result = waeOpenAbuseFormAutofill();
+      if (result === 'empty') return;
+      fillFormBtn.textContent = result === 'opened' ? 'Opened!' : 'Popup blocked';
+      setTimeout(() => { fillFormBtn.textContent = 'Auto-fill abuse form'; }, 1500);
     });
 
     clearAllBtn.addEventListener('click', () => {
@@ -6034,7 +6785,79 @@
         ui.buttonRow([resetStyleBtn]),
       ],
     });
-    body.append(styleSection);
+    // v1.71.0/1.72.0: what the abuse form auto-fill (the button in the
+    // Marked Wayspots list) enters besides the location list.
+    const contact = waeGetReporterContact();
+    const reporterNameInput = ui.textInput({
+      placeholder: 'Name for the abuse form',
+      value: contact.name,
+      autocomplete: 'off',
+      onInput: (v) => wfmmWindow.WFMM.settings.set(PLUGIN_ID, 'reporterName', v.trim()),
+    });
+    const reporterEmailInput = ui.textInput({
+      type: 'email',
+      placeholder: 'Email for the abuse form',
+      value: contact.email,
+      autocomplete: 'off',
+      onInput: (v) => wfmmWindow.WFMM.settings.set(PLUGIN_ID, 'reporterEmail', v.trim()),
+    });
+    // A menu of the form's own options, so the exact title is always right.
+    // A title saved earlier that isn't one of them (typed by hand in
+    // v1.72) stays selectable instead of silently changing.
+    const issueChoices = [{ value: '', label: 'Don\u2019t select \u2014 I\u2019ll choose' }]
+      .concat(WAE_ISSUE_TYPE_OPTIONS.map((t) => ({ value: t, label: t })));
+    if (contact.issueType && !WAE_ISSUE_TYPE_OPTIONS.includes(contact.issueType)) {
+      issueChoices.push({ value: contact.issueType, label: `${contact.issueType} (saved earlier)` });
+    }
+    const onIssueChange = (v) => wfmmWindow.WFMM.settings.set(PLUGIN_ID, 'reporterIssueType', String(v || '').trim());
+    let reporterIssueInput;
+    if (typeof ui.selectInput === 'function') {
+      reporterIssueInput = ui.selectInput({ options: issueChoices, value: contact.issueType, onChange: onIssueChange });
+    } else {
+      reporterIssueInput = document.createElement('select');
+      for (const c of issueChoices) {
+        const o = document.createElement('option');
+        o.value = c.value;
+        o.textContent = c.label;
+        reporterIssueInput.append(o);
+      }
+      reporterIssueInput.value = contact.issueType;
+      reporterIssueInput.addEventListener('change', () => onIssueChange(reporterIssueInput.value));
+    }
+    const makeTextarea = (opts) => {
+      if (typeof ui.textarea === 'function') return ui.textarea(opts);
+      const t = document.createElement('textarea');
+      t.className = 'wfmm-textarea';
+      t.placeholder = opts.placeholder || '';
+      t.value = opts.value || '';
+      t.rows = opts.rows || 3;
+      t.addEventListener('input', () => opts.onInput(t.value, t));
+      return t;
+    };
+    const reporterDetailsInput = makeTextarea({
+      placeholder: 'Default text for \u201cAbuse report details\u201d (empty = leave to you)',
+      value: contact.reportDetails,
+      rows: 3,
+      onInput: (v) => wfmmWindow.WFMM.settings.set(PLUGIN_ID, 'reporterReportDetails', v.trim()),
+    });
+    const reporterAbuserInput = makeTextarea({
+      placeholder: 'Default text for \u201cDetails of the abuser(s)\u201d (empty = leave to you)',
+      value: contact.abuser,
+      rows: 2,
+      onInput: (v) => wfmmWindow.WFMM.settings.set(PLUGIN_ID, 'reporterAbuser', v.trim()),
+    });
+    const autofillSection = ui.section({
+      title: 'Abuse form auto-fill',
+      hint: 'Entered in the Help Center abuse form by the \u201cAuto-fill abuse form\u201d button in the Marked Wayspots list, next to the list of Wayspots itself. Leave a field empty to fill it in yourself; fields that already have text are never overwritten. Saved with this plugin\u2019s settings, so it is included in WFMM\u2019s settings backups.',
+      children: [
+        ui.fieldRow({ label: 'Name', input: reporterNameInput }),
+        ui.fieldRow({ label: 'Email', input: reporterEmailInput }),
+        ui.fieldRow({ label: 'Issue type', input: reporterIssueInput }),
+        ui.fieldRow({ label: 'Report details', input: reporterDetailsInput }),
+        ui.fieldRow({ label: 'Abuser(s)', input: reporterAbuserInput }),
+      ],
+    });
+    body.append(styleSection, autofillSection);
     return {
       onOk() { return true; }, // no-op -- every control above already saved on its own onInput/onChange
     };
@@ -6436,6 +7259,10 @@
 
   function startPlugin() {
     waePluginActive = true;
+    // Answers the Help Center tab's data request for the abuse form
+    // auto-fill (see waeOpenAbuseFormAutofill()). Re-adding the same
+    // function reference on a restart is a no-op.
+    window.addEventListener('message', waeHandleAbuseFormMessage);
     // A review candidate can arrive before this runs (the request hook is
     // installed at load) -- show its row now that the plugin's on.
     try {
@@ -6561,6 +7388,8 @@
 
   function stopPlugin() {
     waePluginActive = false;
+    window.removeEventListener('message', waeHandleAbuseFormMessage);
+    waeAbuseFormSessions.clear();
     waeRemoveReviewAbuseRows();
     waeSidePanelReadyUnsub?.();
     waeSidePanelReadyUnsub = null;
