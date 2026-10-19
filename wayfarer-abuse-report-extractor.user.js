@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.74.0
+// @version      1.75.0
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV. Can also auto-fill the Help Center abuse form from the Marked Wayspots list.
 // @author       Frankmans
 // @grant        none
@@ -87,6 +87,7 @@
   const WAE_AF_POLL_MAX = 600; // 5 min -- covers a person clicking through a multi-step form
   const WAE_AF_TRIGGER_MAX_CLICKS = 3;
   const WAE_AF_TRIGGER_RETRY_MS = 4000;
+  const WAE_AF_SUBMIT_VIEWPORT_FRACTION = 0.9; // Submit ends up this far down the window, from the top
   const WAE_AF_DATA_TIMEOUT_MS = 10000;   // no answer from the Wayfarer tab by then -> say so
   const WAE_AF_NOT_FOUND_POLLS = 20;      // 10s without finding the button -> say so
   const WAE_AF_FIELD_SELECTOR = 'textarea, input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="button"]):not([type="submit"]):not([type="file"])';
@@ -486,20 +487,37 @@
     return null;
   }
 
-  // After the last field is filled: bring the form's Submit button into
-  // view (never pressed -- that stays yours), or just the bottom of the
-  // page when no such button is found. Waits a moment first so a dropdown
-  // that was just closed has finished moving the layout around.
+  // After the last field is filled: scroll so the form's Submit button
+  // sits at WAE_AF_SUBMIT_VIEWPORT_FRACTION of the window height, counted
+  // from the top (90% = near the bottom edge, with the button fully in
+  // view and the form above it still readable). Only scrolls when the
+  // button is below that line or above the window; a button already
+  // higher up is left where it is, and without a Submit button the page
+  // isn't scrolled at all. Never presses it -- that stays yours. Waits a
+  // moment first so a dropdown that was just closed has finished moving
+  // the layout around.
+  function waeAfFindSubmitButton() {
+    for (const label of ['Submit', 'Submit request', 'Submit report', 'Send']) {
+      const button = waeAfFindClickableByText(label);
+      if (button) return button;
+    }
+    const typed = waeAfDeepAll('button[type="submit"], input[type="submit"]')[0];
+    if (typed) return typed;
+    return waeAfDeepAll('button, [role="button"], a').find((el) => {
+      const t = (el.textContent || '').trim();
+      return t.length > 0 && t.length < 40 && /submit/i.test(t);
+    }) || null;
+  }
+
   async function waeAfScrollToSubmit() {
     await waeAfSleep(300);
-    let button = null;
-    for (const label of ['Submit', 'Submit request', 'Send']) {
-      button = waeAfFindClickableByText(label);
-      if (button) break;
-    }
+    const button = waeAfFindSubmitButton();
+    if (!button) { console.info('[Wayfarer Map Mods - Abuse Reports] No Submit button found to scroll to.'); return; }
     try {
-      if (button) button.scrollIntoView({ block: 'center', behavior: 'smooth' });
-      else window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'smooth' });
+      const rect = button.getBoundingClientRect();
+      const line = window.innerHeight * WAE_AF_SUBMIT_VIEWPORT_FRACTION;
+      const centre = rect.top + rect.height / 2;
+      if (centre > line || rect.bottom < 0) window.scrollBy({ top: centre - line, behavior: 'smooth' });
     } catch (e) { /* ignore */ }
   }
 
@@ -3197,7 +3215,30 @@
     formLink.target = '_blank';
     formLink.rel = 'noopener noreferrer';
 
-    row.append(copyBtn, noteInput, markBtn, formLink);
+    // v1.75.0: opens the abuse form and fills it in for THIS review only --
+    // just this Wayspot and the note typed in the field beside it, not the
+    // Marked Wayspots list (and nothing is added to that list). The note is
+    // read when the Help Center tab asks for the data, so one typed or
+    // changed in the meantime is included. It is always included here
+    // (clicking this button is asking for it), whatever the "Include notes
+    // when copying" checkbox of the list's Copy All says.
+    const fillBtn = document.createElement('button');
+    fillBtn.type = 'button';
+    fillBtn.className = 'wae-review-fill-btn';
+    fillBtn.textContent = 'Auto-fill abuse form';
+    fillBtn.title = 'Opens the abuse form in a new tab and fills it in for this review only, with the note beside it';
+    fillBtn.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      const result = waeOpenAbuseFormAutofill(() => ({
+        items: [{ name, lat, lng, note: noteInput.value.trim() }],
+        includeNotes: true,
+      }));
+      fillBtn.textContent = result === 'opened' ? 'Opened!' : 'Popup blocked';
+      setTimeout(() => { if (fillBtn.isConnected) fillBtn.textContent = 'Auto-fill abuse form'; }, 1500);
+    });
+
+    row.append(copyBtn, noteInput, markBtn, fillBtn, formLink);
     return row;
   }
 
@@ -4536,6 +4577,11 @@
     }
     .wae-review-copy-btn:hover{ background:#e0e7ff; }
     .wae-review-form-link{ flex:0 0 auto; font-size:12px; white-space:nowrap; }
+    .wae-review-fill-btn{
+      flex:0 0 auto; font-size:12px; white-space:nowrap; padding:4px 8px; color:#154aab;
+      background:#eef2ff; border:1px solid #c7d2fe; border-radius:5px; cursor:pointer;
+    }
+    .wae-review-fill-btn:hover{ background:#e0e7ff; }
     .wae-review-copy-btn.wae-copied{ color:#16a34a; background:#f0fdf4; border-color:#bbf7d0; }
     /* Note field + button inside a review map info window (see
        waeReviewIwSyncNow()). Stacked and sized to line up with the
@@ -6160,9 +6206,16 @@
     };
   }
 
-  function waeBuildAbuseFormPayload() {
-    const list = waeLoadMarkedWayspots();
-    const includeNotes = waeCopyIncludesNotes();
+  // `getSource` (optional) is a function returning { items, includeNotes }
+  // -- what to put in the form's location field INSTEAD of the Marked
+  // Wayspots list. The review page's "Auto-fill abuse form" button uses it
+  // to send just the open review's Wayspot with the note typed beside it.
+  function waeBuildAbuseFormPayload(getSource) {
+    const source = getSource
+      ? getSource()
+      : { items: waeLoadMarkedWayspots(), includeNotes: waeCopyIncludesNotes() };
+    const list = source.items;
+    const includeNotes = source.includeNotes;
     const contact = waeGetReporterContact();
     return {
       name: contact.name,
@@ -6177,8 +6230,8 @@
 
   // 'opened' | 'empty' | 'blocked'. Must run straight from a click, or the
   // browser's popup blocker will refuse the window.open() call.
-  function waeOpenAbuseFormAutofill() {
-    if (!waeLoadMarkedWayspots().length) return 'empty';
+  function waeOpenAbuseFormAutofill(getSource) {
+    if (!(getSource ? getSource().items : waeLoadMarkedWayspots()).length) return 'empty';
     const sessionId = (typeof crypto !== 'undefined' && crypto.randomUUID)
       ? crypto.randomUUID()
       : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
@@ -6193,7 +6246,7 @@
     if (!popup) return 'blocked';
     const now = Date.now();
     for (const [id, s] of waeAbuseFormSessions) if (s.expiresAt <= now) waeAbuseFormSessions.delete(id);
-    waeAbuseFormSessions.set(sessionId, { popup, expiresAt: now + WAE_AF_SESSION_TTL_MS });
+    waeAbuseFormSessions.set(sessionId, { popup, getSource, expiresAt: now + WAE_AF_SESSION_TTL_MS });
     return 'opened';
   }
 
@@ -6207,7 +6260,7 @@
       type: WAE_AF_MSG_DATA,
       protocolVersion: WAE_AF_PROTOCOL,
       sessionId: data.sessionId,
-      payload: waeBuildAbuseFormPayload(),
+      payload: waeBuildAbuseFormPayload(session.getSource),
     }, WAE_HS_ORIGIN);
   }
 
