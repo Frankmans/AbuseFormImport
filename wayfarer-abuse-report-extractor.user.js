@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.75.0
+// @version      1.75.1
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV. Can also auto-fill the Help Center abuse form from the Marked Wayspots list.
 // @author       Frankmans
 // @grant        none
@@ -83,13 +83,20 @@
   // Labels of the form's other fields: a container whose text mentions
   // one of these is never accepted as the label of the location field.
   const WAE_AF_OTHER_LABELS = ['Abuse report details', 'What issue are you reporting?', 'Provide details of the abuser(s)'];
-  const WAE_AF_POLL_MS = 500;
-  const WAE_AF_POLL_MAX = 600; // 5 min -- covers a person clicking through a multi-step form
+  const WAE_AF_POLL_MS = 200;   // form-filling loop
+  const WAE_AF_POLL_MAX = 1500; // 5 min -- covers a person clicking through a multi-step form
   const WAE_AF_TRIGGER_MAX_CLICKS = 3;
-  const WAE_AF_TRIGGER_RETRY_MS = 4000;
+  const WAE_AF_TRIGGER_RETRY_MS = 1500;
+  // First-page navigator (finds and clicks "Report an abuse"): polls fast,
+  // and keeps its limits in milliseconds rather than poll counts.
+  const WAE_AF_NAV_POLL_MS = 100;
+  const WAE_AF_NAV_MAX_MS = 5 * 60 * 1000;
+  const WAE_AF_NAV_SCROLL_MS = 2000;       // while the button is missing, scroll down this often
+  const WAE_AF_NAV_NOT_FOUND_MS = 10000;   // no button after this long -> say so
+  const WAE_AF_INLINE_LINK_AFTER_MS = 6000; // the article's inline link is only used as a last resort, after this long
   const WAE_AF_SUBMIT_VIEWPORT_FRACTION = 0.9; // Submit ends up this far down the window, from the top
   const WAE_AF_DATA_TIMEOUT_MS = 10000;   // no answer from the Wayfarer tab by then -> say so
-  const WAE_AF_NOT_FOUND_POLLS = 20;      // 10s without finding the button -> say so
+  const WAE_AF_NOT_FOUND_POLLS = 50;      // form loop: 10s without the name/email fields -> say so
   const WAE_AF_FIELD_SELECTOR = 'textarea, input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="button"]):not([type="submit"]):not([type="file"])';
 
   function waeAfNorm(s) {
@@ -208,7 +215,7 @@
       };
     });
     ranked.sort((x, y) => (x.inText - y.inText) || (y.isButton - x.isButton) || (y.area - x.area) || (y.index - x.index));
-    return ranked[0] ? ranked[0].target : null;
+    return ranked[0] ? { target: ranked[0].target, inText: ranked[0].inText } : null;
   }
 
   function waeAfFormVisible() {
@@ -256,24 +263,34 @@
   // Clicks the article's button up to WAE_AF_TRIGGER_MAX_CLICKS times,
   // spaced out, until some form field appears.
   function waeAfStartNavigator(session) {
-    let attempts = 0;
+    const startedAt = Date.now();
     let clicks = 0;
     let lastClickAt = 0;
+    let lastScrollAt = 0;
+    let warned = false;
     const timer = setInterval(() => {
-      attempts += 1;
-      if (attempts > WAE_AF_POLL_MAX || waeAfFormVisible()) { clearInterval(timer); return; }
-      const trigger = waeAfFindTrigger();
+      const now = Date.now();
+      if (now - startedAt > WAE_AF_NAV_MAX_MS || waeAfFormVisible()) { clearInterval(timer); return; }
+      let trigger = waeAfFindTrigger();
+      // The article's inline link renders before the real button does.
+      // Clicking it wastes a click AND starts the retry wait, so it is
+      // ignored unless nothing better has shown up for a while.
+      if (trigger && trigger.inText && now - startedAt < WAE_AF_INLINE_LINK_AFTER_MS) trigger = null;
       // The button sits at the very end of the article; scroll there in case the page only renders it once it is near.
-      if (!trigger && attempts % 4 === 1) { try { window.scrollTo(0, document.documentElement.scrollHeight); } catch (e) { /* ignore */ } }
-      if (trigger && clicks < WAE_AF_TRIGGER_MAX_CLICKS && Date.now() - lastClickAt >= WAE_AF_TRIGGER_RETRY_MS) {
+      if (!trigger && now - lastScrollAt >= WAE_AF_NAV_SCROLL_MS) {
+        lastScrollAt = now;
+        try { window.scrollTo(0, document.documentElement.scrollHeight); } catch (e) { /* ignore */ }
+      }
+      if (trigger && clicks < WAE_AF_TRIGGER_MAX_CLICKS && now - lastClickAt >= WAE_AF_TRIGGER_RETRY_MS) {
         clicks += 1;
-        lastClickAt = Date.now();
-        waeAfActivate(trigger, clicks, session);
-      } else if (!trigger && attempts === WAE_AF_NOT_FOUND_POLLS && clicks === 0) {
+        lastClickAt = now;
+        waeAfActivate(trigger.target, clicks, session);
+      } else if (!trigger && !warned && clicks === 0 && now - startedAt >= WAE_AF_NAV_NOT_FOUND_MS) {
+        warned = true;
         waeAfLogTriggerCandidates();
         waeAfShowStatus('Abuse auto-fill: can\u2019t find the \u201cReport an abuse\u201d button. Click it yourself; the form will still be filled in.', 'error');
       }
-    }, WAE_AF_POLL_MS);
+    }, WAE_AF_NAV_POLL_MS);
   }
 
   // Native value setter + input/change events, so the component sees a
@@ -610,7 +627,7 @@
         const next = waeAfFindClickableByText('Next');
         if (next) {
           clickedNext = true;
-          await waeAfSleep(400); // let the form register the typed values first
+          await waeAfSleep(250); // let the form register the typed values first
           console.info('[Wayfarer Map Mods - Abuse Reports] Clicking "Next":', next);
           next.click();
         }
