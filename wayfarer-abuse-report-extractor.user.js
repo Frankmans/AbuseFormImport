@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.75.1
+// @version      1.78.0
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV. Can also auto-fill the Help Center abuse form from the Marked Wayspots list.
 // @author       Frankmans
 // @grant        none
@@ -3170,6 +3170,49 @@
   let waeReviewAbuseInsertToken = 0;
 
   const WAE_COPY_ICON_SVG = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"></rect><path d="M5 15V6a2 2 0 0 1 2-2h9"></path></svg>';
+  // v1.76.0: the review-page row's other icons -- same 16px outline style
+  // as the copy/check icons. Flag with a plus = add to the abuse report
+  // draft, wand = auto-fill the abuse form, page with an exclamation mark
+  // = open the abuse form (wand and page are Lucide's "wand" and
+  // "file-warning" shapes), cross = popup blocked.
+  const waeIconSvg = (inner) => `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${inner}</svg>`;
+  const WAE_MARK_ICON_SVG = waeIconSvg('<path d="M5 21V4"></path><path d="M5 4h9l-1.5 3.5L14 11H5"></path><path d="M18 15v6M15 18h6"></path>');
+  const WAE_WAND_ICON_SVG = waeIconSvg('<path d="M15 4V2"></path><path d="M15 16v-2"></path><path d="M8 9h2"></path><path d="M20 9h2"></path><path d="M17.8 11.8 19 13"></path><path d="M15 9h.01"></path><path d="M17.8 6.2 19 5"></path><path d="m3 21 9-9"></path><path d="M12.2 6.2 11 5"></path>');
+  const WAE_FILE_ALERT_ICON_SVG = waeIconSvg('<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"></path><path d="M14 2v4a2 2 0 0 0 2 2h4"></path><path d="M12 9v4"></path><path d="M12 17h.01"></path>');
+  const WAE_X_ICON_SVG = waeIconSvg('<path d="M6 6l12 12M18 6 6 18"></path>');
+  // v1.78.0, for the Marked Wayspots list modal (Lucide "trash-2" and "clipboard-check")
+  const WAE_TRASH_ICON_SVG = waeIconSvg('<path d="M3 6h18"></path><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"></path><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><path d="M10 11v6M14 11v6"></path>');
+  const WAE_CLIPBOARD_CHECK_ICON_SVG = waeIconSvg('<rect width="8" height="4" x="8" y="2" rx="1" ry="1"></rect><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path><path d="m9 14 2 2 4-4"></path>');
+
+  // An icon-only button for the suite's own modals (ui.button() underneath,
+  // so it keeps their look) -- the wording lives in the tooltip and the
+  // aria-label. waeFlashButton() swaps the icon + tooltip for a moment
+  // (a check after copying, a cross when it failed) and then puts them back.
+  function waeIconButton(ui, { icon, title, variant, disabled }) {
+    return ui.button({
+      html: icon,
+      title,
+      variant: variant || 'default',
+      disabled: !!disabled,
+      className: 'wae-list-icon-btn',
+      attrs: { 'aria-label': title },
+    });
+  }
+
+  function waeFlashButton(btn, flashIcon, flashTitle, restoreIcon, restoreTitle, ms = 1500) {
+    btn.innerHTML = flashIcon;
+    btn.title = flashTitle;
+    btn.setAttribute('aria-label', flashTitle);
+    setTimeout(() => {
+      // restoreIcon / restoreTitle may be functions, for a button whose
+      // label changes meanwhile (the Copy selected count)
+      const icon = typeof restoreIcon === 'function' ? restoreIcon() : restoreIcon;
+      const title2 = typeof restoreTitle === 'function' ? restoreTitle() : restoreTitle;
+      btn.innerHTML = icon;
+      btn.title = title2;
+      btn.setAttribute('aria-label', title2);
+    }, ms);
+  }
   const WAE_CHECK_ICON_SVG = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12l5 5 9-10"></path></svg>';
 
   function waeAwaitElement(get, tries = 30, delayMs = 100) {
@@ -3200,13 +3243,14 @@
     const row = document.createElement('div');
     row.className = 'wae-review-abuse-row';
 
-    const { noteInput, markBtn } = waeBuildMarkControls({ name, lat, lng });
+    const { noteInput, markBtn } = waeBuildMarkControls({ name, lat, lng, iconOnly: true });
 
     const copyBtn = document.createElement('button');
     copyBtn.type = 'button';
     copyBtn.className = 'wae-review-copy-btn';
     copyBtn.innerHTML = WAE_COPY_ICON_SVG;
     copyBtn.title = 'Copy name and coordinates for the abuse report form';
+    copyBtn.setAttribute('aria-label', 'Copy name and coordinates for the abuse report form');
     copyBtn.addEventListener('click', async (ev) => {
       ev.preventDefault();
       ev.stopPropagation();
@@ -3227,7 +3271,9 @@
     // link -- opens in a new tab so the review in progress isn't lost.
     const formLink = document.createElement('a');
     formLink.className = 'wae-review-form-link';
-    formLink.textContent = 'Abuse form';
+    formLink.innerHTML = WAE_FILE_ALERT_ICON_SVG;
+    formLink.title = 'Open the abuse form (new tab)';
+    formLink.setAttribute('aria-label', 'Open the abuse form (new tab)');
     formLink.href = WAE_ABUSE_FORM_URL;
     formLink.target = '_blank';
     formLink.rel = 'noopener noreferrer';
@@ -3242,8 +3288,10 @@
     const fillBtn = document.createElement('button');
     fillBtn.type = 'button';
     fillBtn.className = 'wae-review-fill-btn';
-    fillBtn.textContent = 'Auto-fill abuse form';
-    fillBtn.title = 'Opens the abuse form in a new tab and fills it in for this review only, with the note beside it';
+    const fillTitle = 'Auto-fill the abuse form for this review only, with the note beside it (opens a new tab)';
+    fillBtn.innerHTML = WAE_WAND_ICON_SVG;
+    fillBtn.title = fillTitle;
+    fillBtn.setAttribute('aria-label', fillTitle);
     fillBtn.addEventListener('click', (ev) => {
       ev.preventDefault();
       ev.stopPropagation();
@@ -3251,8 +3299,14 @@
         items: [{ name, lat, lng, note: noteInput.value.trim() }],
         includeNotes: true,
       }));
-      fillBtn.textContent = result === 'opened' ? 'Opened!' : 'Popup blocked';
-      setTimeout(() => { if (fillBtn.isConnected) fillBtn.textContent = 'Auto-fill abuse form'; }, 1500);
+      const opened = result === 'opened';
+      fillBtn.innerHTML = opened ? WAE_CHECK_ICON_SVG : WAE_X_ICON_SVG;
+      fillBtn.title = opened ? 'Opened' : 'Popup blocked';
+      setTimeout(() => {
+        if (!fillBtn.isConnected) return;
+        fillBtn.innerHTML = WAE_WAND_ICON_SVG;
+        fillBtn.title = fillTitle;
+      }, 1500);
     });
 
     row.append(copyBtn, noteInput, markBtn, fillBtn, formLink);
@@ -3667,7 +3721,7 @@
     try { noteInput.setSelectionRange(d.selStart, d.selEnd); } catch (e) { /* not selectable -- ignore */ }
   }
 
-  function waeBuildMarkControls({ name, lat, lng, draftKey }) {
+  function waeBuildMarkControls({ name, lat, lng, draftKey, iconOnly }) {
     const noteInput = document.createElement('input');
     noteInput.type = 'text';
     noteInput.className = 'wae-detail-mark-note';
@@ -3718,9 +3772,23 @@
 
     const markBtn = document.createElement('button');
     markBtn.type = 'button';
-    markBtn.className = 'wae-detail-mark-btn';
-    markBtn.textContent = WAE_MARK_BTN_LABEL;
-    markBtn.title = 'Add this Wayspot to your Marked Wayspots list';
+    markBtn.className = iconOnly ? 'wae-detail-mark-btn wae-icon-btn' : 'wae-detail-mark-btn';
+    // 'idle' | 'added' | 'updated'. Text button by default; with iconOnly
+    // (the review-page row) the flag-plus icon, then a check, with the
+    // wording in the tooltip / aria-label instead of on the button.
+    const setMarkState = (state) => {
+      if (iconOnly) {
+        const label = state === 'idle' ? 'Add this Wayspot to your abuse report draft (Marked Wayspots list)'
+          : (state === 'updated' ? 'Updated' : 'Added');
+        markBtn.innerHTML = state === 'idle' ? WAE_MARK_ICON_SVG : WAE_CHECK_ICON_SVG;
+        markBtn.title = label;
+        markBtn.setAttribute('aria-label', label);
+      } else {
+        markBtn.textContent = state === 'idle' ? WAE_MARK_BTN_LABEL : (state === 'updated' ? '\u2713 Updated' : '\u2713 Added');
+        if (state === 'idle') markBtn.title = 'Add this Wayspot to your Marked Wayspots list';
+      }
+    };
+    setMarkState('idle');
     markBtn.addEventListener('click', (ev) => {
       ev.preventDefault();
       ev.stopPropagation();
@@ -3729,14 +3797,14 @@
       if (draftKey && waeNoteDraft && waeNoteDraft.key === draftKey) waeNoteDraft = null;
       // waeAddMarkedWayspot() decides whether this was a new entry or an
       // overwrite of an already-marked Wayspot's note.
-      markBtn.textContent = result === 'updated' ? '\u2713 Updated' : '\u2713 Added';
+      setMarkState(result === 'updated' ? 'updated' : 'added');
       markBtn.disabled = true;
       setTimeout(() => {
         // The surrounding DOM may have been torn down/replaced by the
         // time this fires (Base rebuilds the details slot on every
         // selection; the review card re-renders per candidate).
         if (markBtn.isConnected) {
-          markBtn.textContent = WAE_MARK_BTN_LABEL;
+          setMarkState('idle');
           markBtn.disabled = false;
         }
       }, 1200);
@@ -3843,14 +3911,17 @@
 
       const markRow = document.createElement('div');
       markRow.className = 'wae-detail-mark-row';
-      // Note field + "+ add to abuse report draft" button now come from
+      // Note field + the add-to-draft button come from
       // waeBuildMarkControls() (shared with the review-page row, see
       // waeBuildReviewAbuseRow()) rather than being built inline here.
+      // v1.77.0: the button is the flag-plus icon here too, like the
+      // review-page row. It also stays in the row beside the note field now:
+      // this function used to insert it a second time, straight into the
+      // panel, which pulled it out of the row onto a line of its own.
       const draftKey = `${lat},${lng}`;
-      const { noteInput, markBtn } = waeBuildMarkControls({ name, lat, lng, draftKey });
+      const { noteInput, markBtn } = waeBuildMarkControls({ name, lat, lng, draftKey, iconOnly: true });
       markRow.append(noteInput, markBtn);
       statusRow.parentNode.insertBefore(markRow, statusRow);
-      statusRow.parentNode.insertBefore(markBtn, statusRow);
       waeRestoreNoteFocus(noteInput, draftKey);
     });
   }
@@ -4462,7 +4533,9 @@
        abuse-report crosses are. */
     .wae-mark-marker{ position:absolute; transform:translate(-50%, -50%); cursor:pointer; line-height:0; }
     .wae-mark-marker svg{ display:block; }
-    .wae-mark-form-link{ display:block; font-size:12px; margin-bottom:6px; }
+    .wae-list-icon-btn{ display:inline-flex; align-items:center; justify-content:center; padding:6px 10px; text-decoration:none; }
+    .wae-list-icon-btn svg{ pointer-events:none; }
+    .wae-btn-count{ margin-left:4px; font-size:11px; font-weight:600; line-height:1; }
     .wae-mark-row{ border:1px solid var(--wfmm-border, #e5e7eb); border-radius:6px; padding:6px 8px; margin-bottom:6px; min-width:0; max-width:100%; box-sizing:border-box; }
     .wae-mark-row-main{ display:flex; align-items:center; gap:8px; cursor:pointer; min-width:0; }
     .wae-mark-row-main:hover .wae-mark-row-name{ text-decoration:underline; }
@@ -4593,12 +4666,18 @@
       border:1px solid #c7d2fe; border-radius:5px; cursor:pointer;
     }
     .wae-review-copy-btn:hover{ background:#e0e7ff; }
-    .wae-review-form-link{ flex:0 0 auto; font-size:12px; white-space:nowrap; }
-    .wae-review-fill-btn{
-      flex:0 0 auto; font-size:12px; white-space:nowrap; padding:4px 8px; color:#154aab;
-      background:#eef2ff; border:1px solid #c7d2fe; border-radius:5px; cursor:pointer;
+    /* v1.76.0/1.77.0: the review row's buttons and the side panel's add
+       button are all icons now and share one look. */
+    .wae-review-form-link,
+    .wae-review-fill-btn,
+    .wae-detail-mark-btn.wae-icon-btn{
+      flex:0 0 auto; display:inline-flex; align-items:center; justify-content:center;
+      padding:4px 6px; color:#154aab; background:#eef2ff; text-decoration:none;
+      border:1px solid #c7d2fe; border-radius:5px; cursor:pointer;
     }
-    .wae-review-fill-btn:hover{ background:#e0e7ff; }
+    .wae-review-form-link:hover,
+    .wae-review-fill-btn:hover,
+    .wae-detail-mark-btn.wae-icon-btn:not(:disabled):hover{ background:#e0e7ff; }
     .wae-review-copy-btn.wae-copied{ color:#16a34a; background:#f0fdf4; border-color:#bbf7d0; }
     /* Note field + button inside a review map info window (see
        waeReviewIwSyncNow()). Stacked and sized to line up with the
@@ -6380,23 +6459,29 @@
     // entries actually get copied FROM before going to file the report,
     // not the extracted-ticket table elsewhere in this plugin, which is
     // about reports already filed rather than about to be.
+    const copyTitle = 'Copy all Wayspots (name, coordinates and notes) to the clipboard';
+    const fillTitle = 'Auto-fill the abuse form from this list (opens a new tab)';
+    const copyAllBtn = waeIconButton(ui, { icon: WAE_COPY_ICON_SVG, title: copyTitle, disabled: true });
+    // v1.70.0: opens the Help Center abuse form and fills its location
+    // field with the same text Copy All would copy -- see
+    // waeOpenAbuseFormAutofill().
+    const fillFormBtn = waeIconButton(ui, { icon: WAE_WAND_ICON_SVG, title: fillTitle, disabled: true });
+    // v1.78.0: the quick link to Niantic's \"Reporting Abuse in Wayfarer\"
+    // article (where the entries get copied TO) is an icon button in the
+    // row too now, instead of a line of text above it.
     const formLinkEl = ui.createElement('a', {
-      className: 'wae-mark-form-link',
-      text: 'Report abuse via Wayfarer Help Center \u2197',
+      className: 'wfmm-btn wae-list-icon-btn',
+      html: WAE_FILE_ALERT_ICON_SVG,
       attrs: {
         href: WAE_ABUSE_FORM_URL,
         target: '_blank',
         rel: 'noopener noreferrer',
+        title: 'Open the abuse form (Help Center article, new tab)',
+        'aria-label': 'Open the abuse form (Help Center article, new tab)',
       },
     });
-    const copyAllBtn = ui.button({ text: 'Copy All', disabled: true });
-    // v1.70.0: opens the Help Center abuse form and fills its location
-    // field with the same text Copy All would copy -- see
-    // waeOpenAbuseFormAutofill().
-    const fillFormBtn = ui.button({ text: 'Auto-fill abuse form', disabled: true });
-    fillFormBtn.title = 'Opens the abuse form in a new tab and fills in the location field from this list';
-    const clearAllBtn = ui.button({ text: 'Clear All', variant: 'danger', disabled: true });
-    const buttonRow = ui.buttonRow([copyAllBtn, fillFormBtn, clearAllBtn]);
+    const clearAllBtn = waeIconButton(ui, { icon: WAE_TRASH_ICON_SVG, title: 'Clear the whole list', variant: 'danger', disabled: true });
+    const buttonRow = ui.buttonRow([copyAllBtn, fillFormBtn, formLinkEl, clearAllBtn]);
     const copyNotesToggle = ui.checkboxRow({
       label: 'Include notes when copying',
       checked: waeCopyIncludesNotes(),
@@ -6426,15 +6511,14 @@
       const list = waeLoadMarkedWayspots();
       if (!list.length) return;
       const ok = await waeCopyToClipboard(list.map((item) => waeFormatMarkedWayspotLine(item, waeCopyIncludesNotes())).join('\n'));
-      copyAllBtn.textContent = ok ? 'Copied!' : 'Copy failed';
-      setTimeout(() => { copyAllBtn.textContent = 'Copy All'; }, 1500);
+      waeFlashButton(copyAllBtn, ok ? WAE_CHECK_ICON_SVG : WAE_X_ICON_SVG, ok ? 'Copied' : 'Copy failed', WAE_COPY_ICON_SVG, copyTitle);
     });
 
     fillFormBtn.addEventListener('click', () => {
       const result = waeOpenAbuseFormAutofill();
       if (result === 'empty') return;
-      fillFormBtn.textContent = result === 'opened' ? 'Opened!' : 'Popup blocked';
-      setTimeout(() => { fillFormBtn.textContent = 'Auto-fill abuse form'; }, 1500);
+      const opened = result === 'opened';
+      waeFlashButton(fillFormBtn, opened ? WAE_CHECK_ICON_SVG : WAE_X_ICON_SVG, opened ? 'Opened' : 'Popup blocked', WAE_WAND_ICON_SVG, fillTitle);
     });
 
     clearAllBtn.addEventListener('click', () => {
@@ -6445,7 +6529,7 @@
       render();
     });
 
-    body.append(formLinkEl, buttonRow, copyNotesToggle.row, listContainer);
+    body.append(buttonRow, copyNotesToggle.row, listContainer);
     render();
     waeMarkListRenderHook = render;
 
@@ -6556,7 +6640,9 @@
       className: 'wae-sub',
       text: 'No favorite users yet -- click a username in the Wayfarer side panel to add one.',
     });
-    const copyAllBtn = ui.button({ text: 'Copy All', disabled: true });
+    const copyUsersTitle = 'Copy all usernames to the clipboard';
+    const copySelectedTitle = 'Copy the ticked usernames to the clipboard';
+    const copyAllBtn = waeIconButton(ui, { icon: WAE_COPY_ICON_SVG, title: copyUsersTitle, disabled: true });
     // Feature request: copy just the usernames of a subset of this list,
     // with neither the "\u00d7" remove control (never text to begin
     // with, so nothing special needed there) nor any entry's note --
@@ -6566,9 +6652,20 @@
     // Selection state lives in this closure (see waeBuildFavoriteUserRow()'s
     // own comment on selectedKeys) -- cleared on Clear All/modal reopen,
     // not persisted.
-    const copySelectedBtn = ui.button({ text: 'Copy Selected', disabled: true });
-    const clearAllBtn = ui.button({ text: 'Clear All', variant: 'danger', disabled: true });
+    const copySelectedBtn = waeIconButton(ui, { icon: WAE_CLIPBOARD_CHECK_ICON_SVG, title: copySelectedTitle, disabled: true });
+    const clearAllBtn = waeIconButton(ui, { icon: WAE_TRASH_ICON_SVG, title: 'Clear the whole favorite-users list', variant: 'danger', disabled: true });
     const selectedKeys = new Set();
+    // The Copy selected button shows how many usernames are ticked: a small
+    // number beside the icon, and the same count in the tooltip.
+    const selectedIcon = () => WAE_CLIPBOARD_CHECK_ICON_SVG + (selectedKeys.size ? `<span class="wae-btn-count">${selectedKeys.size}</span>` : '');
+    const selectedTitle = () => (selectedKeys.size
+      ? `Copy the ${selectedKeys.size} ticked username${selectedKeys.size === 1 ? '' : 's'} to the clipboard`
+      : copySelectedTitle);
+    const syncSelectedBtn = () => {
+      copySelectedBtn.innerHTML = selectedIcon();
+      copySelectedBtn.title = selectedTitle();
+      copySelectedBtn.setAttribute('aria-label', selectedTitle());
+    };
 
     function render() {
       listContainer.innerHTML = '';
@@ -6582,7 +6679,7 @@
       copyAllBtn.disabled = !list.length;
       clearAllBtn.disabled = !list.length;
       copySelectedBtn.disabled = !selectedKeys.size;
-      copySelectedBtn.textContent = selectedKeys.size ? `Copy Selected (${selectedKeys.size})` : 'Copy Selected';
+      syncSelectedBtn();
 
       if (!list.length) {
         listContainer.append(emptyEl);
@@ -6598,23 +6695,21 @@
       }
     }
 
-    async function copyUsernames(usernames, btn, defaultLabel) {
+    async function copyUsernames(usernames, btn, defaultIcon, defaultTitle) {
       if (!usernames.length) return;
       const ok = await waeCopyToClipboard(usernames.join('\n'));
-      btn.textContent = ok ? 'Copied!' : 'Copy failed';
-      setTimeout(() => { btn.textContent = defaultLabel; }, 1500);
+      waeFlashButton(btn, ok ? WAE_CHECK_ICON_SVG : WAE_X_ICON_SVG, ok ? 'Copied' : 'Copy failed', defaultIcon, defaultTitle);
     }
 
     copyAllBtn.addEventListener('click', () => {
-      copyUsernames(waeLoadFavoriteUsers().map((u) => u.username), copyAllBtn, 'Copy All');
+      copyUsernames(waeLoadFavoriteUsers().map((u) => u.username), copyAllBtn, WAE_COPY_ICON_SVG, copyUsersTitle);
     });
 
     copySelectedBtn.addEventListener('click', () => {
-      const label = copySelectedBtn.textContent;
       const usernames = waeLoadFavoriteUsers()
         .map((u) => u.username)
         .filter((name) => selectedKeys.has(waeFavoriteUserKey(name)));
-      copyUsernames(usernames, copySelectedBtn, label);
+      copyUsernames(usernames, copySelectedBtn, selectedIcon, selectedTitle);
     });
 
     clearAllBtn.addEventListener('click', () => {
