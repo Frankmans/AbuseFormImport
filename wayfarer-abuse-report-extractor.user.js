@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.80.0
+// @version      1.81.2
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV. Can also auto-fill the Help Center abuse form from the Marked Wayspots list.
 // @author       Frankmans
 // @grant        none
@@ -57,6 +57,22 @@
   const WAE_AF_PROTOCOL = 1;
   const WAE_AF_MSG_REQUEST = 'wae-abuse-form:request-data';
   const WAE_AF_MSG_DATA = 'wae-abuse-form:report-data';
+  const WAE_AF_MSG_SUBMITTED = 'wae-abuse-form:submitted';
+  // v1.81.0 (setting "After submitting", off by default): the Help Center
+  // tab watches for the click on Submit and, once the form is really gone
+  // (a rejected click -- a required field missing -- leaves it standing),
+  // tells the Wayfarer tab, closes itself WAE_AF_CLOSE_DELAY_MS later, and
+  // the Wayfarer tab asks whether to clear the draft list.
+  const WAE_AF_CLOSE_DELAY_MS = 1500;
+  const WAE_AF_SUBMIT_POLL_MS = 300;
+  const WAE_AF_SUBMIT_VERIFY_MS = 20000;  // how long after a Submit click the outcome is watched
+  const WAE_AF_SUBMIT_GONE_POLLS = 2;     // the form must stay gone this many polls in a row
+  const WAE_AF_SUBMIT_LABELS = ['Submit', 'Submit request', 'Submit report', 'Send'];
+  // What the page says once the report is in: the first phrase is the Help
+  // Center's own confirmation ("You will receive a response via email at
+  // ..."). Deliberately specific -- a generic "thank you" also sits in the
+  // page's "We're evolving to Scopely Explore" banner.
+  const WAE_AF_CONFIRMATION_RE = /you will receive a response via email|has been (?:submitted|created|received)|(?:we(?:'|\u2019)ve|we have) received your/i;
   const WAE_AF_HASH_SESSION = 'waeAbuseSession';
   const WAE_AF_HASH_ORIGIN = 'waeAbuseOrigin';
   // Kept in sessionStorage as well as the URL hash: if the Help Center
@@ -617,7 +633,8 @@
         let head = done2.length ? `Abuse auto-fill: filled in ${done2.join(', ')}.` : 'Abuse auto-fill: nothing needed filling in.';
         if (!locFilled) head += ' The location field already had text, so it was left as it was.';
         const tail = todo.length ? ` Still yours: ${todo.join(', ')}.` : '';
-        waeAfShowStatus(`${head}${tail} Check everything and submit.`, todo.length ? 'info' : 'ok');
+        const watching = payload.watchSubmit ? ' This tab closes by itself once the report is submitted.' : '';
+        waeAfShowStatus(`${head}${tail} Check everything and submit.${watching}`, todo.length ? 'info' : 'ok');
         await waeAfScrollToSubmit();
         return;
       }
@@ -645,6 +662,94 @@
       : 'Abuse auto-fill: could not find the form (or the "Report an abuse" button). Use "Copy All" in the Marked Wayspots list instead.', 'error');
   }
 
+  // ---- submit watcher ------------------------------------------------
+  // A click counts as the person pressing Submit when it lands on a
+  // submit-type control or a button/link labelled like one (the click's
+  // composedPath() is used, so a click on the text inside a shadow-DOM
+  // button is seen too).
+  function waeAfIsSubmitClick(ev) {
+    const labels = WAE_AF_SUBMIT_LABELS.map(waeAfNorm);
+    for (const el of (ev.composedPath ? ev.composedPath() : [])) {
+      if (!el || el.nodeType !== 1 || !el.matches) continue;
+      if (el.matches('button[type="submit"], input[type="submit"]')) return true;
+      if (el.matches('button, [role="button"], a') && (el.textContent || '').length < 40 && labels.includes(waeAfNorm(el.textContent))) return true;
+    }
+    return false;
+  }
+
+  // All the page's text, shadow roots included (innerText stops at them).
+  function waeAfPageText() {
+    let text = document.body ? document.body.textContent || '' : '';
+    for (const el of waeAfDeepAll('*')) if (el.shadowRoot) text += ` ${el.shadowRoot.textContent || ''}`;
+    return text;
+  }
+
+  function waeAfOnSubmitted(session, reason) {
+    console.info('[Wayfarer Map Mods - Abuse Reports] Abuse report submitted (' + reason + '); closing this tab.');
+    waeAfClearSession();
+    try {
+      window.opener?.postMessage({ type: WAE_AF_MSG_SUBMITTED, protocolVersion: WAE_AF_PROTOCOL, sessionId: session.id }, session.origin);
+    } catch (e) { /* the Wayfarer tab is gone -- closing still goes ahead */ }
+    waeAfShowStatus('Abuse auto-fill: report submitted. Closing this tab\u2026', 'ok');
+    setTimeout(() => {
+      try { window.close(); } catch (e) { /* ignore */ }
+      // a browser may refuse to close a tab it doesn't consider script-opened
+      setTimeout(() => {
+        if (!window.closed) waeAfShowStatus('Abuse auto-fill: report submitted. You can close this tab now.', 'ok');
+      }, 500);
+    }, WAE_AF_CLOSE_DELAY_MS);
+  }
+
+  // Two independent ways to notice a submitted report, either one enough:
+  //  1. the page starts showing the Help Center's confirmation text after
+  //     the report form had been on screen -- needs no knowledge of what the
+  //     Submit button is called (v1.81.0 only had way 2, and a button
+  //     label it didn't know meant it never noticed anything);
+  //  2. a click on Submit after which the form stays gone.
+  function waeAfWatchSubmit(session) {
+    let done = false;
+    let verifying = false;
+    let sawForm = !!waeAfFindField(WAE_AF_LOCATION_LABELS);
+    const confirmationBefore = WAE_AF_CONFIRMATION_RE.test(waeAfPageText());
+    console.info('[Wayfarer Map Mods - Abuse Reports] Watching for the abuse form being submitted (the tab will close afterwards).');
+    const finish = (reason) => {
+      if (done) return;
+      done = true;
+      clearInterval(standing);
+      waeAfOnSubmitted(session, reason);
+    };
+    // way 1
+    const standing = setInterval(() => {
+      if (done) return;
+      if (waeAfFindField(WAE_AF_LOCATION_LABELS)) { sawForm = true; return; }
+      if (sawForm && !confirmationBefore && WAE_AF_CONFIRMATION_RE.test(waeAfPageText())) finish('confirmation text');
+    }, 500);
+    // way 2 -- capture phase: runs before the page's own handler, so the
+    // form is still on the page when this looks.
+    document.addEventListener('click', (ev) => {
+      if (done || verifying || !waeAfIsSubmitClick(ev)) return;
+      // only the report step has the location field; a "Submit"-looking
+      // click anywhere else (the name/email step's button) is not it
+      if (!waeAfFindField(WAE_AF_LOCATION_LABELS)) return;
+      console.info('[Wayfarer Map Mods - Abuse Reports] Submit clicked; checking that the form goes through.');
+      verifying = true;
+      const startedAt = Date.now();
+      let gone = 0;
+      const timer = setInterval(() => {
+        if (done) { clearInterval(timer); return; }
+        gone = waeAfFindField(WAE_AF_LOCATION_LABELS) ? 0 : gone + 1;
+        if (gone >= WAE_AF_SUBMIT_GONE_POLLS) { clearInterval(timer); finish('the form closed'); return; }
+        if (!confirmationBefore && WAE_AF_CONFIRMATION_RE.test(waeAfPageText())) { clearInterval(timer); finish('confirmation text'); return; }
+        if (Date.now() - startedAt > WAE_AF_SUBMIT_VERIFY_MS) {
+          // still standing: the click was rejected (a required field, say) -- wait for the next one
+          console.info('[Wayfarer Map Mods - Abuse Reports] The form is still there after Submit; waiting for the next click.');
+          clearInterval(timer);
+          verifying = false;
+        }
+      }, WAE_AF_SUBMIT_POLL_MS);
+    }, true);
+  }
+
   function waeAfStartHelpshiftCompanion() {
     const session = waeAfReadSession();
     if (!session) return;
@@ -661,6 +766,7 @@
       if (gotData) return;
       gotData = true;
       clearInterval(retryTimer);
+      if (data.payload && data.payload.watchSubmit) waeAfWatchSubmit(session);
       waeAfFill(data.payload).catch((e) => {
         console.warn('[Wayfarer Map Mods - Abuse Reports] Abuse form auto-fill failed:', e);
         waeAfShowStatus('Abuse auto-fill failed -- see the console. Use "Copy All" in the Marked Wayspots list instead.', 'error');
@@ -1402,6 +1508,9 @@
     reporterIssueType: 'Fake Nominations or criteria issues',
     reporterReportDetails: '',
     reporterAbuser: '',
+    // v1.81.0: close the Help Center tab after the form is submitted and
+    // offer to clear the draft list. Off unless switched on.
+    afterSubmitCleanup: false,
   });
   // Set once at startPlugin() (WFMM.markerAppearance.registerStyle()'s
   // return value) and called at stopPlugin() -- registerStyle() throws
@@ -3861,9 +3970,21 @@
         });
       }
 
-      const coordsEl = slot.querySelector('.wfmapmods-detail-coords');
-      const lat = Number(coordsEl?.dataset.lat);
-      const lng = Number(coordsEl?.dataset.lng);
+      // v1.81.2: Map Mods 4.9.0 turned .wfmapmods-detail-coords into a
+      // CONTAINER of .wfmapmods-detail-coords-row children (one per
+      // coordinate: a struck-through "previous" row when the Wayspot was
+      // recently moved, then the "current" one), and moved data-lat/
+      // data-lng from the container onto those rows. Reading them off the
+      // container gave NaN, so this watcher returned right here and the
+      // ticket line + note field + add-to-draft button never showed up.
+      // The current row is the one that matters; the container itself is
+      // still tried as a fallback for the older flat markup.
+      const coordsEl = slot.querySelector('.wfmapmods-detail-coords-row--current')
+        || slot.querySelector('.wfmapmods-detail-coords-row:last-child')
+        || slot.querySelector('.wfmapmods-detail-coords');
+      const readCoord = (v) => (v === undefined || v === null || String(v).trim() === '' ? NaN : Number(v));
+      const lat = readCoord(coordsEl?.dataset.lat);
+      const lng = readCoord(coordsEl?.dataset.lng);
       if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
 
       const statusRow = slot.querySelector('.wfmapmods-detail-status');
@@ -4540,6 +4661,9 @@
     .wae-mark-row{ border:1px solid var(--wfmm-border, #e5e7eb); border-radius:6px; padding:6px 8px; margin-bottom:6px; min-width:0; max-width:100%; box-sizing:border-box; }
     .wae-mark-row-main{ display:flex; align-items:center; gap:8px; cursor:pointer; min-width:0; }
     .wae-mark-row-checkbox{ flex-shrink:0; margin:0; cursor:pointer; }
+    .wae-clear-prompt{ display:flex; align-items:center; flex-wrap:wrap; gap:8px; padding:8px; margin-bottom:8px; font-size:12px; border:1px solid #fcd34d; background:#fffbeb; color:#78350f; border-radius:6px; }
+    .wae-clear-prompt[hidden]{ display:none; }
+    .wae-clear-prompt-text{ flex:1 1 200px; min-width:0; }
     .wae-mark-row-main:hover .wae-mark-row-name{ text-decoration:underline; }
     .wae-mark-row-name{ font-weight:600; font-size:12px; flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .wae-mark-row-coord{ font-size:11px; color:var(--wfmm-muted-text, #667085); flex-shrink:0; white-space:nowrap; }
@@ -6283,7 +6407,13 @@
   // copying" choice, as Copy All -- that is what the form's location
   // parser (opr-email-lib.js) reads back out of the ticket email later.
   // ---------------------------------------------------------------------
-  const waeAbuseFormSessions = new Map(); // sessionId -> { popup, expiresAt }
+  const waeAbuseFormSessions = new Map(); // sessionId -> { popup, getSource, kind, itemIds, createdAt, expiresAt, submitted }
+  // v1.81.0: the "clear the draft list?" question after a submitted form.
+  // waeShowClearPromptHook is set by the open list modal (shows the question
+  // in it); when the modal isn't open the ids wait in waePendingClear and
+  // the modal, opened for the purpose, picks them up when it builds.
+  let waeShowClearPromptHook = null;
+  let waePendingClear = null;
   const WAE_DEFAULT_ISSUE_TYPE = 'Fake Nominations or criteria issues';
   // The options of the form's "What issue are you reporting?" dropdown,
   // as the form lists them (offered in the settings cog's Issue type menu).
@@ -6300,6 +6430,7 @@
     return {
       name: String(s.get(PLUGIN_ID, 'reporterName', '') || '').trim(),
       email: String(s.get(PLUGIN_ID, 'reporterEmail', '') || '').trim(),
+      afterSubmit: s.get(PLUGIN_ID, 'afterSubmitCleanup', false) === true,
       issueType: String(s.get(PLUGIN_ID, 'reporterIssueType', WAE_DEFAULT_ISSUE_TYPE) || '').trim(),
       reportDetails: String(s.get(PLUGIN_ID, 'reporterReportDetails', '') || '').trim(),
       abuser: String(s.get(PLUGIN_ID, 'reporterAbuser', '') || '').trim(),
@@ -6310,16 +6441,14 @@
   // -- what to put in the form's location field INSTEAD of the Marked
   // Wayspots list. The review page's "Auto-fill abuse form" button uses it
   // to send just the open review's Wayspot with the note typed beside it.
-  function waeBuildAbuseFormPayload(getSource) {
-    const source = getSource
-      ? getSource()
-      : { items: waeLoadMarkedWayspots(), includeNotes: waeCopyIncludesNotes() };
+  function waeBuildAbuseFormPayload(source) {
     const list = source.items;
     const includeNotes = source.includeNotes;
     const contact = waeGetReporterContact();
     return {
       name: contact.name,
       email: contact.email,
+      watchSubmit: contact.afterSubmit,
       issueType: contact.issueType,
       reportDetails: contact.reportDetails,
       abuser: contact.abuser,
@@ -6345,23 +6474,55 @@
     const popup = window.open(url.toString(), '_blank');
     if (!popup) return 'blocked';
     const now = Date.now();
-    for (const [id, s] of waeAbuseFormSessions) if (s.expiresAt <= now) waeAbuseFormSessions.delete(id);
-    waeAbuseFormSessions.set(sessionId, { popup, getSource, expiresAt: now + WAE_AF_SESSION_TTL_MS });
+    // sessions linger for hours, not the 15 minutes the data request is good
+    // for: the "submitted" message can come long after the form was opened
+    for (const [id, s] of waeAbuseFormSessions) if (now - s.createdAt > 3 * 60 * 60 * 1000) waeAbuseFormSessions.delete(id);
+    waeAbuseFormSessions.set(sessionId, {
+      popup,
+      getSource,
+      kind: getSource ? 'review' : 'list', // the review page's button sends one Wayspot, not the draft list
+      itemIds: [],
+      createdAt: now,
+      expiresAt: now + WAE_AF_SESSION_TTL_MS,
+      submitted: false,
+    });
     return 'opened';
   }
 
   function waeHandleAbuseFormMessage(event) {
     if (event.origin !== WAE_HS_ORIGIN) return;
     const data = event.data;
-    if (!data || data.type !== WAE_AF_MSG_REQUEST || data.protocolVersion !== WAE_AF_PROTOCOL) return;
+    if (!data || data.protocolVersion !== WAE_AF_PROTOCOL) return;
     const session = waeAbuseFormSessions.get(data.sessionId);
-    if (!session || session.expiresAt <= Date.now() || event.source !== session.popup) return;
-    session.popup.postMessage({
-      type: WAE_AF_MSG_DATA,
-      protocolVersion: WAE_AF_PROTOCOL,
-      sessionId: data.sessionId,
-      payload: waeBuildAbuseFormPayload(session.getSource),
-    }, WAE_HS_ORIGIN);
+    if (!session || event.source !== session.popup) return;
+
+    if (data.type === WAE_AF_MSG_REQUEST) {
+      if (session.expiresAt <= Date.now()) return;
+      const source = session.getSource
+        ? session.getSource()
+        : { items: waeLoadMarkedWayspots(), includeNotes: waeCopyIncludesNotes() };
+      if (!session.getSource) session.itemIds = source.items.map((item) => item.id);
+      session.popup.postMessage({
+        type: WAE_AF_MSG_DATA,
+        protocolVersion: WAE_AF_PROTOCOL,
+        sessionId: data.sessionId,
+        payload: waeBuildAbuseFormPayload(source),
+      }, WAE_HS_ORIGIN);
+      return;
+    }
+
+    // The Help Center tab saw the form get submitted (only ever sent when
+    // the "After submitting" setting is on). For a session that sent the
+    // whole draft list, ask whether to clear the Wayspots that were in it;
+    // the review page's single-Wayspot button has no list to clear.
+    if (data.type === WAE_AF_MSG_SUBMITTED) {
+      if (session.submitted) return;
+      session.submitted = true;
+      if (session.kind !== 'list' || !session.itemIds.length) return;
+      const ids = session.itemIds.slice();
+      if (waeShowClearPromptHook) waeShowClearPromptHook(ids);
+      else { waePendingClear = { ids }; waeOpenMarkedWayspotListModal(); }
+    }
   }
 
   function waeFormatMarkedWayspotLine(item, includeNotes = true) {
@@ -6485,6 +6646,35 @@
       className: 'wae-sub wae-draft-hint',
       text: 'This is your abuse report draft: the Wayspots you marked to report. It is only saved in this browser and nothing is sent from here. Copy it, or auto-fill the abuse form with it, then check the form and submit it yourself.',
     });
+    // v1.81.0: after a submitted abuse form (setting "After submitting"):
+    // asks whether to clear the Wayspots that were just sent. Hidden until
+    // waeShowClearPromptHook() fires. Only the Wayspots that were in the form
+    // are cleared -- anything marked since stays.
+    const clearPrompt = ui.createElement('div', { className: 'wae-clear-prompt' });
+    clearPrompt.hidden = true;
+    const clearPromptText = ui.createElement('span', { className: 'wae-clear-prompt-text', text: '' });
+    const clearPromptYes = ui.button({ text: 'Clear them', variant: 'danger' });
+    const clearPromptNo = ui.button({ text: 'Keep them' });
+    clearPrompt.append(clearPromptText, clearPromptYes, clearPromptNo);
+    let promptIds = [];
+    function showClearPrompt(ids) {
+      const live = new Set(waeLoadMarkedWayspots().map((item) => item.id));
+      promptIds = ids.filter((id) => live.has(id));
+      if (!promptIds.length) return; // already gone from the list
+      const n = promptIds.length;
+      clearPromptText.textContent = `The abuse form was submitted. Clear the ${n} Wayspot${n === 1 ? '' : 's'} that ${n === 1 ? 'was' : 'were'} in it from your abuse report draft?`;
+      clearPrompt.hidden = false;
+    }
+    clearPromptYes.addEventListener('click', () => {
+      const gone = new Set(promptIds);
+      waeSaveMarkedWayspots(waeLoadMarkedWayspots().filter((item) => !gone.has(item.id)));
+      waeRenderMarkedWayspotMarkers();
+      promptIds = [];
+      clearPrompt.hidden = true;
+      render();
+    });
+    clearPromptNo.addEventListener('click', () => { promptIds = []; clearPrompt.hidden = true; });
+
     // Feature request: a quick link to Niantic's own "Reporting Abuse in
     // Wayfarer" Help Center article right on this list -- where the
     // entries actually get copied FROM before going to file the report,
@@ -6601,9 +6791,15 @@
       render();
     });
 
-    body.append(draftHint, buttonRow, copyNotesToggle.row, listContainer);
+    body.append(clearPrompt, draftHint, buttonRow, copyNotesToggle.row, listContainer);
     render();
     waeMarkListRenderHook = render;
+    waeShowClearPromptHook = showClearPrompt;
+    if (waePendingClear) { // the modal was opened FOR a submitted form (see waeHandleAbuseFormMessage())
+      const pending = waePendingClear;
+      waePendingClear = null;
+      showClearPrompt(pending.ids);
+    }
 
     // Feature request: Favorite Users, in this same modal (see that
     // feature's own top-of-section comment, search "Favorite Users list"
@@ -6818,6 +7014,7 @@
       onClose() {
         waeMarkListController = null;
         waeMarkListRenderHook = null;
+        waeShowClearPromptHook = null;
         waeFavoriteUsersRenderHook = null;
       },
     });
@@ -7083,15 +7280,21 @@
       rows: 2,
       onInput: (v) => wfmmWindow.WFMM.settings.set(PLUGIN_ID, 'reporterAbuser', v.trim()),
     });
+    const afterSubmitToggle = ui.checkboxRow({
+      label: 'After the form is submitted: close its tab and offer to clear the draft list',
+      checked: contact.afterSubmit,
+      onChange: (checked) => wfmmWindow.WFMM.settings.set(PLUGIN_ID, 'afterSubmitCleanup', checked === true),
+    });
     const autofillSection = ui.section({
       title: 'Abuse form auto-fill',
-      hint: 'Entered in the Help Center abuse form by the \u201cAuto-fill abuse form\u201d button in the Marked Wayspots list, next to the list of Wayspots itself. Leave a field empty to fill it in yourself; fields that already have text are never overwritten. Saved with this plugin\u2019s settings, so it is included in WFMM\u2019s settings backups.',
+      hint: 'Entered in the Help Center abuse form by the \u201cAuto-fill abuse form\u201d button in the Marked Wayspots list, next to the list of Wayspots itself. Leave a field empty to fill it in yourself; fields that already have text are never overwritten. The last option (off by default) watches for your click on Submit: once the form has gone, the tab closes after 1.5 seconds and the draft list asks whether to clear the Wayspots that were sent. Saved with this plugin\u2019s settings, so it is included in WFMM\u2019s settings backups.',
       children: [
         ui.fieldRow({ label: 'Name', input: reporterNameInput }),
         ui.fieldRow({ label: 'Email', input: reporterEmailInput }),
         ui.fieldRow({ label: 'Issue type', input: reporterIssueInput }),
         ui.fieldRow({ label: 'Report details', input: reporterDetailsInput }),
         ui.fieldRow({ label: 'Abuser(s)', input: reporterAbuserInput }),
+        afterSubmitToggle.row,
       ],
     });
     body.append(styleSection, autofillSection);
