@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.78.0
+// @version      1.80.0
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV. Can also auto-fill the Help Center abuse form from the Marked Wayspots list.
 // @author       Frankmans
 // @grant        none
@@ -3309,7 +3309,8 @@
       }, 1500);
     });
 
-    row.append(copyBtn, noteInput, markBtn, fillBtn, formLink);
+    // v1.79.1: the note field first, then all four icon buttons to its right
+    row.append(noteInput, copyBtn, markBtn, fillBtn, formLink);
     return row;
   }
 
@@ -4538,6 +4539,7 @@
     .wae-btn-count{ margin-left:4px; font-size:11px; font-weight:600; line-height:1; }
     .wae-mark-row{ border:1px solid var(--wfmm-border, #e5e7eb); border-radius:6px; padding:6px 8px; margin-bottom:6px; min-width:0; max-width:100%; box-sizing:border-box; }
     .wae-mark-row-main{ display:flex; align-items:center; gap:8px; cursor:pointer; min-width:0; }
+    .wae-mark-row-checkbox{ flex-shrink:0; margin:0; cursor:pointer; }
     .wae-mark-row-main:hover .wae-mark-row-name{ text-decoration:underline; }
     .wae-mark-row-name{ font-weight:600; font-size:12px; flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .wae-mark-row-coord{ font-size:11px; color:var(--wfmm-muted-text, #667085); flex-shrink:0; white-space:nowrap; }
@@ -4658,8 +4660,10 @@
     /* Review-page row (copy icon + note + add button) -- see
        waeBuildReviewAbuseRow(). Reuses the side panel's note/button
        styles above; only the row layout and the copy icon are new. */
-    .wae-review-abuse-row{ display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin:4px 0; }
-    .wae-review-abuse-row .wae-detail-mark-note{ flex:0 1 260px; }
+    /* v1.79.1: one row, never wrapped: the note field takes all the width
+       the four icon buttons to its right leave over (it shrinks, they don't). */
+    .wae-review-abuse-row{ display:flex; align-items:center; gap:6px; flex-wrap:nowrap; width:100%; box-sizing:border-box; margin:4px 0; }
+    .wae-review-abuse-row .wae-detail-mark-note{ flex:1 1 0; min-width:0; }
     .wae-review-copy-btn{
       flex:0 0 auto; display:inline-flex; align-items:center; justify-content:center;
       padding:4px 6px; color:#154aab; background:#eef2ff;
@@ -6384,7 +6388,13 @@
   // alone is unreliable here since not every element that can be clicked
   // is itself focusable, and this needs to catch literally any outside
   // click, not just a focus change.
-  function waeBuildMarkedWayspotRow(item, ui, onDelete) {
+  // `selection` (optional) = { ids: Set of item ids, onChange: () => void }
+  // -- when given, the row starts with a tick box feeding the list's Copy
+  // selected button (see waeRenderMarkedWayspotListSection()), like the
+  // Favorite Users rows' own. The selection lives in that section's
+  // closure, not on the stored entry: it is a this-modal-session thing,
+  // not something to persist.
+  function waeBuildMarkedWayspotRow(item, ui, onDelete, selection) {
     const row = ui.createElement('div', { className: 'wae-mark-row' });
     const mainLine = ui.createElement('div', {
       className: 'wae-mark-row-main',
@@ -6393,6 +6403,22 @@
     const nameEl = ui.createElement('span', { className: 'wae-mark-row-name', text: item.name || '(unnamed)' });
     const coordEl = ui.createElement('span', { className: 'wae-mark-row-coord', text: `${Number(item.lat).toFixed(6)}, ${Number(item.lng).toFixed(6)}` });
     const deleteBtn = ui.createElement('button', { className: 'wae-mark-row-delete', text: '\u00d7', attrs: { type: 'button', title: 'Remove from list' } });
+    if (selection) {
+      const checkbox = ui.createElement('input', {
+        className: 'wae-mark-row-checkbox',
+        attrs: { type: 'checkbox', title: 'Select for Copy selected', 'aria-label': 'Select for Copy selected' },
+      });
+      checkbox.checked = selection.ids.has(item.id);
+      // Ticking must not also count as clicking the row (which pans the
+      // map to this Wayspot -- see the mainLine click handler below).
+      checkbox.addEventListener('click', (ev) => ev.stopPropagation());
+      checkbox.addEventListener('change', () => {
+        if (checkbox.checked) selection.ids.add(item.id);
+        else selection.ids.delete(item.id);
+        selection.onChange();
+      });
+      mainLine.append(checkbox);
+    }
     mainLine.append(nameEl, coordEl, deleteBtn);
 
     // Feature request: clicking the row (name/coords line, same as the
@@ -6452,7 +6478,12 @@
     const listContainer = ui.createElement('div', { className: 'wae-mark-list' });
     const emptyEl = ui.createElement('div', {
       className: 'wae-sub',
-      text: 'No wayspots marked yet -- use the + button on the main panel, then click a Wayspot on the map.',
+      text: 'Your abuse report draft is empty -- use the + button on the main panel, then click a Wayspot on the map.',
+    });
+    // v1.80.0: says what this list IS: the draft of the next abuse report.
+    const draftHint = ui.createElement('div', {
+      className: 'wae-sub wae-draft-hint',
+      text: 'This is your abuse report draft: the Wayspots you marked to report. It is only saved in this browser and nothing is sent from here. Copy it, or auto-fill the abuse form with it, then check the form and submit it yourself.',
     });
     // Feature request: a quick link to Niantic's own "Reporting Abuse in
     // Wayfarer" Help Center article right on this list -- where the
@@ -6480,8 +6511,34 @@
         'aria-label': 'Open the abuse form (Help Center article, new tab)',
       },
     });
-    const clearAllBtn = waeIconButton(ui, { icon: WAE_TRASH_ICON_SVG, title: 'Clear the whole list', variant: 'danger', disabled: true });
-    const buttonRow = ui.buttonRow([copyAllBtn, fillFormBtn, formLinkEl, clearAllBtn]);
+    const clearAllBtn = waeIconButton(ui, { icon: WAE_TRASH_ICON_SVG, title: 'Clear the whole draft list', variant: 'danger', disabled: true });
+    // v1.79.0: tick boxes on the rows + a Copy selected button, like the
+    // Favorite Users list's -- copies only the ticked Wayspots, in list
+    // order, in the same format as Copy All (so the "Include notes when
+    // copying" checkbox applies to both). The count shows beside the icon
+    // and in the tooltip.
+    const copySelectedTitle = 'Copy the ticked Wayspots (name, coordinates and notes) to the clipboard';
+    const copySelectedBtn = waeIconButton(ui, { icon: WAE_CLIPBOARD_CHECK_ICON_SVG, title: copySelectedTitle, disabled: true });
+    const selectedIds = new Set();
+    const selectedIcon = () => WAE_CLIPBOARD_CHECK_ICON_SVG + (selectedIds.size ? `<span class="wae-btn-count">${selectedIds.size}</span>` : '');
+    const selectedTitle = () => (selectedIds.size
+      ? `Copy the ${selectedIds.size} ticked Wayspot${selectedIds.size === 1 ? '' : 's'} (name, coordinates and notes) to the clipboard`
+      : copySelectedTitle);
+    const syncSelectedBtn = () => {
+      copySelectedBtn.disabled = !selectedIds.size;
+      copySelectedBtn.innerHTML = selectedIcon();
+      copySelectedBtn.title = selectedTitle();
+      copySelectedBtn.setAttribute('aria-label', selectedTitle());
+    };
+    // Forget ticks for entries no longer on the list (removed with the x,
+    // Clear All, or from the map while this modal is open), so a stale id
+    // can't inflate a later Copy selected count.
+    const pruneSelection = (list) => {
+      const live = new Set(list.map((item) => item.id));
+      for (const id of Array.from(selectedIds)) if (!live.has(id)) selectedIds.delete(id);
+    };
+    const selection = { ids: selectedIds, onChange: syncSelectedBtn };
+    const buttonRow = ui.buttonRow([copyAllBtn, copySelectedBtn, fillFormBtn, formLinkEl, clearAllBtn]);
     const copyNotesToggle = ui.checkboxRow({
       label: 'Include notes when copying',
       checked: waeCopyIncludesNotes(),
@@ -6491,9 +6548,11 @@
     function render() {
       listContainer.innerHTML = '';
       const list = waeLoadMarkedWayspots();
+      pruneSelection(list);
       copyAllBtn.disabled = !list.length;
       fillFormBtn.disabled = !list.length;
       clearAllBtn.disabled = !list.length;
+      syncSelectedBtn();
       if (!list.length) {
         listContainer.append(emptyEl);
         return;
@@ -6502,8 +6561,12 @@
         listContainer.append(waeBuildMarkedWayspotRow(item, ui, (rowEl) => {
           rowEl.remove();
           if (!waeLoadMarkedWayspots().length) render();
-          else { copyAllBtn.disabled = false; fillFormBtn.disabled = false; clearAllBtn.disabled = false; }
-        }));
+          else {
+            pruneSelection(waeLoadMarkedWayspots());
+            copyAllBtn.disabled = false; fillFormBtn.disabled = false; clearAllBtn.disabled = false;
+            syncSelectedBtn();
+          }
+        }, selection));
       }
     }
 
@@ -6512,6 +6575,15 @@
       if (!list.length) return;
       const ok = await waeCopyToClipboard(list.map((item) => waeFormatMarkedWayspotLine(item, waeCopyIncludesNotes())).join('\n'));
       waeFlashButton(copyAllBtn, ok ? WAE_CHECK_ICON_SVG : WAE_X_ICON_SVG, ok ? 'Copied' : 'Copy failed', WAE_COPY_ICON_SVG, copyTitle);
+    });
+
+    copySelectedBtn.addEventListener('click', async () => {
+      const lines = waeLoadMarkedWayspots()
+        .filter((item) => selectedIds.has(item.id))
+        .map((item) => waeFormatMarkedWayspotLine(item, waeCopyIncludesNotes()));
+      if (!lines.length) return;
+      const ok = await waeCopyToClipboard(lines.join('\n'));
+      waeFlashButton(copySelectedBtn, ok ? WAE_CHECK_ICON_SVG : WAE_X_ICON_SVG, ok ? 'Copied' : 'Copy failed', selectedIcon, selectedTitle);
     });
 
     fillFormBtn.addEventListener('click', () => {
@@ -6523,13 +6595,13 @@
 
     clearAllBtn.addEventListener('click', () => {
       if (!waeLoadMarkedWayspots().length) return;
-      if (!confirm('Clear the entire marked-wayspots list? This cannot be undone.')) return;
+      if (!confirm('Clear the entire abuse report draft (all marked Wayspots)? This cannot be undone.')) return;
       waeSaveMarkedWayspots([]);
       waeRenderMarkedWayspotMarkers();
       render();
     });
 
-    body.append(buttonRow, copyNotesToggle.row, listContainer);
+    body.append(draftHint, buttonRow, copyNotesToggle.row, listContainer);
     render();
     waeMarkListRenderHook = render;
 
@@ -6735,7 +6807,7 @@
     if (waeMarkListController) return; // already open
     waeMarkListController = wfmmWindow.WFMM.ui.openModal({
       id: 'wae-mark-list',
-      title: 'Abuse Reports - Marked Wayspots',
+      title: 'Abuse Report Draft - Marked Wayspots',
       className: 'wae-dialog',
       showFooterButtons: false,
       ownerPluginId: PLUGIN_ID,
