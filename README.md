@@ -1,11 +1,11 @@
 # Wayfarer Abuse Report Tools
 
-Two companion Tampermonkey userscripts that pull Niantic Support's "Reporting Abuse in Wayfarer" ticket emails out of Gmail (or `.eml` files) and extract a best-guess Wayspot name and coordinates from each one. The results end up in a searchable table that you can plot on the Wayfarer map or export as CSV.
+Two companion Tampermonkey userscripts that pull Niantic Support's "Reporting Abuse in Wayfarer" ticket emails out of Gmail (or `.eml` files) and extract a best-guess Wayspot name and coordinates from each one. The results end up in a searchable table that you can plot on the Wayfarer map or export as CSV. The second script also keeps a draft list of Wayspots you want to report, and can fill in Niantic's abuse form for you.
 
 | Script | What it does |
 |---|---|
 | **Wayfarer Map Mods - Abuse Email Importer** | Gets your ticket emails in, via Gmail sync or by dropping `.eml` files |
-| **Wayfarer Map Mods - Abuse Reports** | Reads the imported emails, extracts name and coordinates, shows the table, draws map markers and exports CSV |
+| **Wayfarer Map Mods - Abuse Reports** | Reads the imported emails, extracts name and coordinates, shows the table, draws map markers and exports CSV. Also keeps your abuse report draft (Marked Wayspots) and auto-fills Niantic's abuse form from it |
 
 Both scripts are add-ons for [Tntnnbltn's wayfarer-map-mods suite][base] and use its native panels and settings. Re-running extraction never requires re-importing your emails.
 
@@ -24,6 +24,8 @@ Both scripts are add-ons for [Tntnnbltn's wayfarer-map-mods suite][base] and use
 3. Install the [extractor](https://raw.githubusercontent.com/Frankmans/AbuseFormImport/refs/heads/main/wayfarer-abuse-report-extractor.user.js).
 
 The two helper libraries (`opr-email-lib.js` and `wst-storage.js`) are downloaded automatically. There is nothing else to install.
+
+The extractor also runs on Niantic's Help Center (`scopelyexplore.helpshift.com`), but only in a tab that the Wayfarer tab opened for [abuse form auto-fill](#abuse-form-auto-fill). On any other visit to the Help Center it does nothing.
 
 ## Setting up Gmail sync (optional)
 
@@ -75,7 +77,7 @@ The diagrams below are illustrative mockups rather than literal screenshots. The
 
 ![The Settings side panel showing a single "Abuse Reports" entry](docs/images/settings-side-panel.svg)
 
-**Inside the Abuse Reports panel.** Three small icons sit next to the summary line, top right: a list icon (opens the **Marked Wayspots** list and the Favorite Users list), an envelope (opens the Email Importer) and a cog (opens Marker Style settings).
+**Inside the Abuse Reports panel.** Three small icons sit next to the summary line, top right: a list icon (opens the **Marked Wayspots** list and the Favorite Users list), an envelope (opens the Email Importer) and a cog (opens Marker Style and the abuse form auto-fill settings).
 
 ![The Abuse Reports panel header with list, envelope and cog icons](docs/images/panel-header-icons.svg)
 
@@ -94,13 +96,15 @@ The diagrams below are illustrative mockups rather than literal screenshots. The
 3. Back in Abuse Reports, click **Scan Imported Emails**. Or tick **Also scan for reports after importing** in the importer's panel to have this happen automatically after every import (see [Scan after import](#scan-after-import)).
 4. Review the table. There is one row per reported Wayspot, so a ticket that reports several shows several rows sharing the same `Conversation ID`. Rows missing a name or coordinates are flagged so you can check the raw `Location Details` / `Report Details` columns by hand. Then **Export CSV**, or tick **Abuse Report Crosses** in the Layers menu to see everything plotted on the map.
 
+5. To report Wayspots yourself, mark them as you browse or review, then let the extractor [fill in the abuse form](#abuse-form-auto-fill). Once the ticket email has been imported and scanned, it shows up in the table.
+
 You can sort by clicking the **Conversation** and **Status** headers (click again to flip direction). Status sorts by pipeline stage (Received, then Pending Review, then a settled state) rather than alphabetically, and your chosen sort is remembered.
 
 Both scripts also appear in the suite's **Plugin Manager**, where you can enable or disable them. Disabling one removes its panel and side-panel link completely, and re-enabling rebuilds everything.
 
 ## Scan after import
 
-The importer's panel has an **Also scan for reports after importing** checkbox. With it on, any import that adds or updates at least one email (a Gmail sync, a dropped `.eml` file, or a backup restore) immediately scans for reports. New tickets show up in the table and on the map without you opening the Abuse Reports panel. It works even while the panel is closed, and the setting is saved.
+The importer's panel has an **Also scan for reports after importing** checkbox. With it on, any import that adds or updates at least one email (a Gmail sync, a dropped `.eml` file, or a backup restore) immediately scans for reports. New tickets show up in the table and on the map without you opening the Abuse Reports panel, and any [Reported](#wayspots-you-reported-yourself) rows waiting for their ticket are matched up. It works even while the panel is closed, and the setting is saved.
 
 ![The Email Importer panel with the scan-after-import checkbox](docs/images/importer-scan-checkbox.svg)
 
@@ -142,9 +146,11 @@ Two other values can appear:
 - **Received**: only the initial automatic acknowledgement, with no human reply yet.
 - **Updated**: the newest message is a custom human reply, or a follow-up from the reporter.
 
+Two more badges are not from Niantic at all: a teal **Reported** for [Wayspots you reported yourself](#wayspots-you-reported-yourself) that have no ticket yet, and a purple **Imported** for CSV rows.
+
 Only the newest message in the thread is checked. If the reporter sends a follow-up (say, a "thanks!") *after* the real decision, the status reads **Updated** again even though a decision was made earlier. This is expected behavior.
 
-Statuses show as color-coded badges, and searching for a status name (e.g. "pending") matches them. Wayspots brought in with **Import CSV** get their own purple **Imported** badge.
+Statuses show as color-coded badges, and searching for a status name (e.g. "pending") matches them. Wayspots brought in with **Import CSV** get their own purple **Imported** badge, and ones you cleared from your draft after submitting the abuse form get a teal **Reported** badge.
 
 ## Flagging nearby duplicate reports
 
@@ -171,7 +177,7 @@ Only one row is editable at a time. Opening another discards the first one's uns
 
 Saved edits update the table, map crosses, nearby-ticket flags, search and CSV export straight away. An edited row shows a small blue dot next to its pencil and is kept when you re-scan, even if you changed its coordinates.
 
-A deleted entry disappears from the table, the map and the CSV export immediately, and stays gone when you re-scan. A row you imported from a CSV can't be recovered once deleted, because it has no source email. **Clear Extracted Data** wipes everything, including edited rows, and also brings manually deleted entries back the next time you scan.
+A deleted entry disappears from the table, the map and the CSV export immediately, and stays gone when you re-scan. A row you imported from a CSV, or a **Reported** row that is still waiting for its ticket, can't be recovered once deleted, because it has no source email. **Clear Extracted Data** wipes everything, including edited rows, and also brings manually deleted entries back the next time you scan. Its confirmation warns you when CSV-imported or Reported rows are among them, since a re-scan can't bring those back.
 
 ## Importing locations from elsewhere (CSV)
 
@@ -230,6 +236,8 @@ Click the cog icon in the Abuse Reports panel header to open Marker Style. It co
 
 Changes apply live to markers already on the map.
 
+This window also holds the [Abuse form auto-fill](#settings-for-the-auto-fill) settings, in a section of their own below the marker options.
+
 ## Resizing the panel
 
 When Wayfarer Map Mods' **Make modals resizeable** preference is on, you can drag the corner of the Abuse Reports panel to resize it, and the table follows: make the panel taller to see more rows at once, or shorter to see fewer without the whole panel scrolling. The table shows at most the rows that fit, with a small minimum, and goes back to its normal height if the panel isn't resized.
@@ -242,19 +250,29 @@ Drag the border between two column headers to resize them. A drag trades width b
 
 ## Marked Wayspots
 
-A separate scratch list for Wayspots you're about to report yourself. It is independent of the ticket table, which covers reports already filed.
+Your abuse report draft: a list of Wayspots you are about to report yourself. It is separate from the ticket table, which covers reports already filed, and it is what the [abuse form auto-fill](#abuse-form-auto-fill) works from. Nothing is sent from the list itself.
 
-**Adding.** Click a Wayspot on the map. In its details card in the side panel, type an optional note (up to 300 characters) and click **+ add to abuse report draft**. It flashes **✓ Added**. If the Wayspot is already on the list (matched by coordinates, not name), its note is overwritten with whatever is in the field, including being cleared if the field is empty, and the button flashes **✓ Updated**. A Wayspot's name is only ever filled in or improved this way, never blanked. An "Untitled location" shows as "(unnamed)". The same note field and button also appear on the review page.
+**Adding.** Click a Wayspot on the map. In its details card in the side panel, type an optional note (up to 1000 characters) and click the flag-with-a-plus button next to the note field (tooltip: *Add this Wayspot to your abuse report draft*). It flashes a check mark. If the Wayspot is already on the list (matched by coordinates, not name), its note is overwritten with whatever is in the field, including being cleared if the field is empty. A Wayspot's name is only ever filled in or improved this way, never blanked. An "Untitled location" shows as "(unnamed)". The same note field and button also appear on the review page and in review map info windows.
 
-**The list.** Open it with the list icon in the Abuse Reports panel header, or, on the review page, with the list icon in the bar under the map (titled **Abuse Reports - Marked Wayspots**):
+**The list.** Open it with the list icon in the Abuse Reports panel header, or, on the review page, with the list icon in the bar under the map (titled **Abuse Report Draft - Marked Wayspots**):
 
 ![The Marked Wayspots list window, with the Favorite Users section below the list](docs/images/marked-wayspots-list.svg)
 
-- A **Report abuse via Wayfarer Help Center** link opens Niantic's "Reporting Abuse in Wayfarer" article, where you paste the copied text.
+The buttons above the list are icons. Hover one for its tooltip, which also shows how many rows it will act on:
+
 - **Copy All** puts one line per entry on the clipboard as `Name, lat, lng (note)`, with coordinates to six decimals and the note only when there is one.
-- **Include notes when copying** (on by default) removes the notes, giving plain `Name, lat, lng` lines. It is saved, and also applies to the copy icon on the review page.
-- **Clear All** empties the list after confirmation.
-- **Click a row** to jump the map there and open a popup with its name, coordinates and note. On the review page it just pans the review map to that Wayspot, where the draft marker is. Click a row's **note** to edit it in place (click outside the box to save), and click **×** to remove the entry.
+- **Copy selected** copies only the ticked rows, in list order and in the same format. It shows the number ticked and stays disabled until something is ticked.
+- **Deselect all** unticks every row at once without redrawing the list, so your scroll position and any note you are editing stay as they are.
+- **Auto-fill abuse form** (the wand) opens Niantic's abuse form and fills it in, see [Abuse form auto-fill](#abuse-form-auto-fill).
+- **Open the abuse form** opens Niantic's "Reporting Abuse in Wayfarer" article in a new tab, without filling anything in.
+- **Trash** removes the ticked rows after a confirmation, or the whole list when nothing is ticked.
+
+Ticking rows works the same everywhere: **with one or more rows ticked, Copy selected, the wand and the trash button act on just those rows. With nothing ticked, the wand and the trash button act on the whole list** (Copy All always copies everything). Ticks are not saved and reset when the window is reopened.
+
+- **Include notes when copying** (on by default) removes the notes, giving plain `Name, lat, lng` lines. It is saved, and applies to Copy All, Copy selected, the auto-fill and the copy icon on the review page.
+- **Click a row** to jump the map there and open a popup with its name, coordinates and note. On the review page it just pans the review map to that Wayspot, where the draft marker is. Click a row's **note** to edit it in place (click outside the box to save), and click **×** to remove just that entry.
+
+**Already reported flag.** A row whose coordinates are *exactly* the same as a row in your abuse reports list (same latitude and longitude to six decimals) gets an amber line, for example `⚠ Already reported at these exact coordinates: #12345 (Actioned)`. A Wayspot you reported yourself that is still waiting for its ticket shows as `reported <date>`. Nearby locations are deliberately not flagged here, unlike the 20 m [duplicate check](#flagging-nearby-duplicate-reports) in the table. The flags refresh by themselves after a scan.
 
 **On the map.**
 
@@ -265,6 +283,52 @@ Every entry also gets a cross marker on the map view, in its own color (default 
 The same markers also show on the review maps, so a Wayspot already on your draft is visible while you review next to it. There they are drawn like the report crosses on those maps (3px larger than on the map view, on top of the Wayspot markers, click-through) and follow the **Abuse report markers** toggle under the map instead of the Layers menu.
 
 The list is saved with the suite's settings, so it is included in **Settings > Backups**.
+
+## Abuse form auto-fill
+
+The wand button in the Marked Wayspots list opens Niantic's "Reporting Abuse in Wayfarer" Help Center article in a new tab and fills the form in for you. The Wayfarer tab hands the data to the Help Center tab directly, so keep the Wayfarer tab open until the form is filled in.
+
+**What happens, step by step.**
+
+1. Click the wand. A small status message appears at the bottom left of the new tab (click it to dismiss).
+2. The tab clicks the article's **Report an abuse** button for you. If it can't find the button, it says so and you click it yourself. The form is still filled in afterwards.
+3. On the first step, your **name** and **email** are entered, and **Next** is pressed for you when both were filled in.
+4. On the report step, the **location field** gets your list (the same text Copy All would give, so it respects *Include notes when copying*). The **report details**, the **abuser(s)** and the **issue type** are filled from your settings.
+5. The page scrolls so the **Submit** button is near the bottom of the window.
+
+**What it never does.** It never presses Submit. You check everything, then submit it yourself. It only fills fields that are still empty, so anything you typed is left alone, and a setting you left empty is left for you to fill in (the status message lists what is still yours). It keeps waiting for up to five minutes, so you can click through the form's steps at your own pace.
+
+**Which Wayspots.** With rows ticked in the list, only those are sent. With nothing ticked, the whole list is sent. The status message says how many Wayspots went into the location field.
+
+<a id="settings-for-the-auto-fill"></a>
+**Settings for the auto-fill.** Click the cog in the Abuse Reports panel header and scroll to **Abuse form auto-fill**:
+
+| Setting | What it does |
+|---|---|
+| **Name**, **Email** | Entered on the form's first step. Leave empty to fill them in yourself. |
+| **Issue type** | Chosen in the form's *What issue are you reporting?* menu. Defaults to *Fake Nominations or criteria issues*. Pick *Don't select* to choose it yourself. |
+| **Report details** | Default text for *Abuse report details*. Empty means you write it. |
+| **Abuser(s)** | Default text for *Details of the abuser(s)*. Empty means you write it. |
+| **After the form is submitted** | Off by default. See below. |
+
+These are saved with the suite's settings, so they are included in **Settings > Backups**. That includes your name and email, so keep backup files private.
+
+**After the form is submitted (optional).** With this on, the Help Center tab watches for the form being submitted (your click on **Submit**, followed by the form disappearing or the confirmation text showing up). A click that is rejected, for example because a required field is empty, is ignored and the tab stays open. Once the submission went through, the tab closes by itself after 1.5 seconds and the Marked Wayspots list asks whether to clear the Wayspots that were just sent (the list opens for the question if it was closed):
+
+- **Clear them** removes exactly those Wayspots from the draft, and nothing you marked since. They move to your abuse reports list as **Reported** rows, see below.
+- **Keep them** leaves the draft as it is.
+
+This question only follows the wand in the Marked Wayspots list. The review page's own wand (see [Abuse helper on the review page](#abuse-helper-on-the-review-page)) sends a single Wayspot and has no draft to clear.
+
+### Wayspots you reported yourself
+
+**Clear them** is the only action that creates these rows. Removing entries with the **×**, the trash button or **Clear All** just deletes them.
+
+Each cleared Wayspot appears in the main table with a teal **Reported** badge, the report date in the **Last Response** column, and the name, coordinates and note it had. It has no ticket number yet. These rows behave like any other: you can star, edit or delete them, they are plotted on the map, and they take part in the nearby-duplicate flags and the draft list's [already reported flag](#marked-wayspots).
+
+Every scan (including the automatic one after an import) looks for the ticket behind each Reported row: a ticket location within 20 m whose newest message is not older than the report (with a day of slack, because ticket dates carry no time zone). When it finds one, the Reported row is replaced by that ticket's own row, and a star carries over. If several tickets qualify, the earliest one wins. Rows without a match yet stay until a later scan. Reporting the same coordinates again updates the existing Reported row instead of adding a second one.
+
+Reported rows live in the extracted reports database and have no source email, so **Clear Extracted Data** removes them for good, just like CSV-imported rows.
 
 ## Favorite users
 
@@ -279,13 +343,14 @@ Favorites are saved with the suite's settings and included in **Settings > Backu
 
 ## Abuse helper on the review page
 
-This replaces the standalone **Wayfarer Abuse Text Formatter** script. Uninstall that script once this one is running, or you'll see both. On `https://wayfarer.scopely.com/new/review`, every review candidate (new Wayspot, photo or edit) gets a small row containing:
+This replaces the standalone **Wayfarer Abuse Text Formatter** script. Uninstall that script once this one is running, or you'll see both. On `https://wayfarer.scopely.com/new/review`, every review candidate (new Wayspot, photo or edit) gets a single row: a **note field**, followed by four icon buttons (hover for the tooltip):
 
-![The review-page row: copy icon, note field, add to abuse report draft button and Abuse form link](docs/images/review-abuse-row.svg)
+![The review-page row: note field and four icon buttons](docs/images/review-abuse-row.svg)
 
-- a **copy icon** that copies `Name, lat, lng` in the same format as the Marked Wayspots list's Copy All, with the row's note appended when **Include notes when copying** is on. The icon briefly turns into a check mark to confirm;
-- a **note field** and **+ add to abuse report draft** button, which add the candidate to your Marked Wayspots list (overwriting the note if it's already there);
-- an **Abuse form** link to the Help Center article, opening in a new tab so your review in progress isn't lost.
+- **Copy** copies `Name, lat, lng` in the same format as the Marked Wayspots list's Copy All, with the note from the field appended when **Include notes when copying** is on. The icon briefly turns into a check mark to confirm.
+- **Add to abuse report draft** (flag with a plus) adds the candidate, with the note, to your Marked Wayspots list. If it is already there, the note is overwritten.
+- **Auto-fill the abuse form for this review only** (wand) opens the abuse form and fills it with just this Wayspot and the note beside it. Nothing is added to your draft list. The note is always included here, whatever the *Include notes when copying* checkbox says, and one typed or changed while the form is loading is picked up too. Name, email and the other [settings](#settings-for-the-auto-fill) are used as usual. If the browser blocks the new tab, the icon shows a cross.
+- **Open the abuse form** (page with an exclamation mark) opens the Help Center article in a new tab, so your review in progress isn't lost.
 
 The row only appears while the plugin is enabled in the Plugin Manager.
 
@@ -310,11 +375,11 @@ When you click a nearby Wayspot on a review's map (the duplicate-check map, or t
 
 ## Data storage & privacy
 
-Everything is stored in your own browser (IndexedDB and the suite's settings) and never leaves it, apart from the Gmail API calls you make yourself.
+Everything is stored in your own browser (IndexedDB and the suite's settings) and never leaves it, apart from the Gmail API calls you make yourself and the abuse form auto-fill. The auto-fill passes your list, name and email from the Wayfarer tab to the Help Center tab it opened (the two tabs talk to each other directly, and only to those exact origins), and the form is submitted by you, to Niantic.
 
 - **Imported emails** are kept in one local database.
-- **Extracted reports** are kept in a second, separate local database.
-- **Your preferences and lists** (Marker Style settings including the Marked Wayspot and Favorite user colors, the close-panel-on-jump and copy-with-notes checkboxes, the scan-after-import checkbox, column widths, the Marked Wayspots list and the Favorite Users list) live in the suite's settings, so they are included in the suite's **Settings > Backups** export/import.
+- **Extracted reports** are kept in a second, separate local database. This includes CSV-imported rows and **Reported** rows.
+- **Your preferences and lists** (Marker Style settings including the Marked Wayspot and Favorite user colors, the close-panel-on-jump and copy-with-notes checkboxes, the scan-after-import checkbox, column widths, the abuse form auto-fill settings with your name and email, the Marked Wayspots list and the Favorite Users list) live in the suite's settings, so they are included in the suite's **Settings > Backups** export/import.
 
 Both the importer and the extractor panels have **Export backup JSON**, **Import backup JSON** and **Clear** buttons. Clearing extracted data does not touch your imported emails, so you can re-scan at any time to rebuild it.
 
@@ -323,12 +388,19 @@ Both the importer and the extractor panels have **Export backup JSON**, **Import
 - Name and coordinate extraction is **best-effort**. It has been refined against many real tickets but is not derived from a formal specification. Treat low-confidence rows, especially anything unusual, as needing a manual check before you rely on them.
 - A location's *name* is only kept when a short, clean label was found. Otherwise the location is added with a blank name rather than a guess.
 - A reply that mixes a new Wayspot into the same sentence as a correction may need a manual check.
+- The abuse form auto-fill finds the form's fields by their labels, and the issue type by driving the dropdown like a person would. If Niantic changes the form, a field may be left for you to fill in (the status message says which), and the issue type may be selected but flagged as *could not confirm it, please check*. **Copy All** always works as the fallback.
+- A **Reported** row is only matched to its ticket by coordinates and date. If that ticket has not been imported and scanned yet, the row stays as it is.
 
 ## Troubleshooting
 
 - **The scripts don't appear anywhere.** Make sure the wayfarer-map-mods suite (v4.0.0 or newer) is installed and enabled, and that you are on a `https://wayfarer.scopely.com` page.
 - **A script works but isn't listed under External plugins in the Plugin Manager.** Update to the latest version of both scripts.
 - **Gmail sign-in is refused.** Check that your Google account is listed under **Test users** and that `https://wayfarer.scopely.com` is in the OAuth client's **Authorized JavaScript origins**.
+- **The wand opens a tab but nothing gets filled in.** The Help Center tab only gets its data from the Wayfarer tab that opened it, so keep that tab open and don't navigate it away. If the Help Center tab says the Wayfarer tab did not answer, reload the Wayfarer tab (it needs a current version of the extractor) and click the wand again.
+- **The wand shows a cross.** The browser blocked the new tab. Allow pop-ups for `wayfarer.scopely.com`, then click again.
+- **Name and email are left empty.** Fill them in under the cog's **Abuse form auto-fill** section. Empty settings are left for you on purpose.
+- **The form was filled in the wrong place or not at all.** Use **Copy All** (or **Copy selected**) in the Marked Wayspots list and paste into the form's location field yourself, and check the browser console for the field list the script logs.
+- **The tab didn't close after submitting.** The option is off by default (see [After the form is submitted](#abuse-form-auto-fill)). Browsers may also refuse to close a tab they don't consider script-opened, in which case the status message says you can close it yourself.
 - **Tickets stopped arriving in Gmail sync.** Check whether tickets are now coming from a new sender address (see [What counts as an abuse report email](#what-counts-as-an-abuse-report-email)).
 
 ## Credits
