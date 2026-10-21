@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.81.2
+// @version      1.84.0
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV. Can also auto-fill the Help Center abuse form from the Marked Wayspots list.
 // @author       Frankmans
 // @grant        none
@@ -1311,7 +1311,7 @@
   // has loaded at least once before the very first draw attempt.
   function waeEnsureRecordsLoaded() {
     if (!waeRecordsLoadPromise) {
-      waeRecordsLoadPromise = getAllExtractedRecords()
+      waeRecordsLoadPromise = waeMigrateReportedHistory().catch(() => {}).then(() => getAllExtractedRecords())
         .then((records) => {
           waeAllRecords = records;
           waeRecordsById = new Map(records.map((r) => [r.id, r]));
@@ -3292,6 +3292,8 @@
   // v1.78.0, for the Marked Wayspots list modal (Lucide "trash-2" and "clipboard-check")
   const WAE_TRASH_ICON_SVG = waeIconSvg('<path d="M3 6h18"></path><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"></path><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><path d="M10 11v6M14 11v6"></path>');
   const WAE_CLIPBOARD_CHECK_ICON_SVG = waeIconSvg('<rect width="8" height="4" x="8" y="2" rx="1" ry="1"></rect><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path><path d="m9 14 2 2 4-4"></path>');
+  // v1.82.0, for the Marked Wayspots list's Deselect all button (Lucide "square-minus")
+  const WAE_DESELECT_ICON_SVG = waeIconSvg('<rect width="18" height="18" x="3" y="3" rx="2"></rect><path d="M8 12h8"></path>');
 
   // An icon-only button for the suite's own modals (ui.button() underneath,
   // so it keeps their look) -- the wording lives in the tooltip and the
@@ -4195,6 +4197,7 @@
     // scratch approach (see the comment a few lines down) would
     // otherwise silently lose every single time, same as it would
     // any other flag not sourced fresh from the emails themselves.
+    await waeMigrateReportedHistory().catch(() => {});
     const previousRecords = await getAllExtractedRecords();
     const starredKeys = new Set(previousRecords.filter((r) => r.starred).map(waeStarredKey));
     // CSV-imported rows (see waeParseCsvImport()) don't come from a
@@ -4213,7 +4216,9 @@
     // can be dropped (instead of showing up next to the edited copy as
     // a duplicate) even when the edit changed the coordinates.
     // CSV-imported rows are already carried above, so they're excluded.
-    const editedRecords = previousRecords.filter((r) => r.edited && r.source !== 'csv');
+    const editedRecords = previousRecords.filter((r) => r.edited && r.source !== 'csv' && r.source !== 'reported');
+    // v1.84.0: Wayspots reported from the draft (see waeAddReportedRecords()) -- no email behind them yet, so carried along like the CSV rows
+    const reportedRecords = previousRecords.filter((r) => r.source === 'reported');
 
     const { extracted: scannedAll, ticketDetails } = await scanImportedEmails(onProgress);
     // Rows the user deleted by hand (see waeDeleteRecord()): a scan would
@@ -4240,6 +4245,14 @@
         if (starredKeys.has(waeStarredKey(r))) r.starred = true;
       }
     }
+    // v1.84.0: a reported placeholder whose ticket this scan found is
+    // replaced by that ticket's own row (its star carries over); the rest wait
+    // for a later scan.
+    const reportedKept = [];
+    for (const placeholder of reportedRecords) {
+      const match = waeFindTicketRowForReported(placeholder, extracted.concat(editedRecords));
+      if (match) { if (placeholder.starred) match.starred = true; } else reportedKept.push(placeholder);
+    }
     // Rebuild from scratch rather than upsert: a ticket's row count can
     // change between scans (a multi-location ticket now yields several
     // "conv:X:0" / "conv:X:1" / ... rows instead of one "conv:X" row),
@@ -4251,7 +4264,7 @@
     // than each carrying their own copy (see EXTRACT_DB_VERSION note).
     await clearExtractedRecords();
     await clearTicketDetails();
-    await putExtractedRecords([...extracted, ...csvRecords, ...editedRecords]);
+    await putExtractedRecords([...extracted, ...csvRecords, ...editedRecords, ...reportedKept]);
     await putTicketDetails(ticketDetails);
 
     const ticketCount = new Set(extracted.concat(editedRecords).map((r) => r.conversationId || r.sourceEmailId)).size;
@@ -4262,6 +4275,12 @@
       // refreshPanel() would otherwise have done exactly this -- see its
       // own comment on why that's nested under an early `if (!waeUI)
       // return` -- so it's repeated here for the panel-closed case.
+      // v1.84.0: with fresh rows too -- the cached ones are from before this scan.
+      try {
+        waeAllRecords = await getAllExtractedRecords();
+        waeRecordsById = new Map(waeAllRecords.map((r) => [r.id, r]));
+        waeRecordsLoadPromise = Promise.resolve(waeAllRecords);
+      } catch (e) { /* keep drawing from what is cached */ }
       if (WAE_PULSES.map && isMapPulsesEnabled()) waeSafeRefreshPulses();
       if (WAE_REVIEW_PULSES.map) waeSafeRefreshReviewPulses();
     }
@@ -5009,6 +5028,8 @@
   // those three canned replies (a custom reply, the reporter's own
   // follow-up being the newest message, etc.).
   const WAE_STATUS_BADGES = {
+    // v1.84.0: reported from the draft, ticket not scanned yet (see waeAddReportedRecords())
+    REPORTED_PENDING: { label: 'Reported', color: '#0891b2' },
     ABUSE_REPORT_RECEIVED: { label: 'Received', color: '#2563eb' },
     ABUSE_REPORT_PENDING: { label: 'Pending Review', color: '#b45309' },
     ABUSE_REPORT_ACTIONED: { label: 'Actioned', color: '#16a34a' },
@@ -5282,7 +5303,7 @@
     }
 
     // Identity before the FIRST edit only -- see waeScanAndPersist().
-    if (!record.edited && record.source !== 'csv') record.editedFromKey = waeStarredKey(record);
+    if (!record.edited && record.source !== 'csv' && record.source !== 'reported') record.editedFromKey = waeStarredKey(record);
     record.edited = true;
     record.editedAt = Date.now();
     record.conversationId = draft.conversationId.trim() || null;
@@ -5353,12 +5374,14 @@
       ? `This deletes only this single row, not the whole ticket (${ticketId}).`
         + (siblings ? ` The ${siblings} other row${siblings === 1 ? '' : 's'} of this ticket will be kept.` : '')
       : 'This deletes only this single row.';
-    const csvNote = record.source === 'csv'
+    const csvNote = record.source === 'reported'
+      ? ' It was added from your reported Wayspots and has no email behind it yet, so it cannot be recovered by re-scanning.'
+      : record.source === 'csv'
       ? ' It was imported from a CSV, so it cannot be recovered by re-scanning.'
       : ' It will stay hidden when you re-scan; Clear Extracted Data brings deleted rows back on the next scan.';
     if (!confirm(`Delete the row "${label}"?\n\n${scope}${csvNote}`)) return;
 
-    if (record.source !== 'csv') {
+    if (record.source !== 'csv' && record.source !== 'reported') {
       const key = record.editedFromKey || waeStarredKey(record);
       const keys = waeLoadDeletedRowKeys();
       if (!keys.includes(key)) {
@@ -5918,6 +5941,7 @@
   async function refreshPanel() {
     if (!waeUI) return; // panel isn't open
     try {
+      await waeMigrateReportedHistory().catch(() => {});
       waeAllRecords = await getAllExtractedRecords();
       waeRecordsById = new Map(waeAllRecords.map((r) => [r.id, r]));
       // Keeps waeEnsureRecordsLoaded()'s cache in sync with this fresher
@@ -6049,6 +6073,101 @@
   // clicking the map WHILE the list modal happens to already be open,
   // without the two having any other reference to each other.
   let waeMarkListRenderHook = null;
+
+  // ---------------------------------------------------------------------
+  // v1.84.0: Wayspots reported from the draft. They become rows of the
+  // abuse reports table itself (source 'reported', status "Reported", no
+  // ticket number yet) -- and ONLY the "Clear them" answer to the
+  // after-submit question (see waeRenderMarkedWayspotListSection()) puts
+  // them there; the x on a row, the trash button and every other removal
+  // just delete. A scan carries these rows along (waeScanAndPersist()) until
+  // it finds the ticket for them -- a ticket row within
+  // WAE_NEARBY_THRESHOLD_METERS whose newest message is not older than the
+  // report -- and then drops the placeholder, since the real row replaces
+  // it.
+  // ---------------------------------------------------------------------
+  // The ticket dates are parsed without a time zone, hence a day of slack.
+  const WAE_REPORTED_LINK_SLACK_MS = 24 * 60 * 60 * 1000;
+  // v1.83.0 kept these in a separate history list in the settings; moved
+  // into the table by waeMigrateReportedHistory().
+  const WAE_REPORTED_SETTINGS_KEY = 'reportedWayspots';
+
+  function waeBuildReportedRecord(item, at) {
+    return {
+      id: `reported:${at}-${Math.random().toString(36).slice(2, 8)}`,
+      ticketKey: null,
+      conversationId: null,
+      ticketStatus: 'REPORTED_PENDING',
+      lastResponseAt: at,
+      reportedAt: at,
+      wayspotName: item.name || null,
+      latitude: Number(item.lat),
+      longitude: Number(item.lng),
+      comment: item.note || null,
+      sourceEmailId: null,
+      sourceFilename: null,
+      scannedAt: at,
+      source: 'reported',
+    };
+  }
+
+  // The ticket row (from `rows`) a reported placeholder turned into, or
+  // null while there is none. Of several the oldest qualifying one wins,
+  // i.e. the one filed first after the report.
+  function waeFindTicketRowForReported(placeholder, rows) {
+    const lat = Number(placeholder.latitude);
+    const lng = Number(placeholder.longitude);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+    const earliest = (Number(placeholder.reportedAt) || Number(placeholder.lastResponseAt) || 0) - WAE_REPORTED_LINK_SLACK_MS;
+    let best = null;
+    for (const r of rows) {
+      if (!r.conversationId || !Number.isFinite(r.latitude) || !Number.isFinite(r.longitude)) continue;
+      if (!Number.isFinite(r.lastResponseAt) || r.lastResponseAt < earliest) continue;
+      if (Math.abs(r.latitude - lat) > WAE_GRID_DEG || Math.abs(r.longitude - lng) > WAE_GRID_DEG * 2) continue; // cheap prefilter before the real distance
+      if (waeHaversineMeters(lat, lng, r.latitude, r.longitude) > WAE_NEARBY_THRESHOLD_METERS) continue;
+      if (!best || r.lastResponseAt < best.lastResponseAt) best = r;
+    }
+    return best;
+  }
+
+  // Called from the "Clear them" button. The same Wayspot (same
+  // coordinates) reported again refreshes its one placeholder instead of
+  // adding a second row.
+  async function waeAddReportedRecords(items) {
+    if (!items.length) return;
+    const now = Date.now();
+    const keyOf = (lat, lng) => `${Number(lat).toFixed(6)},${Number(lng).toFixed(6)}`;
+    const existing = (await getAllFromStore(EXTRACT_STORE_NAME)).filter((r) => r.source === 'reported');
+    const records = items.map((item) => {
+      const rec = waeBuildReportedRecord(item, now);
+      const prev = existing.find((x) => keyOf(x.latitude, x.longitude) === keyOf(rec.latitude, rec.longitude));
+      if (prev) { rec.id = prev.id; if (prev.starred) rec.starred = true; }
+      return rec;
+    });
+    await putExtractedRecords(records);
+    waeRecordsLoadPromise = null;
+    await waeEnsureRecordsLoaded().catch(() => {});
+    if (waeUI) {
+      await refreshPanel();
+    } else {
+      if (WAE_PULSES.map && isMapPulsesEnabled()) waeSafeRefreshPulses();
+      if (WAE_REVIEW_PULSES.map) waeSafeRefreshReviewPulses();
+    }
+  }
+
+  // One-off: the separate "Reported History" list v1.83.0 kept in the
+  // settings becomes table rows. Entries that already found their ticket
+  // are dropped -- that ticket's own row is in the table.
+  async function waeMigrateReportedHistory() {
+    let old;
+    try { old = wfmmWindow.WFMM.settings.get(PLUGIN_ID, WAE_REPORTED_SETTINGS_KEY, []); } catch (e) { return; }
+    if (!Array.isArray(old) || !old.length) return;
+    const records = old
+      .filter((item) => !item.ticketId && Number.isFinite(Number(item.lat)) && Number.isFinite(Number(item.lng)))
+      .map((item) => waeBuildReportedRecord(item, Number(item.reportedAt) || Date.now()));
+    await putExtractedRecords(records);
+    wfmmWindow.WFMM.settings.set(PLUGIN_ID, WAE_REPORTED_SETTINGS_KEY, []);
+  }
 
   // ---------------------------------------------------------------------
   // Feature request: a Favorite Users scratch list -- click a submitter's
@@ -6437,6 +6556,17 @@
     };
   }
 
+  // v1.82.0: the Marked Wayspots entries an action should work on -- just the
+  // ones with these ids (the ticked rows of the list modal), or the whole
+  // list when no ids are given. Always read fresh from storage, so a note
+  // edited after the ids were picked is still what gets sent.
+  function waeMarkedItemsFor(ids) {
+    const all = waeLoadMarkedWayspots();
+    if (!ids || !ids.length) return all;
+    const wanted = new Set(ids);
+    return all.filter((item) => wanted.has(item.id));
+  }
+
   // `getSource` (optional) is a function returning { items, includeNotes }
   // -- what to put in the form's location field INSTEAD of the Marked
   // Wayspots list. The review page's "Auto-fill abuse form" button uses it
@@ -6459,8 +6589,11 @@
 
   // 'opened' | 'empty' | 'blocked'. Must run straight from a click, or the
   // browser's popup blocker will refuse the window.open() call.
-  function waeOpenAbuseFormAutofill(getSource) {
-    if (!(getSource ? getSource().items : waeLoadMarkedWayspots()).length) return 'empty';
+  // `onlyIds` (optional, list mode only) limits the form to those Marked
+  // Wayspots (the ticked rows); without it the whole list is sent.
+  function waeOpenAbuseFormAutofill(getSource, onlyIds) {
+    const subset = !getSource && Array.isArray(onlyIds) && onlyIds.length ? onlyIds.slice() : null;
+    if (!(getSource ? getSource().items : waeMarkedItemsFor(subset)).length) return 'empty';
     const sessionId = (typeof crypto !== 'undefined' && crypto.randomUUID)
       ? crypto.randomUUID()
       : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
@@ -6480,6 +6613,7 @@
     waeAbuseFormSessions.set(sessionId, {
       popup,
       getSource,
+      onlyIds: subset,
       kind: getSource ? 'review' : 'list', // the review page's button sends one Wayspot, not the draft list
       itemIds: [],
       createdAt: now,
@@ -6500,7 +6634,7 @@
       if (session.expiresAt <= Date.now()) return;
       const source = session.getSource
         ? session.getSource()
-        : { items: waeLoadMarkedWayspots(), includeNotes: waeCopyIncludesNotes() };
+        : { items: waeMarkedItemsFor(session.onlyIds), includeNotes: waeCopyIncludesNotes() };
       if (!session.getSource) session.itemIds = source.items.map((item) => item.id);
       session.popup.postMessage({
         type: WAE_AF_MSG_DATA,
@@ -6644,7 +6778,7 @@
     // v1.80.0: says what this list IS: the draft of the next abuse report.
     const draftHint = ui.createElement('div', {
       className: 'wae-sub wae-draft-hint',
-      text: 'This is your abuse report draft: the Wayspots you marked to report. It is only saved in this browser and nothing is sent from here. Copy it, or auto-fill the abuse form with it, then check the form and submit it yourself.',
+      text: 'This is your abuse report draft: the Wayspots you marked to report. It is only saved in this browser and nothing is sent from here. Copy it, or auto-fill the abuse form with it, then check the form and submit it yourself. Tick rows to limit auto-fill and the trash button to just those; with nothing ticked they work on the whole list.',
     });
     // v1.81.0: after a submitted abuse form (setting "After submitting"):
     // asks whether to clear the Wayspots that were just sent. Hidden until
@@ -6662,12 +6796,16 @@
       promptIds = ids.filter((id) => live.has(id));
       if (!promptIds.length) return; // already gone from the list
       const n = promptIds.length;
-      clearPromptText.textContent = `The abuse form was submitted. Clear the ${n} Wayspot${n === 1 ? '' : 's'} that ${n === 1 ? 'was' : 'were'} in it from your abuse report draft?`;
+      clearPromptText.textContent = `The abuse form was submitted. Clear the ${n} Wayspot${n === 1 ? '' : 's'} that ${n === 1 ? 'was' : 'were'} in it from your abuse report draft? ${n === 1 ? 'It moves' : 'They move'} to the abuse reports list as "Reported" until the ticket has been scanned.`;
       clearPrompt.hidden = false;
     }
     clearPromptYes.addEventListener('click', () => {
       const gone = new Set(promptIds);
-      waeSaveMarkedWayspots(waeLoadMarkedWayspots().filter((item) => !gone.has(item.id)));
+      const draft = waeLoadMarkedWayspots();
+      // v1.84.0: the only place that puts Wayspots into the abuse reports list as "Reported"
+      const moved = draft.filter((item) => gone.has(item.id));
+      waeSaveMarkedWayspots(draft.filter((item) => !gone.has(item.id)));
+      waeAddReportedRecords(moved).catch((e) => console.warn('[Wayfarer Map Mods - Abuse Reports] Could not add the reported Wayspots to the list:', e));
       waeRenderMarkedWayspotMarkers();
       promptIds = [];
       clearPrompt.hidden = true;
@@ -6709,16 +6847,32 @@
     // and in the tooltip.
     const copySelectedTitle = 'Copy the ticked Wayspots (name, coordinates and notes) to the clipboard';
     const copySelectedBtn = waeIconButton(ui, { icon: WAE_CLIPBOARD_CHECK_ICON_SVG, title: copySelectedTitle, disabled: true });
+    // v1.82.0: unticks every row at once.
+    const deselectTitle = 'Deselect all ticked Wayspots';
+    const deselectAllBtn = waeIconButton(ui, { icon: WAE_DESELECT_ICON_SVG, title: deselectTitle, disabled: true });
+    const clearAllTitle = 'Clear the whole draft list';
     const selectedIds = new Set();
     const selectedIcon = () => WAE_CLIPBOARD_CHECK_ICON_SVG + (selectedIds.size ? `<span class="wae-btn-count">${selectedIds.size}</span>` : '');
     const selectedTitle = () => (selectedIds.size
       ? `Copy the ${selectedIds.size} ticked Wayspot${selectedIds.size === 1 ? '' : 's'} (name, coordinates and notes) to the clipboard`
       : copySelectedTitle);
+    // v1.82.0: auto-fill and the trash button act on the ticked rows when
+    // there are any, otherwise on the whole list -- their tooltips say which.
+    const fillTitleNow = () => (selectedIds.size
+      ? `Auto-fill the abuse form with the ${selectedIds.size} ticked Wayspot${selectedIds.size === 1 ? '' : 's'} (opens a new tab)`
+      : fillTitle);
+    const clearTitleNow = () => (selectedIds.size
+      ? `Remove the ${selectedIds.size} ticked Wayspot${selectedIds.size === 1 ? '' : 's'} from the draft list`
+      : clearAllTitle);
+    const setTitle = (btn, title) => { btn.title = title; btn.setAttribute('aria-label', title); };
     const syncSelectedBtn = () => {
       copySelectedBtn.disabled = !selectedIds.size;
       copySelectedBtn.innerHTML = selectedIcon();
       copySelectedBtn.title = selectedTitle();
       copySelectedBtn.setAttribute('aria-label', selectedTitle());
+      deselectAllBtn.disabled = !selectedIds.size;
+      setTitle(fillFormBtn, fillTitleNow());
+      setTitle(clearAllBtn, clearTitleNow());
     };
     // Forget ticks for entries no longer on the list (removed with the x,
     // Clear All, or from the map while this modal is open), so a stale id
@@ -6728,7 +6882,7 @@
       for (const id of Array.from(selectedIds)) if (!live.has(id)) selectedIds.delete(id);
     };
     const selection = { ids: selectedIds, onChange: syncSelectedBtn };
-    const buttonRow = ui.buttonRow([copyAllBtn, copySelectedBtn, fillFormBtn, formLinkEl, clearAllBtn]);
+    const buttonRow = ui.buttonRow([copyAllBtn, copySelectedBtn, deselectAllBtn, fillFormBtn, formLinkEl, clearAllBtn]);
     const copyNotesToggle = ui.checkboxRow({
       label: 'Include notes when copying',
       checked: waeCopyIncludesNotes(),
@@ -6777,16 +6931,35 @@
     });
 
     fillFormBtn.addEventListener('click', () => {
-      const result = waeOpenAbuseFormAutofill();
+      // The ticked rows when there are any, else the whole list.
+      const result = waeOpenAbuseFormAutofill(null, Array.from(selectedIds));
       if (result === 'empty') return;
       const opened = result === 'opened';
-      waeFlashButton(fillFormBtn, opened ? WAE_CHECK_ICON_SVG : WAE_X_ICON_SVG, opened ? 'Opened' : 'Popup blocked', WAE_WAND_ICON_SVG, fillTitle);
+      waeFlashButton(fillFormBtn, opened ? WAE_CHECK_ICON_SVG : WAE_X_ICON_SVG, opened ? 'Opened' : 'Popup blocked', WAE_WAND_ICON_SVG, fillTitleNow);
+    });
+
+    deselectAllBtn.addEventListener('click', () => {
+      selectedIds.clear();
+      // untick in place -- a full render() would reset the list's scroll position and close open note editors
+      listContainer.querySelectorAll('.wae-mark-row-checkbox').forEach((cb) => { cb.checked = false; });
+      syncSelectedBtn();
     });
 
     clearAllBtn.addEventListener('click', () => {
-      if (!waeLoadMarkedWayspots().length) return;
-      if (!confirm('Clear the entire abuse report draft (all marked Wayspots)? This cannot be undone.')) return;
-      waeSaveMarkedWayspots([]);
+      const list = waeLoadMarkedWayspots();
+      if (!list.length) return;
+      // v1.82.0: with rows ticked this removes just those, otherwise everything
+      const ticked = list.filter((item) => selectedIds.has(item.id));
+      if (ticked.length) {
+        const n = ticked.length;
+        if (!confirm(`Remove the ${n} ticked Wayspot${n === 1 ? '' : 's'} from the abuse report draft? This cannot be undone.`)) return;
+        const gone = new Set(ticked.map((item) => item.id));
+        waeSaveMarkedWayspots(list.filter((item) => !gone.has(item.id)));
+        selectedIds.clear();
+      } else {
+        if (!confirm('Clear the entire abuse report draft (all marked Wayspots)? This cannot be undone.')) return;
+        waeSaveMarkedWayspots([]);
+      }
       waeRenderMarkedWayspotMarkers();
       render();
     });
@@ -7567,9 +7740,12 @@
       // clears them too. Checked for and mentioned explicitly now rather
       // than letting the reassuring "re-scan any time" line quietly
       // apply to rows it doesn't actually cover.
-      const hasCsvRows = (await getAllExtractedRecords()).some((r) => r.source === 'csv');
-      const csvWarning = hasCsvRows
-        ? ' This will ALSO permanently delete any CSV-imported location(s) -- unlike scanned data, those cannot be recovered by re-scanning.'
+      const allBefore = await getAllExtractedRecords();
+      const hasCsvRows = allBefore.some((r) => r.source === 'csv');
+      // v1.84.0: Wayspots reported from the draft, still waiting for their ticket, have no email behind them either
+      const hasReportedRows = allBefore.some((r) => r.source === 'reported');
+      const csvWarning = (hasCsvRows || hasReportedRows)
+        ? ` This will ALSO permanently delete any ${[hasCsvRows && 'CSV-imported', hasReportedRows && 'reported-from-draft'].filter(Boolean).join(' and ')} location(s) -- unlike scanned data, those cannot be recovered by re-scanning.`
         : '';
       if (!confirm(`Clear all extracted abuse-report data? The original imported emails are untouched -- you can re-scan any time.${csvWarning}`)) return;
       try {
