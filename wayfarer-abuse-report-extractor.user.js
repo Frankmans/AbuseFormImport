@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.84.0
+// @version      1.85.0
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV. Can also auto-fill the Help Center abuse form from the Marked Wayspots list.
 // @author       Frankmans
 // @grant        none
@@ -4284,6 +4284,7 @@
       if (WAE_PULSES.map && isMapPulsesEnabled()) waeSafeRefreshPulses();
       if (WAE_REVIEW_PULSES.map) waeSafeRefreshReviewPulses();
     }
+    waeMarkListRenderHook?.(); // v1.85.0: an open draft list re-checks its "already reported" flags
     return { extractedCount: extracted.length + editedRecords.length, ticketCount, missingCoords };
   }
 
@@ -4688,6 +4689,7 @@
     .wae-mark-row-coord{ font-size:11px; color:var(--wfmm-muted-text, #667085); flex-shrink:0; white-space:nowrap; }
     .wae-mark-row-delete{ flex-shrink:0; border:none; background:none; color:var(--wfmm-muted-text, #667085); font-size:16px; line-height:1; cursor:pointer; padding:0 2px; }
     .wae-mark-row-delete:hover{ color:#dc2626; }
+    .wae-mark-row-flag{ margin-top:4px; font-size:11px; font-weight:600; color:#b45309; word-break:break-word; }
     .wae-mark-row-note{ margin-top:4px; font-size:11px; color:var(--wfmm-muted-text, #667085); cursor:pointer; word-break:break-word; white-space:pre-wrap; }
     .wae-mark-row-note-empty{ font-style:italic; opacity:0.7; }
     .wae-mark-row-note-input{ margin-top:4px; width:100%; box-sizing:border-box; font:inherit; font-size:11px; resize:vertical; }
@@ -6153,6 +6155,7 @@
       if (WAE_PULSES.map && isMapPulsesEnabled()) waeSafeRefreshPulses();
       if (WAE_REVIEW_PULSES.map) waeSafeRefreshReviewPulses();
     }
+    waeMarkListRenderHook?.();
   }
 
   // One-off: the separate "Reported History" list v1.83.0 kept in the
@@ -6689,7 +6692,39 @@
   // Favorite Users rows' own. The selection lives in that section's
   // closure, not on the stored entry: it is a this-modal-session thing,
   // not something to persist.
-  function waeBuildMarkedWayspotRow(item, ui, onDelete, selection) {
+  // v1.85.0: abuse report rows (tickets, and Wayspots reported from the draft
+  // that are still waiting for their ticket) at EXACTLY these coordinates --
+  // same lat/lng to 6 decimals, the precision the draft list itself dedupes
+  // on, NOT the 20 m "nearby" check used elsewhere. Returns a Map of
+  // "lat,lng" -> [rows], built once per render of the list.
+  function waeExactReportIndex() {
+    const index = new Map();
+    for (const r of waeAllRecords) {
+      if (!Number.isFinite(r.latitude) || !Number.isFinite(r.longitude)) continue;
+      const key = `${r.latitude.toFixed(6)},${r.longitude.toFixed(6)}`;
+      if (!index.has(key)) index.set(key, []);
+      index.get(key).push(r);
+    }
+    return index;
+  }
+
+  // "#123 (Actioned)", "reported 21/10/2026" or "imported" -- one entry per
+  // ticket however many of its rows sit on those coordinates.
+  function waeDescribeExactMatches(rows) {
+    const seen = new Set();
+    const parts = [];
+    for (const r of rows) {
+      const ref = r.conversationId || `row:${r.id}`;
+      if (seen.has(ref)) continue;
+      seen.add(ref);
+      if (r.conversationId) parts.push({ text: `#${r.conversationId} (${waeStatusLabel(r.ticketStatus)})`, last: r.lastResponseAt });
+      else if (r.source === 'reported') parts.push({ text: `reported ${new Date(r.reportedAt || r.lastResponseAt || 0).toLocaleDateString()}`, last: r.lastResponseAt });
+      else parts.push({ text: 'in your abuse reports list', last: r.lastResponseAt });
+    }
+    return parts;
+  }
+
+  function waeBuildMarkedWayspotRow(item, ui, onDelete, selection, exactMatches) {
     const row = ui.createElement('div', { className: 'wae-mark-row' });
     const mainLine = ui.createElement('div', {
       className: 'wae-mark-row-main',
@@ -6728,7 +6763,19 @@
       className: `wae-mark-row-note${item.note ? '' : ' wae-mark-row-note-empty'}`,
       text: item.note || 'Click to add a note\u2026',
     });
-    row.append(mainLine, noteEl);
+    if (exactMatches && exactMatches.length) {
+      const parts = waeDescribeExactMatches(exactMatches);
+      const shown = parts.slice(0, 3).map((x) => x.text).join(', ');
+      const more = parts.length > 3 ? ` +${parts.length - 3} more` : '';
+      const flag = ui.createElement('div', {
+        className: 'wae-mark-row-flag',
+        text: `\u26A0 Already reported at these exact coordinates: ${shown}${more}`,
+        attrs: { title: parts.map((x) => x.text).join('\n') },
+      });
+      row.append(mainLine, flag, noteEl);
+    } else {
+      row.append(mainLine, noteEl);
+    }
 
     deleteBtn.addEventListener('click', (ev) => {
       ev.stopPropagation();
@@ -6901,7 +6948,9 @@
         listContainer.append(emptyEl);
         return;
       }
+      const exactIndex = waeExactReportIndex();
       for (const item of list) {
+        const exactKey = `${Number(item.lat).toFixed(6)},${Number(item.lng).toFixed(6)}`;
         listContainer.append(waeBuildMarkedWayspotRow(item, ui, (rowEl) => {
           rowEl.remove();
           if (!waeLoadMarkedWayspots().length) render();
@@ -6910,7 +6959,7 @@
             copyAllBtn.disabled = false; fillFormBtn.disabled = false; clearAllBtn.disabled = false;
             syncSelectedBtn();
           }
-        }, selection));
+        }, selection, exactIndex.get(exactKey)));
       }
     }
 
@@ -6966,6 +7015,8 @@
 
     body.append(clearPrompt, draftHint, buttonRow, copyNotesToggle.row, listContainer);
     render();
+    // v1.85.0: the "already reported" flags need the extracted rows; load them if nothing has yet this session
+    if (!waeRecordsLoadPromise) waeEnsureRecordsLoaded().then(() => { if (waeMarkListRenderHook === render) render(); }).catch(() => {});
     waeMarkListRenderHook = render;
     waeShowClearPromptHook = showClearPrompt;
     if (waePendingClear) { // the modal was opened FOR a submitted form (see waeHandleAbuseFormMessage())
