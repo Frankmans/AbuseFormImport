@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.85.0
+// @version      1.87.0
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV. Can also auto-fill the Help Center abuse form from the Marked Wayspots list.
 // @author       Frankmans
 // @grant        none
@@ -4689,6 +4689,7 @@
     .wae-mark-row-coord{ font-size:11px; color:var(--wfmm-muted-text, #667085); flex-shrink:0; white-space:nowrap; }
     .wae-mark-row-delete{ flex-shrink:0; border:none; background:none; color:var(--wfmm-muted-text, #667085); font-size:16px; line-height:1; cursor:pointer; padding:0 2px; }
     .wae-mark-row-delete:hover{ color:#dc2626; }
+    .wae-row-total{ margin:6px 0 0; text-align:right; }
     .wae-mark-row-flag{ margin-top:4px; font-size:11px; font-weight:600; color:#b45309; word-break:break-word; }
     .wae-mark-row-note{ margin-top:4px; font-size:11px; color:var(--wfmm-muted-text, #667085); cursor:pointer; word-break:break-word; white-space:pre-wrap; }
     .wae-mark-row-note-empty{ font-style:italic; opacity:0.7; }
@@ -5728,6 +5729,11 @@
       }));
     }
 
+    children.push(waeUiApi.createElement('div', {
+      className: 'wae-sub wae-row-total',
+      text: waeRowTotalText(sorted.length, waeAllRecords.length, WAE_TOTAL_NOUN_REPORTED),
+    }));
+
     return waeUiApi.createElement('div', { children });
   }
 
@@ -5907,14 +5913,48 @@
     waePanelFit = null;
   }
 
+  // v1.87.0: the scrollable ancestor of `el` (the panel body when it is
+  // taller than the dialog), or null.
+  function waeScrollParent(el) {
+    for (let n = el.parentElement; n; n = n.parentElement) {
+      const oy = getComputedStyle(n).overflowY;
+      if ((oy === 'auto' || oy === 'scroll') && n.scrollHeight > n.clientHeight) return n;
+    }
+    return null;
+  }
+
+  // Which page / sort / search the table was last drawn for. A re-render
+  // for the same view (an edit, star, delete, cancel ...) keeps the scroll
+  // position instead of jumping back to the top; a different view (page
+  // turn, sort, search) starts at the top as before.
+  let waeLastRenderView = null;
+
   function waeRenderFilteredTable() {
     if (!waeUI) return; // panel isn't open -- nothing to render into
     const q = waeSearchQuery.trim().toLowerCase();
     const sorted = waeGetFilteredSorted();
 
+    // v1.87.0: remember where the table (and the panel body around it) is
+    // scrolled to -- drawing a fresh table resets both
+    const oldScroller = waeUI.tableContainer.querySelector('.wae-table-scroll');
+    const bodyScroller = waeScrollParent(waeUI.tableContainer);
+    const keep = {
+      top: oldScroller ? oldScroller.scrollTop : 0,
+      left: oldScroller ? oldScroller.scrollLeft : 0,
+      bodyTop: bodyScroller ? bodyScroller.scrollTop : 0,
+    };
+
     waeUiApi.empty(waeUI.tableContainer);
     waeUI.tableContainer.appendChild(buildTableSection(sorted, !!q, waeNearbyMap));
     waeFitTableToPanel(); // v1.68.0: the fresh table starts at the stock height
+
+    const view = `${waeCurrentPage}|${waeSortKey}|${waeSortDirection}|${q}`;
+    if (view === waeLastRenderView) {
+      const newScroller = waeUI.tableContainer.querySelector('.wae-table-scroll');
+      if (newScroller) { newScroller.scrollTop = keep.top; newScroller.scrollLeft = keep.left; }
+      if (bodyScroller) bodyScroller.scrollTop = keep.bodyTop;
+    }
+    waeLastRenderView = view;
 
     const { withCoords, withName, ticketCount } = waeGetStats();
     const nearbyCount = waeNearbyMap.size;
@@ -6692,6 +6732,19 @@
   // Favorite Users rows' own. The selection lives in that section's
   // closure, not on the stored entry: it is a this-modal-session thing,
   // not something to persist.
+  // v1.86.0: the total line under the abuse reports table, the draft list
+  // and the Favorite Users list. `shown` is what is on the list right now,
+  // `total` everything behind it (they only differ while the table's search
+  // box is filtering). `noun` is [singular, plural]: "reported Wayspot",
+  // "draft report Wayspot" or "favorite user" (v1.86.1).
+  function waeRowTotalText(shown, total, noun) {
+    if (shown === total) return `${total} ${noun[total === 1 ? 0 : 1]}`;
+    return `${shown} of ${total} ${noun[1]}`;
+  }
+  const WAE_TOTAL_NOUN_REPORTED = ['reported Wayspot', 'reported Wayspots'];
+  const WAE_TOTAL_NOUN_DRAFT = ['draft report Wayspot', 'draft report Wayspots'];
+  const WAE_TOTAL_NOUN_FAVORITE = ['favorite user', 'favorite users'];
+
   // v1.85.0: abuse report rows (tickets, and Wayspots reported from the draft
   // that are still waiting for their ticket) at EXACTLY these coordinates --
   // same lat/lng to 6 decimals, the precision the draft list itself dedupes
@@ -6818,6 +6871,7 @@
 
   function waeRenderMarkedWayspotListSection(ui, body) {
     const listContainer = ui.createElement('div', { className: 'wae-mark-list' });
+    const countEl = ui.createElement('div', { className: 'wae-sub wae-row-total' }); // v1.86.0
     const emptyEl = ui.createElement('div', {
       className: 'wae-sub',
       text: 'Your abuse report draft is empty -- use the + button on the main panel, then click a Wayspot on the map.',
@@ -6940,6 +6994,7 @@
       listContainer.innerHTML = '';
       const list = waeLoadMarkedWayspots();
       pruneSelection(list);
+      countEl.textContent = waeRowTotalText(list.length, list.length, WAE_TOTAL_NOUN_DRAFT);
       copyAllBtn.disabled = !list.length;
       fillFormBtn.disabled = !list.length;
       clearAllBtn.disabled = !list.length;
@@ -7013,7 +7068,7 @@
       render();
     });
 
-    body.append(clearPrompt, draftHint, buttonRow, copyNotesToggle.row, listContainer);
+    body.append(clearPrompt, draftHint, buttonRow, copyNotesToggle.row, listContainer, countEl);
     render();
     // v1.85.0: the "already reported" flags need the extracted rows; load them if nothing has yet this session
     if (!waeRecordsLoadPromise) waeEnsureRecordsLoaded().then(() => { if (waeMarkListRenderHook === render) render(); }).catch(() => {});
@@ -7128,6 +7183,7 @@
 
   function waeRenderFavoriteUsersSection(ui, body) {
     const listContainer = ui.createElement('div', { className: 'wae-favorite-user-list' });
+    const countEl = ui.createElement('div', { className: 'wae-sub wae-row-total' }); // v1.86.0
     const emptyEl = ui.createElement('div', {
       className: 'wae-sub',
       text: 'No favorite users yet -- click a username in the Wayfarer side panel to add one.',
@@ -7172,6 +7228,7 @@
       clearAllBtn.disabled = !list.length;
       copySelectedBtn.disabled = !selectedKeys.size;
       syncSelectedBtn();
+      countEl.textContent = waeRowTotalText(list.length, list.length, WAE_TOTAL_NOUN_FAVORITE);
 
       if (!list.length) {
         listContainer.append(emptyEl);
@@ -7215,7 +7272,7 @@
     const section = ui.section({
       title: 'Favorite Users',
       hint: 'Click a username in the Wayfarer side panel to add or remove it here. Color is set in Marker Style. Tick a username to copy just that subset.',
-      children: [ui.buttonRow([copyAllBtn, copySelectedBtn, clearAllBtn]), listContainer],
+      children: [ui.buttonRow([copyAllBtn, copySelectedBtn, clearAllBtn]), listContainer, countEl],
     });
     body.append(section);
     render();

@@ -167,6 +167,8 @@ Locations within one ticket are never flagged against each other.
 
 Every row ends with a pencil (✎). Rows are locked by default. Click the pencil to unlock that row, which turns its cells into inputs: **Conversation**, **Wayspot Name** (with a **Note** field underneath), **Coordinates** (`lat, lng`, or blank for none), **Status** (dropdown) and **Last Response** (date/time picker).
 
+The table keeps its scroll position while you edit, star or delete rows, so you stay where you were in the list. Changing the page, the sort order or the search starts from the top again.
+
 While a row is unlocked, three buttons replace the pencil:
 
 - **✓** saves your changes (**Enter** does the same).
@@ -194,7 +196,7 @@ Imported rows appear in the table and on the map like any other, with a purple *
 
 ## Searching
 
-The search box above the table filters on name, conversation ID, comment, issue type, both raw text fields and the source filename/email ID. A leading `#` is ignored, so `#12345` finds the same reports as `12345`.
+The search box above the table filters on name, conversation ID, comment, issue type, both raw text fields and the source filename/email ID. A leading `#` is ignored, so `#12345` finds the same reports as `12345`. A total under the table reads, for example, `48 reported Wayspots`, or `5 of 48 reported Wayspots` while a search is filtering it.
 
 Search only changes what the table displays. **Export CSV**, the map crosses and the summary counts always reflect everything.
 
@@ -282,6 +284,8 @@ Every entry also gets a cross marker on the map view, in its own color (default 
 
 The same markers also show on the review maps, so a Wayspot already on your draft is visible while you review next to it. There they are drawn like the report crosses on those maps (3px larger than on the map view, on top of the Wayspot markers, click-through) and follow the **Abuse report markers** toggle under the map instead of the Layers menu.
 
+A total under the list (for example `5 draft report Wayspots`) shows how many Wayspots are on it.
+
 The list is saved with the suite's settings, so it is included in **Settings > Backups**.
 
 ## Abuse form auto-fill
@@ -334,7 +338,7 @@ Reported rows live in the extracted reports database and have no source email, s
 
 When Wayfarer shows a **Submitted by <username>** line in the side panel (for example while reviewing a nomination), click the username to mark that user as a favorite, and click again to remove them. A favorite turns bold in a color you choose with **Favorite user color** in Marker Style (default amber; **Reset to default** restores it). Names are matched ignoring case and surrounding spaces.
 
-Favorites are listed in a **Favorite Users** section of the same window as the Marked Wayspots list, each with an **×** to remove it and a **Clear All** button (with confirmation).
+Favorites are listed in a **Favorite Users** section of the same window as the Marked Wayspots list, each with an **×** to remove it and a **Clear All** button (with confirmation). A total under the list (for example `3 favorite users`) shows how many favorites there are.
 
 - **Notes.** Each favorite has its own note (up to 1000 characters). Click **Click to add a note…**, type, and click outside the box to save. Notes appear in the list only and are never part of what you copy.
 - **Copying usernames.** Every row has a checkbox. **Copy All** copies every username, one per line. **Copy Selected** (which shows a count, e.g. *Copy Selected (3)*, and stays disabled until something is ticked) copies only the ticked ones. The button briefly reads **Copied!** (or **Copy failed**). Ticks aren't saved and reset when the window is reopened or you **Clear All**.
