@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.87.0
+// @version      1.87.1
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV. Can also auto-fill the Help Center abuse form from the Marked Wayspots list.
 // @author       Frankmans
 // @grant        none
@@ -4865,6 +4865,12 @@
       padding:2px 4px; border:1px solid #9ca3af; border-radius:4px; background:#fff; color:#111827;
     }
     .wae-edit-input + .wae-edit-input{ margin-top:3px; }
+    /* v1.87.1: the Wayspot Name cell of an unlocked row holds the name input
+       and the note input. It used to be a .wae-edit-cell, whose nowrap put
+       the two inputs side by side, so the note ended up cut off past the
+       column's right edge. A column keeps them stacked at any column width. */
+    .wae-edit-stack{ display:flex; flex-direction:column; gap:3px; min-width:0; }
+    .wae-edit-stack .wae-edit-input + .wae-edit-input{ margin-top:0; }
     .wae-edit-input.wae-invalid{ border-color:#dc2626; background:#fef2f2; }
     /* BUGFIX v1.25.0: WFMM.ui.table()'s own base CSS (.wfmm-table) has no
        table-layout:fixed and no per-cell max-width/overflow -- columns
@@ -5523,7 +5529,7 @@
         key: 'name', label: 'Wayspot Name',
         render: (r) => {
           if (waeEditingId === r.id) {
-            const box = waeUiApi.createElement('div', { className: 'wae-edit-cell' });
+            const box = waeUiApi.createElement('div', { className: 'wae-edit-stack' });
             box.appendChild(waeBuildEditInput('wayspotName', { placeholder: 'Wayspot name' }));
             box.appendChild(waeBuildEditInput('comment', { placeholder: 'Note (optional)' }));
             return box;
