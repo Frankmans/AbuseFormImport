@@ -297,7 +297,7 @@ The wand button in the Marked Wayspots list opens Niantic's "Reporting Abuse in 
 1. Click the wand. A small status message appears at the bottom left of the new tab (click it to dismiss).
 2. The tab clicks the article's **Report an abuse** button for you. If it can't find the button, it says so and you click it yourself. The form is still filled in afterwards.
 3. On the first step, your **name** and **email** are entered, and **Next** is pressed for you when both were filled in.
-4. On the report step, the **location field** gets your list (the same text Copy All would give, so it respects *Include notes when copying*). The **report details**, the **abuser(s)** and the **issue type** are filled from your settings.
+4. On the report step, the **location field** gets your list (the same text Copy All would give, so it respects *Include notes when copying*, unless the [list-in-report-details option](#settings-for-the-auto-fill) is on). The **report details**, the **abuser(s)** and the **issue type** are filled from your settings.
 5. The page scrolls so the **Submit** button is near the bottom of the window.
 
 **What it never does.** It never presses Submit. You check everything, then submit it yourself. It only fills fields that are still empty, so anything you typed is left alone, and a setting you left empty is left for you to fill in (the status message lists what is still yours). It keeps waiting for up to five minutes, so you can click through the form's steps at your own pace.
@@ -313,6 +313,7 @@ The wand button in the Marked Wayspots list opens Niantic's "Reporting Abuse in 
 | **Issue type** | Chosen in the form's *What issue are you reporting?* menu. Defaults to *Fake Nominations or criteria issues*. Pick *Don't select* to choose it yourself. |
 | **Report details** | Default text for *Abuse report details*. Empty means you write it. |
 | **Abuser(s)** | Default text for *Details of the abuser(s)*. Empty means you write it. |
+| **Also put the Wayspot list, with notes, in the report details** | Off by default. When on, the **location field** gets the list *without* notes (whatever *Include notes when copying* says) and the **report details** get the list *with* notes instead of your default report details text, which is not used while this is on. Applies to the list's wand and to the review page's wand. |
 | **After the form is submitted** | Off by default. See below. |
 
 These are saved with the suite's settings, so they are included in **Settings > Backups**. That includes your name and email, so keep backup files private.

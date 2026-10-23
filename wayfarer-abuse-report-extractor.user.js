@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.87.1
+// @version      1.88.1
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV. Can also auto-fill the Help Center abuse form from the Marked Wayspots list.
 // @author       Frankmans
 // @grant        none
@@ -6602,6 +6602,8 @@
       issueType: String(s.get(PLUGIN_ID, 'reporterIssueType', WAE_DEFAULT_ISSUE_TYPE) || '').trim(),
       reportDetails: String(s.get(PLUGIN_ID, 'reporterReportDetails', '') || '').trim(),
       abuser: String(s.get(PLUGIN_ID, 'reporterAbuser', '') || '').trim(),
+      // v1.88.0: the list goes into the report details too, with the notes
+      listInDetails: s.get(PLUGIN_ID, 'reporterListInDetails', false) === true,
     };
   }
 
@@ -6624,15 +6626,21 @@
     const list = source.items;
     const includeNotes = source.includeNotes;
     const contact = waeGetReporterContact();
+    const linesOf = (withNotes) => list.map((item) => waeFormatMarkedWayspotLine(item, withNotes)).join('\n');
+    // v1.88.0: with the "list in the report details" option the location
+    // field gets the list WITHOUT notes (whatever "Include notes when
+    // copying" says) and the report details get it WITH notes. The default
+    // report details text from the settings is NOT used then (v1.88.1).
+    const listInDetails = contact.listInDetails;
     return {
       name: contact.name,
       email: contact.email,
       watchSubmit: contact.afterSubmit,
       issueType: contact.issueType,
-      reportDetails: contact.reportDetails,
+      reportDetails: listInDetails ? linesOf(true) : contact.reportDetails,
       abuser: contact.abuser,
       count: list.length,
-      locationDetails: list.map((item) => waeFormatMarkedWayspotLine(item, includeNotes)).join('\n'),
+      locationDetails: linesOf(listInDetails ? false : includeNotes),
     };
   }
 
@@ -7567,6 +7575,11 @@
       rows: 2,
       onInput: (v) => wfmmWindow.WFMM.settings.set(PLUGIN_ID, 'reporterAbuser', v.trim()),
     });
+    const listInDetailsToggle = ui.checkboxRow({
+      label: 'Also put the Wayspot list, with notes, in the report details (the location field then gets it without notes)',
+      checked: contact.listInDetails,
+      onChange: (checked) => wfmmWindow.WFMM.settings.set(PLUGIN_ID, 'reporterListInDetails', checked === true),
+    });
     const afterSubmitToggle = ui.checkboxRow({
       label: 'After the form is submitted: close its tab and offer to clear the draft list',
       checked: contact.afterSubmit,
@@ -7574,13 +7587,14 @@
     });
     const autofillSection = ui.section({
       title: 'Abuse form auto-fill',
-      hint: 'Entered in the Help Center abuse form by the \u201cAuto-fill abuse form\u201d button in the Marked Wayspots list, next to the list of Wayspots itself. Leave a field empty to fill it in yourself; fields that already have text are never overwritten. The last option (off by default) watches for your click on Submit: once the form has gone, the tab closes after 1.5 seconds and the draft list asks whether to clear the Wayspots that were sent. Saved with this plugin\u2019s settings, so it is included in WFMM\u2019s settings backups.',
+      hint: 'Entered in the Help Center abuse form by the \u201cAuto-fill abuse form\u201d button in the Marked Wayspots list, next to the list of Wayspots itself. Leave a field empty to fill it in yourself; fields that already have text are never overwritten. The list option (off by default) puts the Wayspots, with their notes, in the report details instead of your default text, while the location field gets the list without notes. The last option (off by default) watches for your click on Submit: once the form has gone, the tab closes after 1.5 seconds and the draft list asks whether to clear the Wayspots that were sent. Saved with this plugin\u2019s settings, so it is included in WFMM\u2019s settings backups.',
       children: [
         ui.fieldRow({ label: 'Name', input: reporterNameInput }),
         ui.fieldRow({ label: 'Email', input: reporterEmailInput }),
         ui.fieldRow({ label: 'Issue type', input: reporterIssueInput }),
         ui.fieldRow({ label: 'Report details', input: reporterDetailsInput }),
         ui.fieldRow({ label: 'Abuser(s)', input: reporterAbuserInput }),
+        listInDetailsToggle.row,
         afterSubmitToggle.row,
       ],
     });
