@@ -1,12 +1,13 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      1.88.1
-// @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV. Can also auto-fill the Help Center abuse form from the Marked Wayspots list.
+// @version      2.0.0
+// @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV. Can also auto-fill the Help Center abuse form from the Marked Wayspots list, and send a review's photo to Sightengine's AI-image check.
 // @author       Frankmans
 // @grant        none
 // @match        https://wayfarer.scopely.com/*
 // @match        https://scopelyexplore.helpshift.com/hc/*
+// @match        https://sightengine.com/detect-ai-generated-images*
 // @require      https://raw.githubusercontent.com/Frankmans/AbuseFormImport/refs/heads/main/opr-email-lib.js
 // @require      https://raw.githubusercontent.com/Frankmans/AbuseFormImport/refs/heads/main/wst-storage.js
 // @run-at       document-start
@@ -793,6 +794,220 @@
       console.warn('[Wayfarer Map Mods - Abuse Reports] No answer from the Wayfarer tab.');
       waeAfShowStatus('Abuse auto-fill: the Wayfarer tab did not answer. Reload the Wayfarer tab (it needs this script version) and try the button again.', 'error');
     }, WAE_AF_DATA_TIMEOUT_MS);
+  }
+
+  // ---------------------------------------------------------------------
+  // Sightengine AI-image check (v1.89.0). The review-page row has a button
+  // that opens Sightengine's \"Detect AI-generated images\" page with the
+  // review photo's address in the URL hash. That page only takes dropped /
+  // uploaded files (no address or query parameter), so this half -- which
+  // runs on that one page, see the @match lines -- downloads the photo and
+  // hands it to the page's own upload input as if you had picked the file.
+  // Nothing else happens on an ordinary visit to Sightengine (no hash, no
+  // action), and only Google-hosted photo addresses (what Wayfarer serves
+  // review photos from) are accepted.
+  // ---------------------------------------------------------------------
+  const WAE_SE_ORIGIN = 'https://sightengine.com';
+  const WAE_SE_URL = 'https://sightengine.com/detect-ai-generated-images';
+  const WAE_SE_HASH_IMAGE = 'wae-photo';
+  // v1.92.0: the verdict goes back to the Wayfarer tab that opened the check
+  const WAE_SE_HASH_SESSION = 'wae-se-session';
+  const WAE_SE_MSG_RESULT = 'wae-sightengine:result';
+  const WAE_SE_AI_THRESHOLD = 0.9;          // "over 90%" AI-generated starts the auto-fill
+  const WAE_SE_RESULT_TIMEOUT_MS = 60000;   // how long the page is watched for a verdict
+
+  function waeSeIsAllowedPhotoUrl(value) {
+    try {
+      const u = new URL(value);
+      return u.protocol === 'https:' && /(^|\.)googleusercontent\.com$/i.test(u.hostname);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function waeSeWaitFor(get, ms) {
+    return new Promise((resolve) => {
+      const started = Date.now();
+      const tick = () => {
+        const found = get();
+        if (found) resolve(found);
+        else if (Date.now() - started >= ms) resolve(null);
+        else setTimeout(tick, 150);
+      };
+      tick();
+    });
+  }
+
+  // v1.92.0: Sightengine's AI score (0..1) out of a parsed response -- the
+  // check API calls it `type.ai_generated`; any `ai_generated` number in
+  // 0..1 found within a few levels is taken.
+  function waeSeFindAiScore(obj, depth = 0) {
+    if (!obj || typeof obj !== 'object' || depth > 6) return null;
+    if (typeof obj.ai_generated === 'number' && obj.ai_generated >= 0 && obj.ai_generated <= 1) return obj.ai_generated;
+    for (const value of Object.values(obj)) {
+      const found = waeSeFindAiScore(value, depth + 1);
+      if (found !== null) return found;
+    }
+    return null;
+  }
+
+  // Wraps the page's fetch / XMLHttpRequest so that a response carrying an
+  // AI score is noticed. Runs in the page itself (@inject-into page).
+  function waeSeHookNetwork(onJson) {
+    const inspect = (text) => {
+      if (typeof text !== 'string' || !/^\s*[{[]/.test(text)) return;
+      try { onJson(JSON.parse(text)); } catch (e) { /* not JSON */ }
+    };
+    const origFetch = window.fetch;
+    if (typeof origFetch === 'function') {
+      window.fetch = function (...args) {
+        const promise = origFetch.apply(this, args);
+        promise.then((res) => {
+          try { res.clone().text().then(inspect).catch(() => {}); } catch (e) { /* ignore */ }
+        }).catch(() => {});
+        return promise;
+      };
+    }
+    const origSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.send = function (...args) {
+      this.addEventListener('load', () => {
+        try {
+          if (this.responseType === '' || this.responseType === 'text') inspect(this.responseText);
+          else if (this.responseType === 'json' && this.response) onJson(this.response);
+        } catch (e) { /* ignore */ }
+      });
+      return origSend.apply(this, args);
+    };
+  }
+
+  // Resolves with { score, source } as soon as the verdict shows up, or
+  // null after WAE_SE_RESULT_TIMEOUT_MS. Two ways of seeing it: a network
+  // response with the score (exact), else a percentage in text that was
+  // not on the page before the photo was handed over (new lines only, so
+  // the page's own marketing numbers never count, and lines that say
+  // "not"/"human"/"real"/"accuracy" are skipped). Call arm() right before the hand-over.
+  function waeSeStartResultWatch() {
+    let armed = false;
+    let settled = false;
+    let resolveWatch;
+    let baseline = new Set();
+    let poll = null;
+    const promise = new Promise((resolve) => { resolveWatch = resolve; });
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearInterval(poll);
+      clearTimeout(timer);
+      resolveWatch(value);
+    };
+    const timer = setTimeout(() => finish(null), WAE_SE_RESULT_TIMEOUT_MS + 8000);
+    const pageLines = () => (document.body ? document.body.innerText || '' : '')
+      .split('\n').map((line) => line.trim()).filter(Boolean);
+    waeSeHookNetwork((obj) => {
+      if (!armed) return;
+      const score = waeSeFindAiScore(obj);
+      if (score !== null) {
+        console.info('[Wayfarer Map Mods - Abuse Reports] Sightengine verdict from a response:', score);
+        finish({ score, source: 'response' });
+      }
+    });
+    const PERCENT_RES = [
+      /(\d{1,3}(?:[.,]\d+)?)\s*%\s*(?:chance\s+|likelihood\s+|probability\s+)?(?:of\s+being\s+)?(?:AI|artificial)/i,
+      /(?:AI[- ]generated|artificial)[^\d%\n]{0,40}(\d{1,3}(?:[.,]\d+)?)\s*%/i,
+    ];
+    return {
+      promise,
+      arm() {
+        armed = true;
+        baseline = new Set(pageLines());
+        poll = setInterval(() => {
+          const fresh = pageLines().filter((line) => !baseline.has(line) && !/\b(?:not|non|no|human|real|authentic|natural)\b|accura/i.test(line));
+          for (const line of fresh) {
+            for (const re of PERCENT_RES) {
+              const m = line.match(re);
+              if (!m) continue;
+              const pct = parseFloat(m[1].replace(',', '.'));
+              if (pct >= 0 && pct <= 100) {
+                console.info('[Wayfarer Map Mods - Abuse Reports] Sightengine verdict from the page text:', line);
+                finish({ score: pct / 100, source: 'page' });
+                return;
+              }
+            }
+          }
+        }, 500);
+      },
+    };
+  }
+
+  // Tell the user, and the Wayfarer tab that opened this one (when it kept
+  // the opener, see the review row's Sightengine button), what the verdict
+  // was. Wayfarer decides what happens next.
+  function waeSeReportResult(sessionId, found) {
+    const score = found ? found.score : null;
+    if (score === null) {
+      waeAfShowStatus('Sightengine check: could not read the verdict from the page. Check it by eye.', 'error');
+    } else {
+      const pct = Math.round(score * 1000) / 10;
+      waeAfShowStatus(`Sightengine check: ${pct}% AI-generated.`, 'info');
+    }
+    if (!sessionId || !window.opener) return;
+    try {
+      window.opener.postMessage({ type: WAE_SE_MSG_RESULT, protocolVersion: WAE_AF_PROTOCOL, sessionId, score }, WAE_WAYFARER_ORIGIN);
+    } catch (e) { /* the Wayfarer tab is gone */ }
+  }
+
+  async function waeSeStartCompanion() {
+    const params = new URLSearchParams(String(location.hash || '').replace(/^#/, ''));
+    const photoUrl = params.get(WAE_SE_HASH_IMAGE) || '';
+    const seSession = params.get(WAE_SE_HASH_SESSION) || '';
+    if (!photoUrl) return; // an ordinary visit -- do nothing
+    const watch = waeSeStartResultWatch();
+    try { history.replaceState(null, '', location.pathname + location.search); } catch (e) { /* keep the hash */ }
+    if (!waeSeIsAllowedPhotoUrl(photoUrl)) {
+      waeAfShowStatus('Sightengine check: that is not a Wayfarer photo address, so nothing was loaded.', 'error');
+      return;
+    }
+    waeAfShowStatus('Sightengine check: loading the review photo\u2026', 'info');
+    let file;
+    try {
+      const res = await fetch(photoUrl, { mode: 'cors', credentials: 'omit' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const blob = await res.blob();
+      const type = blob.type && blob.type.startsWith('image/') ? blob.type : 'image/jpeg';
+      file = new File([blob], `wayfarer-review-photo.${type.split('/')[1].replace('jpeg', 'jpg')}`, { type });
+    } catch (e) {
+      console.warn('[Wayfarer Map Mods - Abuse Reports] Could not load the review photo for Sightengine:', e, photoUrl);
+      waeAfShowStatus('Sightengine check: could not load the photo here. Save it from the review page and drop it on this page yourself.', 'error');
+      return;
+    }
+    // The page's own upload input (hidden or not) is the most reliable way
+    // in; a synthetic drop on the document is the fallback.
+    await new Promise((r) => (document.readyState === 'loading' ? document.addEventListener('DOMContentLoaded', r, { once: true }) : r()));
+    const input = await waeSeWaitFor(() => document.querySelector('input[type="file"]'), 8000);
+    try {
+      watch.arm();
+      const dt = new DataTransfer();
+      dt.items.add(file);
+      if (input) {
+        input.files = dt.files;
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+      } else {
+        for (const type of ['dragenter', 'dragover', 'drop']) {
+          document.body.dispatchEvent(new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer: dt }));
+        }
+      }
+      waeAfShowStatus('Sightengine check: photo sent to the checker. Waiting for the verdict\u2026 (if nothing shows up, drop the photo on the page yourself)', 'ok');
+      watch.promise.then((found) => waeSeReportResult(seSession, found));
+    } catch (e) {
+      console.warn('[Wayfarer Map Mods - Abuse Reports] Could not hand the photo to Sightengine:', e);
+      waeAfShowStatus('Sightengine check: could not hand the photo to the page. Save it from the review page and drop it on this page yourself.', 'error');
+    }
+  }
+
+  if (location.origin === WAE_SE_ORIGIN) {
+    waeSeStartCompanion();
+    return;
   }
 
   // The Help Center page runs only the half above and stops here -- none
@@ -3292,6 +3507,8 @@
   // v1.78.0, for the Marked Wayspots list modal (Lucide "trash-2" and "clipboard-check")
   const WAE_TRASH_ICON_SVG = waeIconSvg('<path d="M3 6h18"></path><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"></path><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><path d="M10 11v6M14 11v6"></path>');
   const WAE_CLIPBOARD_CHECK_ICON_SVG = waeIconSvg('<rect width="8" height="4" x="8" y="2" rx="1" ry="1"></rect><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path><path d="m9 14 2 2 4-4"></path>');
+  // v1.89.0, for the review row's Sightengine button (Lucide \"scan-search\")
+  const WAE_SCAN_SEARCH_ICON_SVG = waeIconSvg('<path d=\"M3 7V5a2 2 0 0 1 2-2h2\"></path><path d=\"M17 3h2a2 2 0 0 1 2 2v2\"></path><path d=\"M21 17v2a2 2 0 0 1-2 2h-2\"></path><path d=\"M7 21H5a2 2 0 0 1-2-2v-2\"></path><circle cx=\"12\" cy=\"12\" r=\"3\"></circle><path d=\"m16 16-1.9-1.9\"></path>');
   // v1.82.0, for the Marked Wayspots list's Deselect all button (Lucide "square-minus")
   const WAE_DESELECT_ICON_SVG = waeIconSvg('<rect width="18" height="18" x="3" y="3" rx="2"></rect><path d="M8 12h8"></path>');
 
@@ -3341,6 +3558,26 @@
 
   function waeRemoveReviewAbuseRows() {
     document.querySelectorAll('.wae-review-abuse-row').forEach((el) => el.remove());
+  }
+
+  // v1.91.0: the addresses of the review's photos, from the review response,
+  // at full size (\"=s0\", as Image Mods' magnifier opens them): the new
+  // Wayspot's `imageUrl`, its `supportingImageUrls`, and the `newPhotos` of
+  // a photo review. Only Google-hosted addresses are taken; unusable
+  // entries stay as '' so the positions still line up with the photo cards
+  // and the carousel.
+  function waeFullSizePhotoUrl(v) {
+    if (typeof v !== 'string' || !waeSeIsAllowedPhotoUrl(v)) return '';
+    return v.includes('=') ? v : `${v}=s0`;
+  }
+
+  function waeReviewPhotoUrls(c) {
+    const list = (arr, pick) => (Array.isArray(arr) ? arr.map((x) => waeFullSizePhotoUrl(pick(x))) : []);
+    return {
+      main: waeFullSizePhotoUrl(c.imageUrl),
+      supporting: list(c.supportingImageUrls, (x) => x),
+      photos: list(c.newPhotos, (x) => x && x.value),
+    };
   }
 
   function waeBuildReviewAbuseRow(candidate) {
@@ -3420,8 +3657,99 @@
       }, 1500);
     });
 
-    // v1.79.1: the note field first, then all four icon buttons to its right
+    // v1.89.0 / v1.91.0: opens Sightengine's AI-image check with this
+    // review's photo already loaded (see the Sightengine companion near the
+    // top of this file): the new Wayspot's photo, or the first photo of a
+    // photo review. Edits have no photo, so they get no button; a review
+    // whose photo address wasn't in the response gets a disabled one, with
+    // the reason in the tooltip.
+    let seBtn = null;
+    const sePhotoUrl = (candidate.photos && (candidate.photos.main || candidate.photos.photos.find(Boolean))) || '';
+    if (candidate.type === 'NEW' || candidate.type === 'PHOTO') {
+      seBtn = document.createElement('button');
+      seBtn.type = 'button';
+      seBtn.className = 'wae-review-fill-btn wae-review-se-btn';
+      const seTitle = sePhotoUrl
+        ? 'Check this photo for AI generation on Sightengine (opens a new tab)'
+        : 'No photo address found in this review, so it cannot be sent to Sightengine';
+      seBtn.innerHTML = WAE_SCAN_SEARCH_ICON_SVG;
+      seBtn.title = seTitle;
+      seBtn.setAttribute('aria-label', seTitle);
+      seBtn.disabled = !sePhotoUrl;
+      seBtn.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (!sePhotoUrl) return;
+        // v1.92.0: with the "start the auto-fill on an AI verdict" setting on
+        // (the default), the tab keeps its opener so the verdict can come
+        // back to this tab; with it off the tab is cut loose as before.
+        const autoStart = wfmmWindow.WFMM.settings.get(PLUGIN_ID, 'sightengineAutoStart', true) !== false;
+        const checkId = autoStart
+          ? ((typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`)
+          : '';
+        const hash = `${WAE_SE_HASH_IMAGE}=${encodeURIComponent(sePhotoUrl)}${checkId ? `&${WAE_SE_HASH_SESSION}=${checkId}` : ''}`;
+        const popup = window.open(`${WAE_SE_URL}#${hash}`, '_blank');
+        if (popup && !autoStart) { try { popup.opener = null; } catch (e) { /* ignore */ } }
+        if (popup && autoStart) {
+          const now = Date.now();
+          for (const [id, c] of waeSeChecks) if (now - c.createdAt > 10 * 60 * 1000) waeSeChecks.delete(id);
+          waeSeChecks.set(checkId, {
+            popup,
+            createdAt: now,
+            onResult: (score) => {
+              if (score === null) {
+                if (seBtn.isConnected) seBtn.title = 'Sightengine: the verdict could not be read';
+                return;
+              }
+              const pct = Math.round(score * 1000) / 10;
+              const high = score > WAE_SE_AI_THRESHOLD;
+              if (seBtn.isConnected) {
+                seBtn.title = `Sightengine: ${pct}% AI-generated${high ? ' (over 90%, starting the abuse form auto-fill)' : ''}`;
+              }
+              if (!high) return;
+              // A moment to see the verdict, then this review's Wayspot (and the
+              // note beside it, as read now) goes into the abuse form in the
+              // same tab -- the review-row wand's workflow without a new tab.
+              // v1.93.0: this workflow fills the form its own way: the issue is
+              // always "Photo Issues"; the Abuse report details are the note
+              // typed beside the row (when there is one) and the verdict, and
+              // nothing else (not the settings' default text); the location
+              // field only has the Wayspot's name and coordinates.
+              const aiNote = `Sightengine estimates this photo is ${pct}% AI-generated`;
+              setTimeout(() => {
+                const result = waeOpenAbuseFormAutofill(() => ({
+                  items: [{ name, lat, lng, note: '' }],
+                  includeNotes: false,
+                  overrides: {
+                    issueType: 'Photo Issues',
+                    reportDetails: [noteInput.value.trim(), aiNote].filter(Boolean).join('\n'),
+                    locationNotes: false,
+                  },
+                }), undefined, popup, () => {
+                  // v1.94.0: once the form is submitted the Wayspot goes straight into the
+                  // abuse reports table as a \"Reported\" row (the note and the verdict as its
+                  // comment); the next scan that finds its ticket email replaces it.
+                  waeAddReportedRecords([{ name, lat, lng, note: [noteInput.value.trim(), aiNote].filter(Boolean).join('; ') }])
+                    .catch((e) => console.warn('[Wayfarer Map Mods - Abuse Reports] Could not add the reported Wayspot to the table:', e));
+                });
+                if (result !== 'opened') console.warn('[Wayfarer Map Mods - Abuse Reports] Could not send the Sightengine tab to the abuse form (closed?).');
+              }, 1500);
+            },
+          });
+        }
+        seBtn.innerHTML = popup ? WAE_CHECK_ICON_SVG : WAE_X_ICON_SVG;
+        seBtn.title = popup ? 'Opened' : 'Popup blocked';
+        setTimeout(() => {
+          if (!seBtn.isConnected) return;
+          seBtn.innerHTML = WAE_SCAN_SEARCH_ICON_SVG;
+          seBtn.title = seTitle;
+        }, 1500);
+      });
+    }
+
+    // v1.79.1: the note field first, then all the icon buttons to its right
     row.append(noteInput, copyBtn, markBtn, fillBtn, formLink);
+    if (seBtn) row.append(seBtn);
     return row;
   }
 
@@ -3463,7 +3791,7 @@
       // waeReviewIwResolvePoi()).
       waeCaptureReviewNearbyPortals(c);
       if (c.type === 'NEW' || c.type === 'PHOTO' || c.type === 'EDIT') {
-        waeLatestReviewCandidate = { type: c.type, title: c.title, lat: c.lat, lng: c.lng };
+        waeLatestReviewCandidate = { type: c.type, title: c.title, lat: c.lat, lng: c.lng, photos: waeReviewPhotoUrls(c) };
         waeInsertReviewAbuseRow(waeLatestReviewCandidate);
       }
       waeReviewIwSchedule(); // a different review means different (or no) nearby Wayspots
@@ -4807,7 +5135,7 @@
        waeBuildReviewAbuseRow(). Reuses the side panel's note/button
        styles above; only the row layout and the copy icon are new. */
     /* v1.79.1: one row, never wrapped: the note field takes all the width
-       the four icon buttons to its right leave over (it shrinks, they don't). */
+       the icon buttons to its right leave over (it shrinks, they don't). */
     .wae-review-abuse-row{ display:flex; align-items:center; gap:6px; flex-wrap:nowrap; width:100%; box-sizing:border-box; margin:4px 0; }
     .wae-review-abuse-row .wae-detail-mark-note{ flex:1 1 0; min-width:0; }
     .wae-review-copy-btn{
@@ -4828,6 +5156,7 @@
     .wae-review-form-link:hover,
     .wae-review-fill-btn:hover,
     .wae-detail-mark-btn.wae-icon-btn:not(:disabled):hover{ background:#e0e7ff; }
+    .wae-review-fill-btn:disabled{ opacity:.45; cursor:not-allowed; }
     .wae-review-copy-btn.wae-copied{ color:#16a34a; background:#f0fdf4; border-color:#bbf7d0; }
     /* Note field + button inside a review map info window (see
        waeReviewIwSyncNow()). Stacked and sized to line up with the
@@ -6575,6 +6904,21 @@
   // copying" choice, as Copy All -- that is what the form's location
   // parser (opr-email-lib.js) reads back out of the ticket email later.
   // ---------------------------------------------------------------------
+  // v1.92.0: Sightengine checks opened from the review row that are waiting for
+  // their verdict: sessionId -> { popup, createdAt, onResult(score|null) }
+  const waeSeChecks = new Map();
+
+  function waeHandleSightengineMessage(event) {
+    if (event.origin !== WAE_SE_ORIGIN) return;
+    const data = event.data;
+    if (!data || data.type !== WAE_SE_MSG_RESULT || data.protocolVersion !== WAE_AF_PROTOCOL) return;
+    const check = waeSeChecks.get(data.sessionId);
+    if (!check || event.source !== check.popup) return;
+    waeSeChecks.delete(data.sessionId);
+    const score = typeof data.score === 'number' && data.score >= 0 && data.score <= 1 ? data.score : null;
+    try { check.onResult(score); } catch (e) { console.warn('[Wayfarer Map Mods - Abuse Reports] Sightengine result handler failed:', e); }
+  }
+
   const waeAbuseFormSessions = new Map(); // sessionId -> { popup, getSource, kind, itemIds, createdAt, expiresAt, submitted }
   // v1.81.0: the "clear the draft list?" question after a submitted form.
   // waeShowClearPromptHook is set by the open list modal (shows the question
@@ -6604,6 +6948,8 @@
       abuser: String(s.get(PLUGIN_ID, 'reporterAbuser', '') || '').trim(),
       // v1.88.0: the list goes into the report details too, with the notes
       listInDetails: s.get(PLUGIN_ID, 'reporterListInDetails', false) === true,
+      // v1.92.0: a Sightengine verdict over 90% AI-generated starts the auto-fill
+      sightengineAutoStart: s.get(PLUGIN_ID, 'sightengineAutoStart', true) !== false,
     };
   }
 
@@ -6632,23 +6978,36 @@
     // copying" says) and the report details get it WITH notes. The default
     // report details text from the settings is NOT used then (v1.88.1).
     const listInDetails = contact.listInDetails;
+    // v1.93.0: a workflow can pin parts of the form (the Sightengine one
+    // does) with `source.overrides`: issueType, reportDetails (instead of the
+    // settings' default text and of the list-in-details option) and
+    // locationNotes: false (the location field then only has name + coordinates).
+    const o = source.overrides || {};
     return {
       name: contact.name,
       email: contact.email,
       watchSubmit: contact.afterSubmit,
-      issueType: contact.issueType,
-      reportDetails: listInDetails ? linesOf(true) : contact.reportDetails,
+      issueType: o.issueType !== undefined ? o.issueType : contact.issueType,
+      reportDetails: o.reportDetails !== undefined
+        ? o.reportDetails
+        : (listInDetails ? linesOf(true) : contact.reportDetails),
       abuser: contact.abuser,
       count: list.length,
-      locationDetails: linesOf(listInDetails ? false : includeNotes),
+      locationDetails: o.locationNotes === false ? linesOf(false) : linesOf(listInDetails ? false : includeNotes),
     };
   }
 
   // 'opened' | 'empty' | 'blocked'. Must run straight from a click, or the
-  // browser's popup blocker will refuse the window.open() call.
+  // browser's popup blocker will refuse the window.open() call -- unless
+  // `existingPopup` is given (v1.92.0): then that tab, one this tab opened
+  // earlier (the Sightengine check), is sent to the form instead of a new
+  // one being opened, which needs no click.
   // `onlyIds` (optional, list mode only) limits the form to those Marked
   // Wayspots (the ticked rows); without it the whole list is sent.
-  function waeOpenAbuseFormAutofill(getSource, onlyIds) {
+  // `onSubmitted` (optional, v1.94.0) runs once when the form tab reports the
+  // form as submitted (only happens with the \"After the form is submitted\"
+  // setting on).
+  function waeOpenAbuseFormAutofill(getSource, onlyIds, existingPopup, onSubmitted) {
     const subset = !getSource && Array.isArray(onlyIds) && onlyIds.length ? onlyIds.slice() : null;
     if (!(getSource ? getSource().items : waeMarkedItemsFor(subset)).length) return 'empty';
     const sessionId = (typeof crypto !== 'undefined' && crypto.randomUUID)
@@ -6661,7 +7020,15 @@
     }).toString();
     // No "noopener" -- the Help Center tab needs window.opener to ask for
     // the data.
-    const popup = window.open(url.toString(), '_blank');
+    let popup;
+    if (existingPopup) {
+      // a tab this one opened (and that kept its opener) can be navigated from here
+      if (existingPopup.closed) return 'blocked';
+      try { existingPopup.location.href = url.toString(); } catch (e) { return 'blocked'; }
+      popup = existingPopup;
+    } else {
+      popup = window.open(url.toString(), '_blank');
+    }
     if (!popup) return 'blocked';
     const now = Date.now();
     // sessions linger for hours, not the 15 minutes the data request is good
@@ -6673,6 +7040,7 @@
       onlyIds: subset,
       kind: getSource ? 'review' : 'list', // the review page's button sends one Wayspot, not the draft list
       itemIds: [],
+      onSubmitted: typeof onSubmitted === 'function' ? onSubmitted : null,
       createdAt: now,
       expiresAt: now + WAE_AF_SESSION_TTL_MS,
       submitted: false,
@@ -6709,6 +7077,9 @@
     if (data.type === WAE_AF_MSG_SUBMITTED) {
       if (session.submitted) return;
       session.submitted = true;
+      if (session.onSubmitted) {
+        try { session.onSubmitted(); } catch (e) { console.warn('[Wayfarer Map Mods - Abuse Reports] After-submit handler failed:', e); }
+      }
       if (session.kind !== 'list' || !session.itemIds.length) return;
       const ids = session.itemIds.slice();
       if (waeShowClearPromptHook) waeShowClearPromptHook(ids);
@@ -7580,6 +7951,11 @@
       checked: contact.listInDetails,
       onChange: (checked) => wfmmWindow.WFMM.settings.set(PLUGIN_ID, 'reporterListInDetails', checked === true),
     });
+    const sightengineToggle = ui.checkboxRow({
+      label: 'When the Sightengine check says a review photo is over 90% AI-generated, start the abuse form auto-fill for that Wayspot',
+      checked: contact.sightengineAutoStart,
+      onChange: (checked) => wfmmWindow.WFMM.settings.set(PLUGIN_ID, 'sightengineAutoStart', checked === true),
+    });
     const afterSubmitToggle = ui.checkboxRow({
       label: 'After the form is submitted: close its tab and offer to clear the draft list',
       checked: contact.afterSubmit,
@@ -7587,7 +7963,7 @@
     });
     const autofillSection = ui.section({
       title: 'Abuse form auto-fill',
-      hint: 'Entered in the Help Center abuse form by the \u201cAuto-fill abuse form\u201d button in the Marked Wayspots list, next to the list of Wayspots itself. Leave a field empty to fill it in yourself; fields that already have text are never overwritten. The list option (off by default) puts the Wayspots, with their notes, in the report details instead of your default text, while the location field gets the list without notes. The last option (off by default) watches for your click on Submit: once the form has gone, the tab closes after 1.5 seconds and the draft list asks whether to clear the Wayspots that were sent. Saved with this plugin\u2019s settings, so it is included in WFMM\u2019s settings backups.',
+      hint: 'Entered in the Help Center abuse form by the \u201cAuto-fill abuse form\u201d button in the Marked Wayspots list, next to the list of Wayspots itself. Leave a field empty to fill it in yourself; fields that already have text are never overwritten. The list option (off by default) puts the Wayspots, with their notes, in the report details instead of your default text, while the location field gets the list without notes. The Sightengine option (on by default) applies to the review row\u2019s Sightengine button: if the verdict is over 90% AI-generated, that tab goes to the abuse form and fills it in for the review\u2019s Wayspot (issue Photo Issues, the verdict and your note as the report details); with it off the tab simply stays on Sightengine. The last option (off by default) watches for your click on Submit: once the form has gone, the tab closes after 1.5 seconds and the draft list asks whether to clear the Wayspots that were sent. Saved with this plugin\u2019s settings, so it is included in WFMM\u2019s settings backups.',
       children: [
         ui.fieldRow({ label: 'Name', input: reporterNameInput }),
         ui.fieldRow({ label: 'Email', input: reporterEmailInput }),
@@ -7595,6 +7971,7 @@
         ui.fieldRow({ label: 'Report details', input: reporterDetailsInput }),
         ui.fieldRow({ label: 'Abuser(s)', input: reporterAbuserInput }),
         listInDetailsToggle.row,
+        sightengineToggle.row,
         afterSubmitToggle.row,
       ],
     });
@@ -8007,6 +8384,7 @@
     // auto-fill (see waeOpenAbuseFormAutofill()). Re-adding the same
     // function reference on a restart is a no-op.
     window.addEventListener('message', waeHandleAbuseFormMessage);
+    window.addEventListener('message', waeHandleSightengineMessage);
     // A review candidate can arrive before this runs (the request hook is
     // installed at load) -- show its row now that the plugin's on.
     try {
@@ -8133,7 +8511,9 @@
   function stopPlugin() {
     waePluginActive = false;
     window.removeEventListener('message', waeHandleAbuseFormMessage);
+    window.removeEventListener('message', waeHandleSightengineMessage);
     waeAbuseFormSessions.clear();
+    waeSeChecks.clear();
     waeRemoveReviewAbuseRows();
     waeSidePanelReadyUnsub?.();
     waeSidePanelReadyUnsub = null;

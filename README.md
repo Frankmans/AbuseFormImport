@@ -25,7 +25,7 @@ Both scripts are add-ons for [Tntnnbltn's wayfarer-map-mods suite][base] and use
 
 The two helper libraries (`opr-email-lib.js` and `wst-storage.js`) are downloaded automatically. There is nothing else to install.
 
-The extractor also runs on Niantic's Help Center (`scopelyexplore.helpshift.com`), but only in a tab that the Wayfarer tab opened for [abuse form auto-fill](#abuse-form-auto-fill). On any other visit to the Help Center it does nothing.
+The extractor also runs on Niantic's Help Center (`scopelyexplore.helpshift.com`), but only in a tab that the Wayfarer tab opened for [abuse form auto-fill](#abuse-form-auto-fill), and on Sightengine's AI image detector page (`sightengine.com/detect-ai-generated-images`), but only in a tab opened by the [Sightengine button](#checking-a-photo-for-ai-generation). On any other visit to those pages it does nothing. Your userscript manager may ask you to approve the extra sites when you update.
 
 ## Setting up Gmail sync (optional)
 
@@ -314,6 +314,7 @@ The wand button in the Marked Wayspots list opens Niantic's "Reporting Abuse in 
 | **Report details** | Default text for *Abuse report details*. Empty means you write it. |
 | **Abuser(s)** | Default text for *Details of the abuser(s)*. Empty means you write it. |
 | **Also put the Wayspot list, with notes, in the report details** | Off by default. When on, the **location field** gets the list *without* notes (whatever *Include notes when copying* says) and the **report details** get the list *with* notes instead of your default report details text, which is not used while this is on. Applies to the list's wand and to the review page's wand. |
+| **Start the auto-fill on an AI verdict** | On by default. Applies to the review row's [Sightengine button](#checking-a-photo-for-ai-generation): when Sightengine says the photo is over 90% AI-generated, that tab goes to the abuse form and fills it in for the review's Wayspot (issue *Photo Issues*, the verdict in the report details). Off: the tab stays on Sightengine, and is cut loose from the Wayfarer tab. |
 | **After the form is submitted** | Off by default. See below. |
 
 These are saved with the suite's settings, so they are included in **Settings > Backups**. That includes your name and email, so keep backup files private.
@@ -348,16 +349,48 @@ Favorites are saved with the suite's settings and included in **Settings > Backu
 
 ## Abuse helper on the review page
 
-This replaces the standalone **Wayfarer Abuse Text Formatter** script. Uninstall that script once this one is running, or you'll see both. On `https://wayfarer.scopely.com/new/review`, every review candidate (new Wayspot, photo or edit) gets a single row: a **note field**, followed by four icon buttons (hover for the tooltip):
+This replaces the standalone **Wayfarer Abuse Text Formatter** script. Uninstall that script once this one is running, or you'll see both. On `https://wayfarer.scopely.com/new/review`, every review candidate (new Wayspot, photo or edit) gets a single row: a **note field**, followed by icon buttons (hover for the tooltip):
 
-![The review-page row: note field and four icon buttons](docs/images/review-abuse-row.svg)
+![The review-page row: note field and five icon buttons](docs/images/review-abuse-row.svg)
 
 - **Copy** copies `Name, lat, lng` in the same format as the Marked Wayspots list's Copy All, with the note from the field appended when **Include notes when copying** is on. The icon briefly turns into a check mark to confirm.
 - **Add to abuse report draft** (flag with a plus) adds the candidate, with the note, to your Marked Wayspots list. If it is already there, the note is overwritten.
 - **Auto-fill the abuse form for this review only** (wand) opens the abuse form and fills it with just this Wayspot and the note beside it. Nothing is added to your draft list. The note is always included here, whatever the *Include notes when copying* checkbox says, and one typed or changed while the form is loading is picked up too. Name, email and the other [settings](#settings-for-the-auto-fill) are used as usual. If the browser blocks the new tab, the icon shows a cross.
 - **Open the abuse form** (page with an exclamation mark) opens the Help Center article in a new tab, so your review in progress isn't lost.
+- **Check the photo on Sightengine** (magnifier in a frame) opens Sightengine's *Detect AI-generated images* page in a new tab with this review's photo already loaded, see [Checking a photo for AI generation](#checking-a-photo-for-ai-generation). It only appears on new-Wayspot and photo reviews, since edits have no photo.
 
 The row only appears while the plugin is enabled in the Plugin Manager.
+
+## Checking a photo for AI generation
+
+Many reported Wayspots have an AI-generated photo. The last icon in the review-page row (a magnifier in a frame) sends that review's photo to [Sightengine's AI image detector](https://sightengine.com/detect-ai-generated-images):
+
+1. Click the icon. A new tab opens on Sightengine's page.
+2. The extractor, which also runs on that one page, downloads the photo at full size and hands it to the page's upload box as if you had picked the file.
+3. Sightengine shows its verdict and score. Treat it as one clue, not proof: Sightengine itself says no detector is 100% reliable, and newly released generators may not be recognised yet.
+4. The extractor also reads the score. A small message at the bottom left of the Sightengine tab shows it (for example `97% AI-generated`), and the icon's tooltip in the Wayfarer tab repeats it.
+
+**Starting the auto-fill automatically.** When the score is **over 90%**, the Sightengine tab is sent on to the Help Center abuse form (after a moment, so you can see the verdict) and the form is filled in for this review's Wayspot. This workflow fills the form its own way, whatever your auto-fill settings say:
+
+- **Issue type:** always *Photo Issues*.
+- **Abuse report details:** the note you typed beside the review row (if any), then the verdict on its own line, for example `Sightengine estimates this photo is 97% AI-generated`. Your default report details text and the list-in-details option are not used here.
+- **Provide details of the location(s):** only the Wayspot's name and coordinates, without any note.
+- Your name, email and the abuser(s) text are used as usual. Nothing is submitted; you check and submit it yourself.
+
+**In the table.** With *After the form is submitted* on, the moment the form has gone through (the tab closes), the Wayspot is added to the abuse reports table as a teal **Reported** row, with the note and the verdict as its comment, see [Wayspots you reported yourself](#wayspots-you-reported-yourself). The next scan that finds its ticket email replaces that row with the real ticket. Without that setting, the extractor cannot tell the form was submitted, so no row is added.
+
+At 90% or below nothing else happens, and you stay on the Sightengine page.
+
+The verdict is read from Sightengine's page while it works (from its own response when it has one, otherwise from a percentage that shows up in the page text after the photo was sent). If it cannot be read, the tab says so and nothing is started. You can turn the automatic start off with the *Start the auto-fill on an AI verdict* setting.
+
+Notes:
+
+- On a new-Wayspot review it sends the Wayspot's photo, on a photo review the first photo. Edit reviews have no photo of their own, so they get no icon.
+- The photo is **uploaded to Sightengine**, a third party, the same as dropping it on their page yourself. Their free demo has a usage limit; after that the page asks you to sign up.
+- Sightengine's page has no way to take a picture address, so the hand-over relies on the page's upload box. If Sightengine changes its page, or the browser cannot download the photo, the tab shows a red message and you can save the photo and drop it on the page yourself.
+- If a review's photo address could not be found in the review data, the icon is greyed out with the reason in its tooltip.
+- The extractor does nothing on Sightengine unless the tab was opened by this icon, and only accepts Google-hosted photo addresses (where Wayfarer serves review photos from).
+- For the verdict to reach the Wayfarer tab, the Sightengine tab keeps a link back to the tab that opened it (with the automatic start turned off, that link is cut, as before). Sightengine's own page could in principle use that link, for instance to navigate the Wayfarer tab elsewhere, so turn the setting off if you don't want that.
 
 ## Abuse draft in review map info windows
 
@@ -380,7 +413,7 @@ When you click a nearby Wayspot on a review's map (the duplicate-check map, or t
 
 ## Data storage & privacy
 
-Everything is stored in your own browser (IndexedDB and the suite's settings) and never leaves it, apart from the Gmail API calls you make yourself and the abuse form auto-fill. The auto-fill passes your list, name and email from the Wayfarer tab to the Help Center tab it opened (the two tabs talk to each other directly, and only to those exact origins), and the form is submitted by you, to Niantic.
+Everything is stored in your own browser (IndexedDB and the suite's settings) and never leaves it, apart from the Gmail API calls you make yourself and the abuse form auto-fill and Sightengine check. The auto-fill passes your list, name and email from the Wayfarer tab to the Help Center tab it opened (the two tabs talk to each other directly, and only to those exact origins), and the form is submitted by you, to Niantic. The Sightengine button uploads the review's photo to Sightengine.
 
 - **Imported emails** are kept in one local database.
 - **Extracted reports** are kept in a second, separate local database. This includes CSV-imported rows and **Reported** rows.
@@ -402,6 +435,9 @@ Both the importer and the extractor panels have **Export backup JSON**, **Import
 - **A script works but isn't listed under External plugins in the Plugin Manager.** Update to the latest version of both scripts.
 - **Gmail sign-in is refused.** Check that your Google account is listed under **Test users** and that `https://wayfarer.scopely.com` is in the OAuth client's **Authorized JavaScript origins**.
 - **The wand opens a tab but nothing gets filled in.** The Help Center tab only gets its data from the Wayfarer tab that opened it, so keep that tab open and don't navigate it away. If the Help Center tab says the Wayfarer tab did not answer, reload the Wayfarer tab (it needs a current version of the extractor) and click the wand again.
+- **The Sightengine tab opens but no photo shows up.** The page may have changed or the photo may not have been downloadable; the red message at the bottom left says which. Save the photo from the review page and drop it on the Sightengine page. If the message says it could not hand the photo to the page, check the browser console (look for `Abuse Reports`) and report what it says.
+- **The Sightengine check ran but the abuse form did not start.** Check the message at the bottom left of the Sightengine tab: if it shows a score at or below 90%, that is expected; if it says it could not read the verdict, Sightengine's page may have changed, so check it by eye (and report what the browser console says, look for `Sightengine verdict`). A pop-up or tab that was closed before the verdict arrived cannot be continued either. Reloading the Wayfarer tab loses a pending check.
+- **The Sightengine icon is greyed out.** The review data had no photo address (edits never have an icon at all). Reloading the review page re-reads it.
 - **The wand shows a cross.** The browser blocked the new tab. Allow pop-ups for `wayfarer.scopely.com`, then click again.
 - **Name and email are left empty.** Fill them in under the cog's **Abuse form auto-fill** section. Empty settings are left for you on purpose.
 - **The form was filled in the wrong place or not at all.** Use **Copy All** (or **Copy selected**) in the Marked Wayspots list and paste into the form's location field yourself, and check the browser console for the field list the script logs.
