@@ -254,7 +254,7 @@ Drag the border between two column headers to resize them. A drag trades width b
 
 Your abuse report draft: a list of Wayspots you are about to report yourself. It is separate from the ticket table, which covers reports already filed, and it is what the [abuse form auto-fill](#abuse-form-auto-fill) works from. Nothing is sent from the list itself.
 
-**Adding.** Click a Wayspot on the map. In its details card in the side panel, type an optional note (up to 1000 characters) and click the flag-with-a-plus button next to the note field (tooltip: *Add this Wayspot to your abuse report draft*). It flashes a check mark. If the Wayspot is already on the list (matched by coordinates, not name), its note is overwritten with whatever is in the field, including being cleared if the field is empty. A Wayspot's name is only ever filled in or improved this way, never blanked. An "Untitled location" shows as "(unnamed)". The same note field and button also appear on the review page and in review map info windows.
+**Adding.** Click a Wayspot on the map. In its details card in the side panel, type an optional note (up to 1000 characters) and click the flag-with-a-plus button next to the note field (tooltip: *Add this Wayspot to your abuse report draft*). Right next to it is the [Sightengine button](#checking-a-photo-for-ai-generation) for the photo shown in the panel. It flashes a check mark. If the Wayspot is already on the list (matched by coordinates, not name), its note is overwritten with whatever is in the field, including being cleared if the field is empty. A Wayspot's name is only ever filled in or improved this way, never blanked. An "Untitled location" shows as "(unnamed)". The same note field and button also appear on the review page and in review map info windows.
 
 **The list.** Open it with the list icon in the Abuse Reports panel header, or, on the review page, with the list icon in the bar under the map (titled **Abuse Report Draft - Marked Wayspots**):
 
@@ -382,6 +382,8 @@ Many reported Wayspots have an AI-generated photo. The last icon in the review-p
 At 90% or below nothing else happens, and you stay on the Sightengine page.
 
 The verdict is read from Sightengine's page while it works (from its own response when it has one, otherwise from a percentage that shows up in the page text after the photo was sent). If it cannot be read, the tab says so and nothing is started. You can turn the automatic start off with the *Start the auto-fill on an AI verdict* setting.
+
+The same icon sits next to the add-to-draft button in the **map side panel's** note row. There it sends the photo the panel shows for the selected Wayspot (read off the panel when you click, in full size), and everything else works the same: the verdict, the automatic start over 90%, and the **Reported** row once the form is submitted. If the panel shows no photo, the icon flashes a cross and nothing is opened.
 
 Notes:
 
