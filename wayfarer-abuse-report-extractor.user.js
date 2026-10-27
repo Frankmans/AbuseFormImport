@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      2.1.0
+// @version      2.0.8
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV. Can also auto-fill the Help Center abuse form from the Marked Wayspots list, and send a review's photo to Sightengine's AI-image check.
 // @author       Frankmans
 // @grant        none
@@ -3112,12 +3112,139 @@
     return Array.from(document.querySelectorAll('nia-map'));
   }
 
+  // v2.0.1: the redesigned review page no longer has <nia-map> / Angular
+  // contexts to dig the map out of. Two framework-independent ways in:
+  //  (1) google.maps.Map.prototype is patched (as soon as the Maps API
+  //      exists) so every map the page touches registers itself here;
+  //  (2) failing that, the map is searched for in whatever framework state
+  //      (Angular __ngContext__, React fiber) hangs off the ancestors of a
+  //      rendered .gm-style element.
+  const waeCapturedMaps = new Set();
+  function waeCaptureMap(m) {
+    if (m && !waeCapturedMaps.has(m) && waeReviewLooksLikeGoogleMap(m)) waeCapturedMaps.add(m);
+  }
+  (function waeInstallMapCaptureHook() {
+    const METHODS = ['getZoom', 'getCenter', 'getBounds', 'getDiv', 'setCenter', 'setZoom', 'panTo',
+      'fitBounds', 'addListener', 'getProjection', 'getMapTypeId', 'setOptions', 'setMapTypeId'];
+    let tries = 0;
+    const iv = setInterval(() => {
+      tries += 1;
+      try {
+        const proto = wfmmWindow.google && wfmmWindow.google.maps && wfmmWindow.google.maps.Map
+          && wfmmWindow.google.maps.Map.prototype;
+        if (proto) {
+          if (!proto.__waePatched) {
+            for (const name of METHODS) {
+              const orig = proto[name];
+              if (typeof orig !== 'function') continue;
+              proto[name] = function () { waeCaptureMap(this); return orig.apply(this, arguments); };
+            }
+            Object.defineProperty(proto, '__waePatched', { value: true });
+          }
+          const gm = wfmmWindow.google.maps;
+          // objects that are attached to a map: setMap(map) / open(map)
+          for (const cls of ['Circle', 'Marker', 'Polygon', 'Polyline', 'Rectangle', 'GroundOverlay', 'OverlayView', 'Data', 'InfoWindow']) {
+            const cp = gm[cls] && gm[cls].prototype;
+            if (!cp || cp.__waePatched) continue;
+            for (const name of ['setMap', 'open']) {
+              const orig = cp[name];
+              if (typeof orig !== 'function') continue;
+              cp[name] = function (a) {
+                waeCaptureMap(a && a.map ? a.map : a);
+                return orig.apply(this, arguments);
+              };
+            }
+            for (const name of ['getMap']) {
+              const orig = cp[name];
+              if (typeof orig !== 'function') continue;
+              cp[name] = function () { const r = orig.apply(this, arguments); waeCaptureMap(r); return r; };
+            }
+            try { Object.defineProperty(cp, '__waePatched', { value: true }); } catch (e) { /* ignore */ }
+          }
+          // google.maps.event.addListener(instance, ...) and friends
+          if (gm.event && !gm.event.__waePatched) {
+            for (const name of ['addListener', 'addListenerOnce', 'addDomListener', 'trigger']) {
+              const orig = gm.event[name];
+              if (typeof orig !== 'function') continue;
+              try {
+                gm.event[name] = function (inst) { waeCaptureMap(inst); return orig.apply(this, arguments); };
+              } catch (e) { /* read-only namespace */ }
+            }
+            try { Object.defineProperty(gm.event, '__waePatched', { value: true }); } catch (e) { /* ignore */ }
+          }
+          clearInterval(iv);
+        }
+      } catch (e) { /* keep trying */ }
+      if (tries > 1200) clearInterval(iv); // ~1 minute at 50ms
+    }, 50);
+  })();
+
+  function waeReviewMapFromGmStyle() {
+    const isMap = waeReviewLooksLikeGoogleMap;
+    for (const gm of document.querySelectorAll('.gm-style')) {
+      let el = gm;
+      for (let depth = 0; el && depth < 10; depth += 1, el = el.parentElement) {
+        for (const k of Object.keys(el)) {
+          let v;
+          try { v = el[k]; } catch (e) { continue; }
+          if (!v || typeof v !== 'object') continue;
+          if (isMap(v)) return v;
+          if (k.startsWith('__reactFiber$')) {
+            // React: look at this element's owning components' state/props/refs only
+            let f = v;
+            for (let up = 0; f && up < 20; up += 1, f = f.return) {
+              for (const field of ['memoizedState', 'memoizedProps', 'ref', 'dependencies']) {
+                const found = waeReviewFindObjectDeep(f[field], isMap, { maxDepth: 8, maxItems: 4000 });
+                if (found) return found;
+              }
+            }
+          } else if (!k.startsWith('__reactProps$') || true) {
+            const found = waeReviewFindObjectDeep(v, isMap, { maxDepth: 10, maxItems: 20000 });
+            if (found) return found;
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  // v2.0.2: the bar no longer waits for the map object. As soon as a map is
+  // on screen the bar is placed under it (the list button works right away);
+  // once the map object is found it takes over the same bar.
+  function waeEnsureReviewBarFallback() {
+    if (WAE_REVIEW_PULSES.map) return;
+    if (document.getElementById(WAE_REVIEW_TOGGLE_ID)?.isConnected) return;
+    let host = null;
+    let bestArea = 0;
+    for (const gm of document.querySelectorAll('.gm-style')) {
+      const box = gm.parentElement;
+      if (!box) continue;
+      const area = box.offsetWidth * box.offsetHeight;
+      if (area > bestArea) { bestArea = area; host = box; }
+    }
+    if (host) waeInjectReviewToggle(host);
+  }
+
   function waeFindReviewMapOnce() {
+    // old Angular page
     for (const host of waeFindReviewMapHosts()) {
       const ctx = host.__ngContext__;
       if (!ctx) continue;
       const map = waeReviewFindObjectDeep(ctx, waeReviewLooksLikeGoogleMap, { maxDepth: 9, maxItems: 5000 });
       if (map) return { map, host };
+    }
+    // redesigned page: maps captured from the Maps API (newest visible one wins)
+    let best = null;
+    for (const m of Array.from(waeCapturedMaps)) {
+      let div = null;
+      try { div = m.getDiv(); } catch (e) { /* ignore */ }
+      if (!div || !div.isConnected) { waeCapturedMaps.delete(m); continue; }
+      if (div.offsetWidth > 0 && div.offsetHeight > 0) best = { map: m, host: div };
+    }
+    if (best) return best;
+    {
+      const map = waeReviewMapFromGmStyle();
+      if (map) { waeCaptureMap(map); try { return { map, host: map.getDiv() }; } catch (e) { /* ignore */ } }
     }
     return null;
   }
@@ -3145,7 +3272,9 @@
   let waeReviewPeriodicRecheckTimer = null;
 
   function waeReviewIsOnRoute() {
-    return wfmmWindow.WFMM.routes.is('review');
+    try { if (wfmmWindow.WFMM.routes.is('review')) return true; } catch (e) { /* fall through to the URL check */ }
+    // v2.0.1: the redesigned review page may not be recognised by Map Mods' router
+    return /\/review(\/|$)/.test(location.pathname);
   }
 
   function waeStopReviewMapSearch() {
@@ -3163,6 +3292,7 @@
         waeSetReviewMap(found.map, found.host);
         return;
       }
+      waeEnsureReviewBarFallback();
       waeReviewMapSearchAttempts += 1;
       if (waeReviewMapSearchAttempts < WAE_REVIEW_MAP_SEARCH_MAX_ATTEMPTS) {
         waeReviewMapSearchTimer = setTimeout(tick, WAE_REVIEW_MAP_SEARCH_INTERVAL_MS);
@@ -3205,9 +3335,14 @@
   // burst every single 3-second tick forever.
   function waeReviewPeriodicRecheck() {
     if (!waeReviewIsOnRoute()) return;
+    if (!WAE_REVIEW_PULSES.map) waeEnsureReviewBarFallback();
     if (!waeReviewMapStillValid()) {
+      const hadMap = !!WAE_REVIEW_PULSES.map;
       waeSetReviewMap(null, null);
+      if (!hadMap) waeEnsureReviewBarFallback();
       waeScheduleReviewMapSearch();
+    } else if (WAE_REVIEW_PULSES.host && !document.getElementById(WAE_REVIEW_TOGGLE_ID)) {
+      waeInjectReviewToggle(WAE_REVIEW_PULSES.host); // v2.0.1: a re-render removed the bar
     }
   }
 
@@ -3324,11 +3459,15 @@
       const actions = document.createElement('span');
       actions.className = 'wae-review-toggle-actions';
       actions.append(listBtn, btn);
-      bar.appendChild(label);
+      // v2.0.8: no text label any more (more room for the note field);
+      // the toggle button carries the marker cross + On/Off instead
       bar.appendChild(actions);
     }
     waeReviewToggleHost = host;
     waePlaceReviewToggle(host, bar);
+    // v2.0.6: the review's abuse controls (note, copy, add, auto-fill,
+    // form, Sightengine) live in this bar, on a second line
+    if (waeCurrentReviewRow && waeCurrentReviewRow.parentElement !== bar) bar.appendChild(waeCurrentReviewRow);
     // Back to living inside Wayfarer's own app tree (a genuine DOM
     // descendant of host's parent), so the bar and whatever ancestor
     // carries Wayfarer's in-app ".dark" class are in the same subtree
@@ -3399,6 +3538,42 @@
     return `${((hostWidth / parentContent) * 100).toFixed(2)}%`;
   }
   function waePlaceReviewToggle(host, bar) {
+    if (host.tagName !== 'NIA-MAP') {
+      // v2.0.1: redesigned page. Don't re-parent the framework's own map
+      // element (that can crash its re-rendering) -- put the bar right
+      // after it, full width.
+      // natural height, never grows or shrinks (a column parent would
+      // otherwise stretch it and squeeze the photo strip below)
+      bar.style.flex = '0 0 auto';
+      bar.style.alignSelf = 'stretch';
+      bar.style.height = 'auto';
+      bar.style.width = '100%';
+      bar.style.boxSizing = 'border-box';
+      // v2.0.3: the map sits in Wayfarer's [data-testid="base-map-root"]
+      // box (fixed height, rounded, overflow hidden) -- a bar placed inside
+      // it gets clipped away. Place it after that whole box instead (the
+      // same element Map Mods uses as the map's host).
+      let anchor = host.closest('[data-testid="base-map-root"]')
+        || host.querySelector('[data-testid="base-map-root"]')
+        || host;
+      // v2.0.4: not every page carries that attribute. Climb out of any
+      // ancestor that clips its content (overflow hidden/clip, like the
+      // rounded fixed-height map box) or is just the map's own size, and
+      // stop at the first roomier one (the card around map + photos).
+      for (let i = 0; i < 6; i += 1) {
+        const parent = anchor.parentElement;
+        if (!parent || parent === document.body) break;
+        const cs = getComputedStyle(parent);
+        const clips = [cs.overflow, cs.overflowX, cs.overflowY].some((v) => v && v !== 'visible');
+        const mapSized = parent.offsetHeight <= anchor.offsetHeight + 24;
+        if (!clips && !mapSized) break;
+        anchor = parent;
+      }
+      if (bar.previousElementSibling !== anchor || bar.parentElement !== anchor.parentElement) {
+        anchor.insertAdjacentElement('afterend', bar);
+      }
+      return;
+    }
     let wrap = host.parentElement;
     if (!wrap || wrap.id !== WAE_REVIEW_TOGGLE_WRAP_ID) {
       const originalParent = host.parentElement;
@@ -3436,7 +3611,10 @@
     const btn = bar.querySelector('.wae-review-toggle-btn');
     if (!btn) return;
     const on = waeReviewPulsesEnabled();
-    btn.textContent = on ? 'On' : 'Off';
+    btn.innerHTML = '<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M3 3l10 10M13 3L3 13"></path></svg>'
+      + `<span>${on ? 'On' : 'Off'}</span>`;
+    btn.title = `Abuse report markers on the map: ${on ? 'on' : 'off'}`;
+    btn.setAttribute('aria-label', btn.title);
     btn.classList.toggle('wae-review-toggle-on', on);
     btn.setAttribute('aria-pressed', String(on));
   }
@@ -3466,7 +3644,19 @@
     waeReviewRouteEnterUnsub = WFMM.routes.onEnter('review', waeReviewOnRouteEnter);
     waeReviewRouteLeaveUnsub = WFMM.routes.onLeave('review', waeReviewOnRouteLeave);
     if (waeReviewIsOnRoute()) waeReviewOnRouteEnter(); // this version can load while already sitting on /new/review
+    // v2.0.1: watchdog for when Map Mods' route events don't fire on the redesigned page
+    if (!waeReviewWatchdog) {
+      let wasOn = waeReviewIsOnRoute();
+      waeReviewWatchdog = setInterval(() => {
+        const on = waeReviewIsOnRoute();
+        if (on && !wasOn) waeReviewOnRouteEnter();
+        else if (!on && wasOn) waeReviewOnRouteLeave();
+        else if (on && !waeReviewPeriodicRecheckTimer) waeReviewOnRouteEnter();
+        wasOn = on;
+      }, 1000);
+    }
   }
+  let waeReviewWatchdog = null;
 
   // ---------------------------------------------------------------------
   // Review-page abuse helper (folded in from the standalone "Wayfarer
@@ -3557,6 +3747,7 @@
   }
 
   function waeRemoveReviewAbuseRows() {
+    waeCurrentReviewRow = null;
     document.querySelectorAll('.wae-review-abuse-row').forEach((el) => el.remove());
   }
 
@@ -3578,125 +3769,6 @@
       supporting: list(c.supportingImageUrls, (x) => x),
       photos: list(c.newPhotos, (x) => x && x.value),
     };
-  }
-
-  // v2.1.0: the Sightengine button, shared by the review-page row and the map
-  // side panel's note row. Opens Sightengine's AI-image check with a photo
-  // already loaded (see the Sightengine companion near the top of this file)
-  // and, with the "start the auto-fill on an AI verdict" setting on (the
-  // default), keeps a link back to this tab so the verdict can come back:
-  // over 90% AI-generated sends that tab on to the abuse form, filled in for
-  // this Wayspot (issue Photo Issues, the note and the verdict as the
-  // report details, only name + coordinates as the location), and once the
-  // form is submitted the Wayspot is added to the abuse reports table as a
-  // "Reported" row.
-  //   name / lat / lng   the Wayspot
-  //   noteInput          the note field beside the button (read when needed)
-  //   getPhotoUrl()      the photo's address at click time ('' = none found)
-  //   className          the button's CSS class(es), to match its row
-  //   idleTitle          the tooltip when idle
-  //   disabledTitle      (optional) disables the button, with this tooltip
-  function waeBuildSightengineButton({ name, lat, lng, noteInput, getPhotoUrl, className, idleTitle, disabledTitle }) {
-    const seBtn = document.createElement('button');
-    seBtn.type = 'button';
-    seBtn.className = className;
-    const seTitle = disabledTitle || idleTitle;
-    seBtn.innerHTML = WAE_SCAN_SEARCH_ICON_SVG;
-    seBtn.title = seTitle;
-    seBtn.setAttribute('aria-label', seTitle);
-    seBtn.disabled = !!disabledTitle;
-    const flash = (icon, title) => {
-      seBtn.innerHTML = icon;
-      seBtn.title = title;
-      setTimeout(() => {
-        if (!seBtn.isConnected) return;
-        seBtn.innerHTML = WAE_SCAN_SEARCH_ICON_SVG;
-        seBtn.title = seTitle;
-      }, 1500);
-    };
-    seBtn.addEventListener('click', (ev) => {
-      ev.preventDefault();
-      ev.stopPropagation();
-      const photoUrl = getPhotoUrl();
-      if (!photoUrl) { flash(WAE_X_ICON_SVG, 'No photo found here, so nothing to send to Sightengine'); return; }
-      // v1.92.0: with the "start the auto-fill on an AI verdict" setting on
-      // (the default), the tab keeps its opener so the verdict can come
-      // back to this tab; with it off the tab is cut loose as before.
-      const autoStart = wfmmWindow.WFMM.settings.get(PLUGIN_ID, 'sightengineAutoStart', true) !== false;
-      const checkId = autoStart
-        ? ((typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`)
-        : '';
-      const hash = `${WAE_SE_HASH_IMAGE}=${encodeURIComponent(photoUrl)}${checkId ? `&${WAE_SE_HASH_SESSION}=${checkId}` : ''}`;
-      const popup = window.open(`${WAE_SE_URL}#${hash}`, '_blank');
-      if (popup && !autoStart) { try { popup.opener = null; } catch (e) { /* ignore */ } }
-      if (popup && autoStart) {
-        const now = Date.now();
-        for (const [id, c] of waeSeChecks) if (now - c.createdAt > 10 * 60 * 1000) waeSeChecks.delete(id);
-        waeSeChecks.set(checkId, {
-          popup,
-          createdAt: now,
-          onResult: (score) => {
-            if (score === null) {
-              if (seBtn.isConnected) seBtn.title = 'Sightengine: the verdict could not be read';
-              return;
-            }
-            const pct = Math.round(score * 1000) / 10;
-            const high = score > WAE_SE_AI_THRESHOLD;
-            if (seBtn.isConnected) {
-              seBtn.title = `Sightengine: ${pct}% AI-generated${high ? ' (over 90%, starting the abuse form auto-fill)' : ''}`;
-            }
-            if (!high) return;
-            // A moment to see the verdict, then this Wayspot goes into the
-            // abuse form in the same tab. This workflow fills the form its
-            // own way: the issue is always "Photo Issues"; the Abuse report
-            // details are the note typed beside the button (when there is
-            // one) and the verdict, and nothing else (not the settings'
-            // default text); the location field only has the Wayspot's name
-            // and coordinates.
-            const aiNote = `Sightengine estimates this photo is ${pct}% AI-generated`;
-            setTimeout(() => {
-              const result = waeOpenAbuseFormAutofill(() => ({
-                items: [{ name, lat, lng, note: '' }],
-                includeNotes: false,
-                overrides: {
-                  issueType: 'Photo Issues',
-                  reportDetails: [noteInput.value.trim(), aiNote].filter(Boolean).join('\n'),
-                  locationNotes: false,
-                },
-              }), undefined, popup, () => {
-                // once the form is submitted the Wayspot goes straight into the abuse
-                // reports table as a "Reported" row (the note and the verdict as its
-                // comment); the next scan that finds its ticket email replaces it
-                waeAddReportedRecords([{ name, lat, lng, note: [noteInput.value.trim(), aiNote].filter(Boolean).join('; ') }])
-                  .catch((e) => console.warn('[Wayfarer Map Mods - Abuse Reports] Could not add the reported Wayspot to the table:', e));
-              });
-              if (result !== 'opened') console.warn('[Wayfarer Map Mods - Abuse Reports] Could not send the Sightengine tab to the abuse form (closed?).');
-            }, 1500);
-          },
-        });
-      }
-      flash(popup ? WAE_CHECK_ICON_SVG : WAE_X_ICON_SVG, popup ? 'Opened' : 'Popup blocked');
-    });
-    return seBtn;
-  }
-
-  // v2.1.0: the photo of the Wayspot open in the map side panel, read off
-  // the panel when the button is clicked (it may load after the panel
-  // appears): the first Google-hosted <img> or CSS background image in it,
-  // with any size suffix (=s60, =w200-h200, ...) swapped for =s0, the full
-  // size. '' when the panel shows none.
-  function waeSidePanelPhotoUrl(slot) {
-    const found = [];
-    slot.querySelectorAll('img').forEach((img) => found.push(img.currentSrc || img.src));
-    slot.querySelectorAll('*').forEach((el) => {
-      const bg = getComputedStyle(el).backgroundImage;
-      const m = bg && bg !== 'none' ? bg.match(/url\((['"]?)(.*?)\1\)/) : null;
-      if (m) found.push(m[2]);
-    });
-    for (const raw of found) {
-      if (waeSeIsAllowedPhotoUrl(raw)) return `${raw.replace(/=[^/=]*$/, '')}=s0`;
-    }
-    return '';
   }
 
   function waeBuildReviewAbuseRow(candidate) {
@@ -3776,20 +3848,93 @@
       }, 1500);
     });
 
-    // v1.89.0 / v1.91.0: the Sightengine button (see waeBuildSightengineButton()):
-    // the new Wayspot's photo, or the first photo of a photo review. Edits
-    // have no photo, so they get no button; a review whose photo address
-    // wasn't in the response gets a disabled one, with the reason in the
-    // tooltip.
+    // v1.89.0 / v1.91.0: opens Sightengine's AI-image check with this
+    // review's photo already loaded (see the Sightengine companion near the
+    // top of this file): the new Wayspot's photo, or the first photo of a
+    // photo review. Edits have no photo, so they get no button; a review
+    // whose photo address wasn't in the response gets a disabled one, with
+    // the reason in the tooltip.
     let seBtn = null;
     const sePhotoUrl = (candidate.photos && (candidate.photos.main || candidate.photos.photos.find(Boolean))) || '';
     if (candidate.type === 'NEW' || candidate.type === 'PHOTO') {
-      seBtn = waeBuildSightengineButton({
-        name, lat, lng, noteInput,
-        getPhotoUrl: () => sePhotoUrl,
-        className: 'wae-review-fill-btn wae-review-se-btn',
-        idleTitle: 'Check this photo for AI generation on Sightengine (opens a new tab)',
-        disabledTitle: sePhotoUrl ? '' : 'No photo address found in this review, so it cannot be sent to Sightengine',
+      seBtn = document.createElement('button');
+      seBtn.type = 'button';
+      seBtn.className = 'wae-review-fill-btn wae-review-se-btn';
+      const seTitle = sePhotoUrl
+        ? 'Check this photo for AI generation on Sightengine (opens a new tab)'
+        : 'No photo address found in this review, so it cannot be sent to Sightengine';
+      seBtn.innerHTML = WAE_SCAN_SEARCH_ICON_SVG;
+      seBtn.title = seTitle;
+      seBtn.setAttribute('aria-label', seTitle);
+      seBtn.disabled = !sePhotoUrl;
+      seBtn.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (!sePhotoUrl) return;
+        // v1.92.0: with the "start the auto-fill on an AI verdict" setting on
+        // (the default), the tab keeps its opener so the verdict can come
+        // back to this tab; with it off the tab is cut loose as before.
+        const autoStart = wfmmWindow.WFMM.settings.get(PLUGIN_ID, 'sightengineAutoStart', true) !== false;
+        const checkId = autoStart
+          ? ((typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`)
+          : '';
+        const hash = `${WAE_SE_HASH_IMAGE}=${encodeURIComponent(sePhotoUrl)}${checkId ? `&${WAE_SE_HASH_SESSION}=${checkId}` : ''}`;
+        const popup = window.open(`${WAE_SE_URL}#${hash}`, '_blank');
+        if (popup && !autoStart) { try { popup.opener = null; } catch (e) { /* ignore */ } }
+        if (popup && autoStart) {
+          const now = Date.now();
+          for (const [id, c] of waeSeChecks) if (now - c.createdAt > 10 * 60 * 1000) waeSeChecks.delete(id);
+          waeSeChecks.set(checkId, {
+            popup,
+            createdAt: now,
+            onResult: (score) => {
+              if (score === null) {
+                if (seBtn.isConnected) seBtn.title = 'Sightengine: the verdict could not be read';
+                return;
+              }
+              const pct = Math.round(score * 1000) / 10;
+              const high = score > WAE_SE_AI_THRESHOLD;
+              if (seBtn.isConnected) {
+                seBtn.title = `Sightengine: ${pct}% AI-generated${high ? ' (over 90%, starting the abuse form auto-fill)' : ''}`;
+              }
+              if (!high) return;
+              // A moment to see the verdict, then this review's Wayspot (and the
+              // note beside it, as read now) goes into the abuse form in the
+              // same tab -- the review-row wand's workflow without a new tab.
+              // v1.93.0: this workflow fills the form its own way: the issue is
+              // always "Photo Issues"; the Abuse report details are the note
+              // typed beside the row (when there is one) and the verdict, and
+              // nothing else (not the settings' default text); the location
+              // field only has the Wayspot's name and coordinates.
+              const aiNote = `Sightengine estimates this photo is ${pct}% AI-generated`;
+              setTimeout(() => {
+                const result = waeOpenAbuseFormAutofill(() => ({
+                  items: [{ name, lat, lng, note: '' }],
+                  includeNotes: false,
+                  overrides: {
+                    issueType: 'Photo Issues',
+                    reportDetails: [noteInput.value.trim(), aiNote].filter(Boolean).join('\n'),
+                    locationNotes: false,
+                  },
+                }), undefined, popup, () => {
+                  // v1.94.0: once the form is submitted the Wayspot goes straight into the
+                  // abuse reports table as a \"Reported\" row (the note and the verdict as its
+                  // comment); the next scan that finds its ticket email replaces it.
+                  waeAddReportedRecords([{ name, lat, lng, note: [noteInput.value.trim(), aiNote].filter(Boolean).join('; ') }])
+                    .catch((e) => console.warn('[Wayfarer Map Mods - Abuse Reports] Could not add the reported Wayspot to the table:', e));
+                });
+                if (result !== 'opened') console.warn('[Wayfarer Map Mods - Abuse Reports] Could not send the Sightengine tab to the abuse form (closed?).');
+              }, 1500);
+            },
+          });
+        }
+        seBtn.innerHTML = popup ? WAE_CHECK_ICON_SVG : WAE_X_ICON_SVG;
+        seBtn.title = popup ? 'Opened' : 'Popup blocked';
+        setTimeout(() => {
+          if (!seBtn.isConnected) return;
+          seBtn.innerHTML = WAE_SCAN_SEARCH_ICON_SVG;
+          seBtn.title = seTitle;
+        }, 1500);
       });
     }
 
@@ -3804,21 +3949,54 @@
   // card. Waits for the element (the response can land before Angular
   // has rendered the card); a newer candidate arriving while waiting
   // supersedes this one via the token.
+  // v2.0.1: the redesigned review page has no .mt-2 / .review-edit-info.
+  // Anchor on the first card heading instead ("Title and Description" on
+  // new nominations, the nearest equivalent on other review types).
+  function waeFindNewLayoutAnchor() {
+    const wanted = /^(title and description|title & description|location|photo|photos)$/i;
+    for (const el of document.querySelectorAll('h1,h2,h3,h4,h5,h6,[class*="title"],[class*="heading"],p,div,span')) {
+      if (el.children.length > 0) continue;
+      if (!wanted.test((el.textContent || '').trim())) continue;
+      if (el.closest('.wae-review-abuse-row')) continue;
+      el.__waeNewLayoutAnchor = true;
+      return el;
+    }
+    return null;
+  }
+
+  let waeCurrentReviewRow = null;
   async function waeInsertReviewAbuseRow(candidate) {
     if (!waePluginActive) return;
     const token = ++waeReviewAbuseInsertToken;
     const isEdit = candidate.type === 'EDIT';
-    let target;
+    // v2.0.6: the row goes into the toggle bar under the map, so all the
+    // abuse report controls sit in one place. Give the bar a moment to
+    // appear; if there is no map/bar on this review, fall back to the card.
+    let bar = null;
     try {
-      target = await waeAwaitElement(() => document.querySelector(isEdit ? '.review-edit-info' : '.mt-2'));
-    } catch (e) {
-      return; // no card to attach to (e.g. left the page)
-    }
+      bar = await waeAwaitElement(() => document.getElementById(WAE_REVIEW_TOGGLE_ID), 25, 100);
+    } catch (e) { /* no bar -- use the card */ }
     if (token !== waeReviewAbuseInsertToken || !waePluginActive) return;
+    let target = null;
+    if (!bar) {
+      try {
+        target = await waeAwaitElement(() => document.querySelector(isEdit ? '.review-edit-info' : '.mt-2') || waeFindNewLayoutAnchor(), 60, 100);
+      } catch (e) {
+        return; // no card to attach to (e.g. left the page)
+      }
+      if (token !== waeReviewAbuseInsertToken || !waePluginActive) return;
+    }
     const row = waeBuildReviewAbuseRow(candidate);
     if (!row) return;
     waeRemoveReviewAbuseRows(); // drop the previous candidate's row
-    if (isEdit) {
+    waeCurrentReviewRow = row;
+    if (bar) {
+      bar.appendChild(row);
+      return;
+    }
+    if (target.__waeNewLayoutAnchor) {
+      target.parentNode.insertBefore(row, target.nextSibling); // redesigned page: right under the card heading
+    } else if (isEdit) {
       if (target.children.length >= 1) target.insertBefore(row, target.children[1] || null);
       else target.appendChild(row);
     } else {
@@ -3828,7 +4006,12 @@
 
   function waeOnReviewResponse() {
     try {
-      const json = typeof this.response === 'string' ? JSON.parse(this.response) : this.response;
+      waeHandleReviewJson(typeof this.response === 'string' ? JSON.parse(this.response) : this.response);
+    } catch (e) { /* not a review response we can use -- ignore */ }
+  }
+
+  function waeHandleReviewJson(json) {
+    try {
       if (!json || json.captcha) return;
       const c = json.result;
       if (!c) return;
@@ -3859,6 +4042,26 @@
     };
   }
   waeInstallReviewCandidateHook();
+
+  // v2.0.1: the redesigned page may load the review with fetch() instead of XHR
+  (function waeInstallReviewFetchHook() {
+    const w = wfmmWindow;
+    if (!w.fetch || w.__waeReviewFetchHooked) return;
+    w.__waeReviewFetchHooked = true;
+    const originalFetch = w.fetch;
+    w.fetch = function (input, init) {
+      const p = originalFetch.apply(this, arguments);
+      try {
+        const url = typeof input === 'string' ? input : (input && input.url) || '';
+        const method = String((init && init.method) || (input && input.method) || 'GET').toUpperCase();
+        const path = String(url).split('?')[0].replace(/^https?:\/\/[^/]+/, '');
+        if (method === 'GET' && path === '/api/v1/vault/review') {
+          p.then((res) => res.clone().json().then(waeHandleReviewJson).catch(() => {})).catch(() => {});
+        }
+      } catch (e) { /* never let the hook break a request */ }
+      return p;
+    };
+  })();
 
   // ---------------------------------------------------------------------
   // Abuse draft controls inside the review map's info windows (v1.64.0).
@@ -4057,6 +4260,7 @@
     waeReviewRouteLeaveUnsub?.();
     waeReviewRouteEnterUnsub = null;
     waeReviewRouteLeaveUnsub = null;
+    if (waeReviewWatchdog) { clearInterval(waeReviewWatchdog); waeReviewWatchdog = null; }
     waeReviewOnRouteLeave();
   }
 
@@ -4418,15 +4622,7 @@
       // panel, which pulled it out of the row onto a line of its own.
       const draftKey = `${lat},${lng}`;
       const { noteInput, markBtn } = waeBuildMarkControls({ name, lat, lng, draftKey, iconOnly: true });
-      // v2.1.0: the Sightengine button right after it; the photo is read off
-      // this panel when it is clicked
-      const seBtn = waeBuildSightengineButton({
-        name, lat, lng, noteInput,
-        getPhotoUrl: () => waeSidePanelPhotoUrl(slot),
-        className: 'wae-detail-mark-btn wae-icon-btn wae-detail-se-btn',
-        idleTitle: 'Check this Wayspot\u2019s photo for AI generation on Sightengine (opens a new tab)',
-      });
-      markRow.append(noteInput, markBtn, seBtn);
+      markRow.append(noteInput, markBtn);
       statusRow.parentNode.insertBefore(markRow, statusRow);
       waeRestoreNoteFocus(noteInput, draftKey);
     });
@@ -5192,6 +5388,34 @@
        the icon buttons to its right leave over (it shrinks, they don't). */
     .wae-review-abuse-row{ display:flex; align-items:center; gap:6px; flex-wrap:nowrap; width:100%; box-sizing:border-box; margin:4px 0; }
     .wae-review-abuse-row .wae-detail-mark-note{ flex:1 1 0; min-width:0; }
+    /* v2.0.7: one line -- label | note + action icons | list + On/Off.
+       Only wraps (row drops to its own line) when the bar gets too narrow. */
+    .wae-review-toggle-bar{ flex-wrap:wrap; row-gap:6px; column-gap:10px; }
+    .wae-review-toggle-bar .wae-review-toggle-label{ order:1; flex:0 0 auto; }
+    .wae-review-toggle-bar > .wae-review-abuse-row{ order:2; flex:1 1 300px; min-width:0; width:auto; margin:0; }
+    .wae-review-toggle-bar .wae-review-toggle-actions{ order:3; }
+    /* one look for every icon in the bar: 28px squares, outlined, text colour */
+    .wae-review-toggle-bar .wae-review-copy-btn,
+    .wae-review-toggle-bar .wae-review-form-link,
+    .wae-review-toggle-bar .wae-review-fill-btn,
+    .wae-review-toggle-bar .wae-detail-mark-btn.wae-icon-btn,
+    .wae-review-toggle-bar .wae-review-toggle-icon-btn{
+      box-sizing:border-box; width:28px; height:28px; padding:0; flex:0 0 auto;
+      display:inline-flex; align-items:center; justify-content:center;
+      color:inherit; background:transparent; text-decoration:none;
+      border:1px solid rgba(128,128,128,0.5); border-radius:6px; cursor:pointer;
+    }
+    .wae-review-toggle-bar .wae-review-copy-btn:hover,
+    .wae-review-toggle-bar .wae-review-form-link:hover,
+    .wae-review-toggle-bar .wae-review-fill-btn:not(:disabled):hover,
+    .wae-review-toggle-bar .wae-detail-mark-btn.wae-icon-btn:not(:disabled):hover,
+    .wae-review-toggle-bar .wae-review-toggle-icon-btn:hover{ background:rgba(128,128,128,0.22); }
+    .wae-review-toggle-bar .wae-review-copy-btn.wae-copied,
+    .wae-review-toggle-bar .wae-detail-mark-btn.wae-icon-btn:disabled{ color:#22c55e; background:transparent; border-color:#22c55e; }
+    .wae-review-toggle-bar .wae-review-fill-btn:disabled{ opacity:.4; cursor:not-allowed; }
+    .wae-review-toggle-bar .wae-detail-mark-note{ height:28px; padding:0 8px; font-size:12px; }
+    .wae-review-toggle-bar .wae-review-toggle-btn{ height:28px; box-sizing:border-box; padding:0 12px; display:inline-flex; align-items:center; gap:5px; }
+    .wae-review-toggle-bar .wae-review-toggle-btn svg{ display:block; pointer-events:none; }
     .wae-review-copy-btn{
       flex:0 0 auto; display:inline-flex; align-items:center; justify-content:center;
       padding:4px 6px; color:#154aab; background:#eef2ff;
