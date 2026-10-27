@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      2.0.8
+// @version      2.0.11
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV. Can also auto-fill the Help Center abuse form from the Marked Wayspots list, and send a review's photo to Sightengine's AI-image check.
 // @author       Frankmans
 // @grant        none
@@ -3336,6 +3336,7 @@
   function waeReviewPeriodicRecheck() {
     if (!waeReviewIsOnRoute()) return;
     if (!WAE_REVIEW_PULSES.map) waeEnsureReviewBarFallback();
+    waeRefreshReviewBarTheme(); // the page's theme can change while it is open
     if (!waeReviewMapStillValid()) {
       const hadMap = !!WAE_REVIEW_PULSES.map;
       waeSetReviewMap(null, null);
@@ -3476,7 +3477,7 @@
     // ".dark .wae-review-toggle-bar" descendant selector, since that's
     // one less thing that can silently stop matching if the bar's exact
     // DOM position ever moves again in a future version.
-    bar.classList.toggle('wae-review-dark', !!host.closest('.dark'));
+    waeRefreshReviewBarTheme(bar, host);
     waeUpdateReviewToggleUi();
   }
 
@@ -3599,6 +3600,26 @@
   }
 
   let waeReviewToggleHost = null;
+
+  // v2.0.11: follow the PAGE's theme (a .dark class / data-theme on an
+  // ancestor, else the page background's brightness) -- never the OS setting.
+  function waeReviewPageIsDark(host) {
+    try {
+      if ((host || document.documentElement).closest('.dark, [data-theme="dark"], [data-mode="dark"]')) return true;
+      if (document.querySelector('html.dark, body.dark, html[data-theme="dark"], body[data-theme="dark"]')) return true;
+      const m = /rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/.exec(getComputedStyle(document.body).backgroundColor);
+      if (m && (m[4] === undefined || Number(m[4]) > 0.5)) {
+        const lum = (0.299 * m[1] + 0.587 * m[2] + 0.114 * m[3]) / 255;
+        return lum < 0.35;
+      }
+    } catch (e) { /* default to light */ }
+    return false;
+  }
+  function waeRefreshReviewBarTheme(bar, host) {
+    bar = bar || document.getElementById(WAE_REVIEW_TOGGLE_ID);
+    if (!bar) return;
+    bar.classList.toggle('wae-review-dark', waeReviewPageIsDark(host || waeReviewToggleHost || bar));
+  }
 
   function waeRemoveReviewToggle() {
     document.getElementById(WAE_REVIEW_TOGGLE_ID)?.remove();
@@ -4148,7 +4169,8 @@
 
   function waeReviewIwMatchPortal(content, titleKey) {
     if (!waeReviewNearbyPortals.length) return null;
-    const img = content.querySelector('img.wf-image-modal') || content.querySelector('img[wf-image-modal]');
+    const img = content.querySelector('img.wf-image-modal') || content.querySelector('img[wf-image-modal]')
+      || content.querySelector(':scope > button > img') || content.querySelector('img'); // v2.0.9: redesigned page's windows
     const imageUrl = waeReviewIwNormalizeImageUrl(img?.currentSrc || img?.src);
     if (imageUrl) {
       const byImage = waeReviewNearbyPortals.filter((p) => p.imageUrl && p.imageUrl === imageUrl);
@@ -4182,7 +4204,7 @@
     const owned = content.classList.contains('wfmm-review-owned-info-window');
     const titleEl = owned
       ? content.querySelector('.wfmm-review-owned-info-window__title')
-      : (content.querySelector(':scope > div > .font-medium') || content.querySelector('.font-medium'));
+      : (content.querySelector(':scope > div > .font-medium') || content.querySelector(':scope > .font-medium') || content.querySelector('.font-medium'));
     const domTitle = waeReviewIwNormalizeText(titleEl?.textContent);
     if (!owned) {
       const portal = waeReviewIwMatchPortal(content, domTitle.toLowerCase());
@@ -4202,7 +4224,7 @@
     const wrap = document.createElement('div');
     wrap.className = WAE_REVIEW_IW_CLASS;
     wrap.dataset.waeKey = key;
-    const { noteInput, markBtn } = waeBuildMarkControls({ name: poi.name, lat: poi.lat, lng: poi.lng });
+    const { noteInput, markBtn } = waeBuildMarkControls({ name: poi.name, lat: poi.lat, lng: poi.lng, iconOnly: true });
     wrap.append(noteInput, markBtn);
     // Same as the suite's own link in these windows: keep presses here
     // from reaching the map or Wayfarer's own handlers behind the window.
@@ -4216,7 +4238,12 @@
     waeReviewIwQueued = false;
     if (!waeReviewIwObserver) return;
     const enabled = waeReviewMapControlsEnabled();
-    for (const content of document.querySelectorAll('.agm-info-window-content')) {
+    // v2.0.9: the redesigned page has no .agm-info-window-content. Wayfarer's own
+    // nearby windows are .wf-duplicate-iw-content, the suite's are
+    // .wfmm-review-owned-info-window; the old class is kept for the old page.
+    const IW_SEL = '.agm-info-window-content, .wf-duplicate-iw-content, .wfmm-review-owned-info-window';
+    for (const content of document.querySelectorAll(IW_SEL)) {
+      if (content.querySelector(IW_SEL)) continue; // nested matches: the innermost one (where the title/photo live) gets the controls
       const existing = content.querySelector(`:scope > .${WAE_REVIEW_IW_CLASS}`);
       const poi = enabled ? waeReviewIwResolvePoi(content) : null;
       if (!poi) {
@@ -5440,9 +5467,13 @@
        waeReviewIwSyncNow()). Stacked and sized to line up with the
        180px photo the suite's own windows show; reuses the side
        panel's field/button styles above. */
-    .wae-review-iw-abuse{ display:flex; flex-direction:column; gap:4px; box-sizing:border-box; width:100%; min-width:160px; max-width:200px; margin:6px auto 0; }
-    .wae-review-iw-abuse .wae-detail-mark-note{ width:100%; flex:0 0 auto; }
-    .wae-review-iw-abuse .wae-detail-mark-btn{ width:100%; flex:0 0 auto; white-space:normal; }
+    /* v2.0.10: note + icon button on ONE line */
+    .wae-review-iw-abuse{ display:flex; flex-direction:row; align-items:center; gap:6px; box-sizing:border-box; width:100%; min-width:180px; max-width:220px; margin:6px auto 0; }
+    .wae-review-iw-abuse .wae-detail-mark-note{ flex:1 1 0; min-width:0; width:auto; height:28px; padding:0 8px; font-size:12px; }
+    .wae-review-iw-abuse .wae-detail-mark-btn{ flex:0 0 auto; width:28px; height:28px; padding:0; display:inline-flex; align-items:center; justify-content:center; }
+    /* Google fixes the popup's height when it opens; let it grow for the controls added afterwards */
+    .gm-style-iw-c:has(.wae-review-iw-abuse){ max-height:none !important; }
+    .gm-style-iw-d:has(.wae-review-iw-abuse){ max-height:none !important; overflow:visible !important; }
     .wae-detail-mark-btn:disabled{ color:#16a34a; background:#f0fdf4; border-color:#bbf7d0; cursor:default; }
     /* Star toggle -- matches Report History's own \u2605/\u2606 button
        convention (plain glyph, no pill/border) rather than inventing a
@@ -5613,13 +5644,7 @@
     }
     .wae-review-toggle-icon-btn:hover{ background:#f3f4f6; }
     .wae-review-toggle-icon-btn svg{ display:block; pointer-events:none; }
-    @media (prefers-color-scheme: dark){
-      .wae-review-toggle-bar{ background:#1f2937; color:#f9fafb; border-color:#4b5563; box-shadow:0 2px 6px rgba(0,0,0,0.5); }
-      .wae-review-toggle-btn{ color:#f9fafb; }
-      .wae-review-toggle-btn.wae-review-toggle-on{ background:#22c55e; color:#052e16; border-color:#16a34a; }
-      .wae-review-toggle-icon-btn{ color:#f9fafb; border-color:#4b5563; }
-      .wae-review-toggle-icon-btn:hover{ background:#374151; }
-    }
+    /* v2.0.11: light is the default; dark only when the PAGE is dark (.wae-review-dark), not when the OS is */
     .wae-review-toggle-bar.wae-review-dark{ background:#1f2937; color:#f9fafb; border-color:#4b5563; box-shadow:0 2px 6px rgba(0,0,0,0.5); }
     .wae-review-toggle-bar.wae-review-dark .wae-review-toggle-btn{ color:#f9fafb; }
     .wae-review-toggle-bar.wae-review-dark .wae-review-toggle-icon-btn{ color:#f9fafb; border-color:#4b5563; }
