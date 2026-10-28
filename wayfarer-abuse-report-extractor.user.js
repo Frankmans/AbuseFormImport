@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      2.0.11
+// @version      2.0.12
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV. Can also auto-fill the Help Center abuse form from the Marked Wayspots list, and send a review's photo to Sightengine's AI-image check.
 // @author       Frankmans
 // @grant        none
@@ -3546,7 +3546,7 @@
       // natural height, never grows or shrinks (a column parent would
       // otherwise stretch it and squeeze the photo strip below)
       bar.style.flex = '0 0 auto';
-      bar.style.alignSelf = 'stretch';
+      bar.style.alignSelf = 'flex-start'; // never stretched to the height of a neighbour
       bar.style.height = 'auto';
       bar.style.width = '100%';
       bar.style.boxSizing = 'border-box';
@@ -3568,6 +3568,18 @@
         const clips = [cs.overflow, cs.overflowX, cs.overflowY].some((v) => v && v !== 'visible');
         const mapSized = parent.offsetHeight <= anchor.offsetHeight + 24;
         if (!clips && !mapSized) break;
+        anchor = parent;
+      }
+      // v2.0.12: never sit beside things in a row layout (photo review puts
+      // the Wayspot title and the map side by side; a full-width bar there
+      // squeezes the title to one letter per line). Climb out of any row.
+      for (let i = 0; i < 5; i += 1) {
+        const parent = anchor.parentElement;
+        if (!parent || parent === document.body) break;
+        const cs = getComputedStyle(parent);
+        const isRow = /flex/.test(cs.display) && /^row/.test(cs.flexDirection);
+        const isGrid = cs.display === 'grid' || cs.display === 'inline-grid';
+        if (!isRow && !isGrid) break;
         anchor = parent;
       }
       if (bar.previousElementSibling !== anchor || bar.parentElement !== anchor.parentElement) {
