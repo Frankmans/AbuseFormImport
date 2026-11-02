@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      2.1.1
+// @version      2.1.2
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV. Can also auto-fill the Help Center abuse form from the Marked Wayspots list, and send a review's photo to Sightengine's AI-image check.
 // @author       Frankmans
 // @grant        none
@@ -8989,6 +8989,16 @@
   // ---------------------------------------------------------------------
   wfmmWindow.WayfarerAbuseReportExtractor = {
     scanImportedEmails: (onProgress) => waeScanAndPersist(onProgress),
+    // Used by the Wayfarer Creator Lookup plugin to send a player's Wayspots
+    // to the Marked Wayspots abuse draft. Same function the side panel's
+    // "+ add to abuse report draft" button uses.
+    // Skips Wayspots already on the list (by coordinates) so an existing
+    // note is never overwritten.
+    addMarkedWayspot: (item) => {
+      const same = (a, b) => Number(a).toFixed(6) === Number(b).toFixed(6);
+      if (waeLoadMarkedWayspots().some((i) => same(i.lat, item.lat) && same(i.lng, item.lng))) return 'exists';
+      return waeAddMarkedWayspot(item);
+    },
   };
 
   // ---------------------------------------------------------------------
