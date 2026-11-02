@@ -8989,11 +8989,7 @@
   // ---------------------------------------------------------------------
   wfmmWindow.WayfarerAbuseReportExtractor = {
     scanImportedEmails: (onProgress) => waeScanAndPersist(onProgress),
-    // Used by the Wayfarer Creator Lookup plugin to send a player's Wayspots
-    // to the Marked Wayspots abuse draft. Same function the side panel's
-    // "+ add to abuse report draft" button uses.
-    // Skips Wayspots already on the list (by coordinates) so an existing
-    // note is never overwritten.
+    // Allows better marking of drafts
     addMarkedWayspot: (item) => {
       const same = (a, b) => Number(a).toFixed(6) === Number(b).toFixed(6);
       if (waeLoadMarkedWayspots().some((i) => same(i.lat, item.lat) && same(i.lng, item.lng))) return 'exists';
