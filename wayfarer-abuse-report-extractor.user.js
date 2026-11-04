@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      2.1.2
+// @version      2.1.3
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV. Can also auto-fill the Help Center abuse form from the Marked Wayspots list, and send a review's photo to Sightengine's AI-image check.
 // @author       Frankmans
 // @grant        none
@@ -3478,6 +3478,7 @@
     // one less thing that can silently stop matching if the bar's exact
     // DOM position ever moves again in a future version.
     waeRefreshReviewBarTheme(bar, host);
+    waeWatchPageTheme();
     waeUpdateReviewToggleUi();
   }
 
@@ -3613,19 +3614,78 @@
 
   let waeReviewToggleHost = null;
 
-  // v2.0.11: follow the PAGE's theme (a .dark class / data-theme on an
-  // ancestor, else the page background's brightness) -- never the OS setting.
+  // v2.1.3: any CSS color (rgb, rgba, oklch, color(srgb ...), lab ...) as sRGB + alpha. The redesigned
+  // site paints its backgrounds in modern color formats, which a plain rgb() regex cannot read.
+  let waeColorCtx = null;
+  function waeCssColorToRgba(css) {
+    const str = String(css || '').trim();
+    if (!str || str === 'transparent') return { r: 0, g: 0, b: 0, a: 0 };
+    const m = /^rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:\s*[,/]\s*([\d.]+)(%?))?\s*\)$/i.exec(str);
+    if (m) {
+      let a = m[4] === undefined ? 1 : Number(m[4]);
+      if (m[5]) a /= 100;
+      return { r: Number(m[1]), g: Number(m[2]), b: Number(m[3]), a };
+    }
+    try {   // let the canvas convert it; an unsupported value paints the fallback, which we detect by painting twice
+      if (!waeColorCtx) {
+        const cv = document.createElement('canvas');
+        cv.width = 1; cv.height = 1;
+        waeColorCtx = cv.getContext('2d', { willReadFrequently: true });
+      }
+      if (!waeColorCtx) return null;
+      const paint = (fallback) => {
+        waeColorCtx.clearRect(0, 0, 1, 1);
+        waeColorCtx.fillStyle = fallback;
+        waeColorCtx.fillStyle = str;
+        waeColorCtx.fillRect(0, 0, 1, 1);
+        return waeColorCtx.getImageData(0, 0, 1, 1).data;
+      };
+      const d1 = paint('#000000');
+      const d2 = paint('#ffffff');
+      if (d1[0] !== d2[0] || d1[1] !== d2[1] || d1[2] !== d2[2] || d1[3] !== d2[3]) return null;
+      return { r: d1[0], g: d1[1], b: d1[2], a: d1[3] / 255 };
+    } catch (e) { return null; }
+  }
+  const waeColorLuma = (c) => (0.299 * c.r + 0.587 * c.g + 0.114 * c.b) / 255;
+
+  // v2.0.11: follow the PAGE's theme -- never the OS setting. v2.1.3: when there is no .dark class /
+  // data-theme, look at the first background that is really painted behind the toolbar (walking up
+  // from the toolbar's own wrapper, not the map and not <body>, which is often transparent), then at
+  // the text color, then at color-scheme.
   function waeReviewPageIsDark(host) {
     try {
       if ((host || document.documentElement).closest('.dark, [data-theme="dark"], [data-mode="dark"]')) return true;
       if (document.querySelector('html.dark, body.dark, html[data-theme="dark"], body[data-theme="dark"]')) return true;
-      const m = /rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/.exec(getComputedStyle(document.body).backgroundColor);
-      if (m && (m[4] === undefined || Number(m[4]) > 0.5)) {
-        const lum = (0.299 * m[1] + 0.587 * m[2] + 0.114 * m[3]) / 255;
-        return lum < 0.35;
+      const bar = document.getElementById(WAE_REVIEW_TOGGLE_ID);
+      const start = (bar && bar.parentElement) || (host && host.parentElement) || document.body;
+      for (let el = start; el; el = el.parentElement) {
+        const c = waeCssColorToRgba(getComputedStyle(el).backgroundColor);
+        if (c && c.a > 0.5) return waeColorLuma(c) < 0.45;
       }
+      const t = waeCssColorToRgba(getComputedStyle(start).color);
+      if (t && t.a > 0.5 && waeColorLuma(t) > 0.7) return true;
+      const scheme = getComputedStyle(document.documentElement).colorScheme || '';
+      if (/\bdark\b/.test(scheme) && !/\blight\b/.test(scheme)) return true;
     } catch (e) { /* default to light */ }
     return false;
+  }
+
+  // Re-checks the theme the moment the page flips it (class / data-theme / style on <html> or <body>).
+  let waeThemeObserver = null;
+  let waeThemeTimer = null;
+  function waeWatchPageTheme() {
+    if (waeThemeObserver) return;
+    try {
+      const refresh = () => { clearTimeout(waeThemeTimer); waeThemeTimer = setTimeout(() => waeRefreshReviewBarTheme(), 150); };
+      waeThemeObserver = new MutationObserver(refresh);
+      const opts = { attributes: true, attributeFilter: ['class', 'data-theme', 'data-mode', 'style'] };
+      waeThemeObserver.observe(document.documentElement, opts);
+      if (document.body) waeThemeObserver.observe(document.body, opts);
+    } catch (e) { waeThemeObserver = null; }
+  }
+  function waeUnwatchPageTheme() {
+    if (waeThemeObserver) { waeThemeObserver.disconnect(); waeThemeObserver = null; }
+    clearTimeout(waeThemeTimer);
   }
   function waeRefreshReviewBarTheme(bar, host) {
     bar = bar || document.getElementById(WAE_REVIEW_TOGGLE_ID);
@@ -3635,6 +3695,7 @@
 
   function waeRemoveReviewToggle() {
     document.getElementById(WAE_REVIEW_TOGGLE_ID)?.remove();
+    waeUnwatchPageTheme();
     waeReviewToggleHost = null;
   }
 
@@ -5780,6 +5841,18 @@
     .wae-review-toggle-bar.wae-review-dark .wae-review-toggle-icon-btn{ color:#f9fafb; border-color:#4b5563; }
     .wae-review-toggle-bar.wae-review-dark .wae-review-toggle-icon-btn:hover{ background:#374151; }
     .wae-review-toggle-bar.wae-review-dark .wae-review-toggle-btn.wae-review-toggle-on{ background:#22c55e; color:#052e16; border-color:#16a34a; }
+    /* v2.1.3: the note field and the icon buttons follow the dark bar too (the field used to stay bright white) */
+    .wae-review-toggle-bar.wae-review-dark .wae-detail-mark-note{ background:#111827 !important; color:#f9fafb !important; border-color:#4b5563; }
+    .wae-review-toggle-bar.wae-review-dark .wae-detail-mark-note::placeholder{ color:#9ca3af !important; opacity:1; }
+    .wae-review-toggle-bar.wae-review-dark .wae-detail-mark-note:focus{ outline:none; border-color:#818cf8; box-shadow:0 0 0 2px rgba(129,140,248,0.35); }
+    .wae-review-toggle-bar.wae-review-dark .wae-review-copy-btn,
+    .wae-review-toggle-bar.wae-review-dark .wae-review-form-link,
+    .wae-review-toggle-bar.wae-review-dark .wae-review-fill-btn,
+    .wae-review-toggle-bar.wae-review-dark .wae-detail-mark-btn.wae-icon-btn{ border-color:rgba(255,255,255,0.3); }
+    .wae-review-toggle-bar.wae-review-dark .wae-review-copy-btn:hover,
+    .wae-review-toggle-bar.wae-review-dark .wae-review-form-link:hover,
+    .wae-review-toggle-bar.wae-review-dark .wae-review-fill-btn:not(:disabled):hover,
+    .wae-review-toggle-bar.wae-review-dark .wae-detail-mark-btn.wae-icon-btn:not(:disabled):hover{ background:rgba(255,255,255,0.14); }
   `;
 
   function log(container, msg, cls) {
