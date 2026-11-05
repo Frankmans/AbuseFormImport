@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      2.1.3
+// @version      2.1.5
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV. Can also auto-fill the Help Center abuse form from the Marked Wayspots list, and send a review's photo to Sightengine's AI-image check.
 // @author       Frankmans
 // @grant        none
@@ -2371,13 +2371,13 @@
     if (typeof google === 'undefined' || !google.maps?.InfoWindow || !WAE_PULSES.map) return;
     if (!WAE_PULSES.infoWindow) WAE_PULSES.infoWindow = new google.maps.InfoWindow();
     const name = escapeHtml(record.wayspotName || '(unnamed report)');
-    const parts = [`<div style="font-size:12px;max-width:260px;"><strong>${name}</strong>`];
+    const parts = [`<div class="wae-iw" style="color:#111827;font-size:13px;line-height:1.35;max-width:260px;padding-right:18px;"><strong>${name}</strong>`];
     parts.push(`<div>${latLng.lat().toFixed(6)}, ${latLng.lng().toFixed(6)}</div>`);
-    if (record.comment) parts.push(`<div style="margin-top:4px;color:#6b7280;word-break:break-all;">${escapeHtml(record.comment)}</div>`);
+    if (record.comment) parts.push(`<div style="margin-top:4px;color:#4b5563;word-break:break-all;">${escapeHtml(record.comment)}</div>`);
     if (record.conversationId) {
       const dateSuffix = waeFormatTicketDateSuffix(record.lastResponseAt);
       const titleAttr = dateSuffix ? ` title="${dateSuffix.title}"` : '';
-      parts.push(`<div style="margin-top:4px;color:#9ca3af;"${titleAttr}>Ticket ${escapeHtml(record.conversationId)}${dateSuffix ? dateSuffix.text : ''}</div>`);
+      parts.push(`<div style="margin-top:4px;color:#4b5563;"${titleAttr}>Ticket ${escapeHtml(record.conversationId)}${dateSuffix ? dateSuffix.text : ''}</div>`);
     }
     parts.push('</div>');
     WAE_PULSES.infoWindow.setContent(parts.join(''));
@@ -2402,7 +2402,7 @@
   function waeShowPulseClusterInfoWindow(cluster, latLng) {
     if (typeof google === 'undefined' || !google.maps?.InfoWindow || !WAE_PULSES.map) return;
     if (!WAE_PULSES.infoWindow) WAE_PULSES.infoWindow = new google.maps.InfoWindow();
-    const parts = [`<div style="font-size:12px;max-width:280px;"><strong>${cluster.records.length} reports at this location</strong>`];
+    const parts = [`<div class="wae-iw" style="color:#111827;font-size:13px;line-height:1.35;max-width:280px;padding-right:18px;"><strong>${cluster.records.length} reports at this location</strong>`];
     parts.push(`<div>${latLng.lat().toFixed(6)}, ${latLng.lng().toFixed(6)}</div>`);
     parts.push('<ul style="margin:6px 0 0;padding-left:16px;">');
     for (const record of cluster.records) {
@@ -2434,13 +2434,13 @@
     if (typeof google === 'undefined' || !google.maps?.InfoWindow || !WAE_REVIEW_PULSES.map) return;
     if (!WAE_REVIEW_PULSES.infoWindow) WAE_REVIEW_PULSES.infoWindow = new google.maps.InfoWindow();
     const name = escapeHtml(record.wayspotName || '(unnamed report)');
-    const parts = [`<div style="font-size:12px;max-width:260px;"><strong>${name}</strong>`];
+    const parts = [`<div class="wae-iw" style="color:#111827;font-size:13px;line-height:1.35;max-width:260px;padding-right:18px;"><strong>${name}</strong>`];
     parts.push(`<div>${latLng.lat().toFixed(6)}, ${latLng.lng().toFixed(6)}</div>`);
-    if (record.comment) parts.push(`<div style="margin-top:4px;color:#6b7280;word-break:break-all;">${escapeHtml(record.comment)}</div>`);
+    if (record.comment) parts.push(`<div style="margin-top:4px;color:#4b5563;word-break:break-all;">${escapeHtml(record.comment)}</div>`);
     if (record.conversationId) {
       const dateSuffix = waeFormatTicketDateSuffix(record.lastResponseAt);
       const titleAttr = dateSuffix ? ` title="${dateSuffix.title}"` : '';
-      parts.push(`<div style="margin-top:4px;color:#9ca3af;"${titleAttr}>Ticket ${escapeHtml(record.conversationId)}${dateSuffix ? dateSuffix.text : ''}</div>`);
+      parts.push(`<div style="margin-top:4px;color:#4b5563;"${titleAttr}>Ticket ${escapeHtml(record.conversationId)}${dateSuffix ? dateSuffix.text : ''}</div>`);
     }
     parts.push('</div>');
     WAE_REVIEW_PULSES.infoWindow.setContent(parts.join(''));
@@ -5665,6 +5665,24 @@
     /* Google fixes the popup's height when it opens; let it grow for the controls added afterwards */
     .gm-style-iw-c:has(.wae-review-iw-abuse){ max-height:none !important; }
     .gm-style-iw-d:has(.wae-review-iw-abuse){ max-height:none !important; overflow:visible !important; }
+    /* v2.1.5: tidy Google's info window bubble around our content. Google reserves a ~30px header row for the
+       close button (the empty strip above the text) and the page's dark theme can leave the close icon
+       invisible on the white bubble. The header collapses, the button floats in the top-right corner and is
+       drawn dark. Only bubbles that contain our content (.wae-iw) are touched. */
+    .gm-style-iw-c:has(.wae-iw){ padding:10px 12px !important; }
+    .gm-style-iw-c:has(.wae-iw) .gm-style-iw-chr{ height:0 !important; min-height:0 !important; overflow:visible !important; }
+    .gm-style-iw-c:has(.wae-iw) .gm-style-iw-ch{ display:none !important; padding:0 !important; min-height:0 !important; }
+    .gm-style-iw-c:has(.wae-iw) .gm-style-iw-d{ overflow:auto; }
+    .gm-style-iw-c:has(.wae-iw) button.gm-ui-hover-effect{
+      position:absolute !important; top:3px !important; right:3px !important; width:24px !important; height:24px !important;
+      opacity:1 !important; z-index:2; border-radius:50%; background:transparent !important;
+    }
+    .gm-style-iw-c:has(.wae-iw) button.gm-ui-hover-effect:hover{ background:rgba(17,24,39,0.08) !important; }
+    .gm-style-iw-c:has(.wae-iw) button.gm-ui-hover-effect > span{
+      background-color:#374151 !important; filter:none !important; opacity:1 !important;
+      width:14px !important; height:14px !important; margin:5px !important;
+    }
+    .gm-style-iw-c:has(.wae-iw) button.gm-ui-hover-effect > img{ filter:brightness(0) !important; opacity:0.75 !important; width:14px !important; height:14px !important; margin:5px !important; }
     .wae-detail-mark-btn:disabled{ color:#16a34a; background:#f0fdf4; border-color:#bbf7d0; cursor:default; }
     /* Star toggle -- matches Report History's own \u2605/\u2606 button
        convention (plain glyph, no pill/border) rather than inventing a
@@ -7212,9 +7230,9 @@
     if (typeof google === 'undefined' || !google.maps?.InfoWindow || !WAE_PULSES.map) return;
     if (!WAE_PULSES.infoWindow) WAE_PULSES.infoWindow = new google.maps.InfoWindow();
     const name = escapeHtml(item.name || '(unnamed)');
-    const parts = [`<div style="font-size:12px;max-width:260px;"><strong>${name}</strong>`];
+    const parts = [`<div class="wae-iw" style="color:#111827;font-size:13px;line-height:1.35;max-width:260px;padding-right:18px;"><strong>${name}</strong>`];
     parts.push(`<div>${latLng.lat().toFixed(6)}, ${latLng.lng().toFixed(6)}</div>`);
-    if (item.note) parts.push(`<div style="margin-top:4px;color:#6b7280;word-break:break-word;white-space:pre-wrap;">${escapeHtml(item.note)}</div>`);
+    if (item.note) parts.push(`<div style="margin-top:4px;color:#4b5563;word-break:break-word;white-space:pre-wrap;">${escapeHtml(item.note)}</div>`);
     parts.push('</div>');
     WAE_PULSES.infoWindow.setContent(parts.join(''));
     WAE_PULSES.infoWindow.setPosition(latLng);
