@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      2.1.10
+// @version      2.2.0
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV. Can also auto-fill the Help Center abuse form from the Marked Wayspots list, and send a review's photo to Sightengine's AI-image check.
 // @author       Frankmans
 // @grant        none
@@ -20,7 +20,7 @@
   'use strict';
 
   // ---------------------------------------------------------------------
-  // Abuse form auto-fill (v1.70.0) -- the Marked Wayspots list (the abuse
+  // Abuse form auto-fill -- the Marked Wayspots list (the abuse
   // report draft) can open Niantic's "Reporting Abuse in Wayfarer" Help
   // Center page and fill the form's location field for you, the same way
   // Wayfarer Map Mods' Report History fills the Pokestop/Gym report form
@@ -59,7 +59,7 @@
   const WAE_AF_MSG_REQUEST = 'wae-abuse-form:request-data';
   const WAE_AF_MSG_DATA = 'wae-abuse-form:report-data';
   const WAE_AF_MSG_SUBMITTED = 'wae-abuse-form:submitted';
-  // v1.81.0 (setting "After submitting", off by default): the Help Center
+  // Setting "After submitting" (off by default): the Help Center
   // tab watches for the click on Submit and, once the form is really gone
   // (a rejected click -- a required field missing -- leaves it standing),
   // tells the Wayfarer tab, closes itself WAE_AF_CLOSE_DELAY_MS later, and
@@ -275,8 +275,8 @@
   }
 
   // Runs on its own as soon as the Help Center tab opens -- it does NOT
-  // wait for the data from the Wayfarer tab (v1.71.0 clicked only after
-  // that arrived, so a missing answer meant nothing was ever clicked).
+  // wait for the data from the Wayfarer tab (a missing answer must not
+  // mean that nothing is ever clicked).
   // Clicks the article's button up to WAE_AF_TRIGGER_MAX_CLICKS times,
   // spaced out, until some form field appears.
   function waeAfStartNavigator(session) {
@@ -704,8 +704,8 @@
   // Two independent ways to notice a submitted report, either one enough:
   //  1. the page starts showing the Help Center's confirmation text after
   //     the report form had been on screen -- needs no knowledge of what the
-  //     Submit button is called (v1.81.0 only had way 2, and a button
-  //     label it didn't know meant it never noticed anything);
+  //     Submit button is called (way 2 alone would never notice anything when
+  //     the button's label is one it doesn't know);
   //  2. a click on Submit after which the form stays gone.
   function waeAfWatchSubmit(session) {
     let done = false;
@@ -797,7 +797,7 @@
   }
 
   // ---------------------------------------------------------------------
-  // Sightengine AI-image check (v1.89.0). The review-page row has a button
+  // Sightengine AI-image check. The review-page row has a button
   // that opens Sightengine's \"Detect AI-generated images\" page with the
   // review photo's address in the URL hash. That page only takes dropped /
   // uploaded files (no address or query parameter), so this half -- which
@@ -810,7 +810,7 @@
   const WAE_SE_ORIGIN = 'https://sightengine.com';
   const WAE_SE_URL = 'https://sightengine.com/detect-ai-generated-images';
   const WAE_SE_HASH_IMAGE = 'wae-photo';
-  // v1.92.0: the verdict goes back to the Wayfarer tab that opened the check
+  // The verdict goes back to the Wayfarer tab that opened the check
   const WAE_SE_HASH_SESSION = 'wae-se-session';
   const WAE_SE_MSG_RESULT = 'wae-sightengine:result';
   const WAE_SE_AI_THRESHOLD = 0.9;          // "over 90%" AI-generated starts the auto-fill
@@ -838,7 +838,7 @@
     });
   }
 
-  // v1.92.0: Sightengine's AI score (0..1) out of a parsed response -- the
+  // Sightengine's AI score (0..1) out of a parsed response -- the
   // check API calls it `type.ai_generated`; any `ai_generated` number in
   // 0..1 found within a few levels is taken.
   function waeSeFindAiScore(obj, depth = 0) {
@@ -1030,7 +1030,7 @@
   const EXTRACT_DB_NAME = 'wf-abuse-report-extract-db';
   const EXTRACT_DB_VERSION = 2;
   const EXTRACT_STORE_NAME = 'extractedReports';
-  // v1.21.0: split out of extractedReports. issueType/locationDetails/
+  // Split out of extractedReports. issueType/locationDetails/
   // reportDetails are genuinely per-TICKET, not per-location -- storing
   // them on every location row meant a 12-location ticket duplicated the
   // same ~2.4KB of raw text 12 times. Measured at a real 15,000-row/
@@ -1140,7 +1140,7 @@
       const d = detailsById.get(r.ticketKey) || {};
       return {
         ...r,
-        // Rows stored before v1.62.1 can still carry a "#" in their ticket
+        // Older stored rows can still carry a "#" in their ticket
         // id. Cleaned here, on read, so the table, sorting, search, CSV
         // export and nearby-ticket labels all see the bare number without
         // touching what's stored. Only values containing "#" are changed.
@@ -1155,7 +1155,7 @@
   }
 
   // ---------------------------------------------------------------------
-  // Map attachment -- v1.26.0 switched this over to WFMM.map, the
+  // Map attachment -- uses WFMM.map, the
   // suite's own shared map-lookup service (confirmed against the real
   // source, src/core/map/service.js) -- the same one Report History and
   // every other official WFMM plugin uses. Earlier versions here were
@@ -1220,8 +1220,7 @@
   // each other always land in the same cell or an immediately adjacent
   // one. Only checking the 3x3 neighborhood instead of every other record
   // is what turns this from O(n^2) into close to O(n) for realistically
-  // spread-out real-world locations -- see the v1.13.0 changelog note for
-  // why this mattered (600+ accumulated rows made the naive full-pairwise
+  // spread-out real-world locations (600+ accumulated rows made the naive full-pairwise
   // version measurably slow, and it was re-running on every panel open).
   const WAE_GRID_DEG = 0.001;
   function waeGridKey(lat, lon) {
@@ -1410,21 +1409,9 @@
   // ---------------------------------------------------------------------
   // Map plotting -- extracted locations as a custom google.maps.OverlayView
   // subclass (WaePulseOverlay, see waeEnsurePulseOverlayCtor() further
-  // down), NOT native google.maps.Marker objects, as of v1.38.0.
+  // down), NOT native google.maps.Marker objects.
   //
-  // v1.12.0's own note here (kept for the record, since the reasoning in
-  // it turned out to be the wrong half of the story) argued the opposite:
-  // that a custom OverlayView forces a JS-driven DOM reposition on every
-  // drag frame while native Markers are repositioned by the Maps SDK
-  // itself with "no per-frame JS callback involved." That's not actually
-  // true -- Marker's own positioning is internally driven by the exact
-  // same projection/frame-update mechanism an OverlayView's draw()
-  // subscribes to; there's no callback-free "native" path, just one
-  // hidden from userland instead of one written in this file. What
-  // v1.12.0 was actually seeing (or anticipating) was never confirmed
-  // against a real reposition-cost measurement either way.
-  //
-  // What v1.38.0 DID confirm, reported as "loads fine on Chrome, slow on
+  // The reason: reported as "loads fine on Chrome, slow on
   // Firefox" once a dataset grew into the hundreds: a Marker's .icon is
   // fundamentally an <img>, decoded through the browser's image
   // pipeline -- and that pipeline is measurably heavier in Firefox than
@@ -1620,7 +1607,7 @@
   }
 
   // ---------------------------------------------------------------------
-  // Marker appearance -- v1.23.0. Registered with WFMM.markerAppearance
+  // Marker appearance. Registered with WFMM.markerAppearance
   // (confirmed against the real source, src/core/marker-appearance.js) so
   // this plugin's marker style is a genuine, discoverable entry in the
   // suite's own marker-styling engine, not just an internal constant. Kept
@@ -1645,7 +1632,7 @@
   // colorInput/numberInput/rangeInput controls the suite's own settings
   // screens use. Same underlying engine, same look, own section -- not a
   // literal new row in that one hardcoded grid.
-  // v1.67.0: on the review maps every cross (abuse reports AND the abuse
+  // On the review maps every cross (abuse reports AND the abuse
   // draft's Marked Wayspots) is drawn this many px larger than the
   // map-view one. Derived from the same Cross size setting, not a setting
   // of its own, so the review maps always follow it. The extra size is
@@ -1655,7 +1642,7 @@
   const WAE_APPEARANCE_STYLE_KEY = 'wae:abuse-report';
   const WAE_APPEARANCE_DEFAULTS = Object.freeze({
     // BUGFIX (not upstream, feature request): standard defaults as of
-    // v1.41.0 -- markerSize/clusterMarkerSize both 12px (previously 9/10
+    // MarkerSize/clusterMarkerSize both 12px (previously 9/10
     // respectively -- see clusterMarkerSize's own comment for why they
     // used to differ at all), borderWidth 1px (previously 2), fillOpacity
     // 0.5 (previously 1, fully opaque). fillOpacity/borderWidth only
@@ -1710,23 +1697,23 @@
     // Feature request: whether the Marked Wayspots list's "Copy All"
     // appends each entry's note -- see waeCopyIncludesNotes().
     copyIncludeNotes: true,
-    // v1.64.0: whether the note field + "+ add to abuse report draft"
+    // Whether the note field + "+ add to abuse report draft"
     // button also appear inside the review map's info windows -- see
     // waeReviewIwSyncNow(). Checkbox: Marker Style settings.
     reviewMapAbuseControls: true,
-    // v1.71.0: name/email the abuse form auto-fill puts in the form's
+    // Name/email the abuse form auto-fill puts in the form's
     // contact fields -- see waeGetReporterContact().
     reporterName: '',
     reporterEmail: '',
-    // v1.72.0: the report step's issue type (the option's title as the
+    // The report step's issue type (the option's title as the
     // form shows it), default text for the report-details / abuser fields.
     reporterIssueType: 'Fake Nominations or criteria issues',
     reporterReportDetails: '',
     reporterAbuser: '',
-    // v1.81.0: close the Help Center tab after the form is submitted and
+    // Close the Help Center tab after the form is submitted and
     // offer to clear the draft list. Off unless switched on.
     afterSubmitCleanup: false,
-    // v2.1.8: how dates are shown (Last Response column, ticket dates in
+    // How dates are shown (Last Response column, ticket dates in
     // the info windows / side panel, "reported ..." text) -- one of the
     // WAE_DATE_FORMATS values. See waeDateLocale().
     dateFormat: 'nl-NL',
@@ -1786,11 +1773,12 @@
     // load.
     WAE_MARKER_ICON = {};
     WAE_CLUSTER_ICON = {};
+    waeReviewIwSchedule(); // The nearby pictures' markers use these colors too
     // Only live-redraw if pulses are actually already visible -- editing
     // colors shouldn't be what makes the map attach/show pulses if the
     // user never turned "Show on Map" on.
     if (WAE_PULSES.map && isMapPulsesEnabled()) waeSafeRefreshPulses();
-    if (WAE_REVIEW_PULSES.map && waeReviewPulsesEnabled()) waeSafeRefreshReviewPulses(); // v1.67.0: review crosses derive from Cross size
+    if (WAE_REVIEW_PULSES.map && waeReviewPulsesEnabled()) waeSafeRefreshReviewPulses(); // Review crosses derive from Cross size
   }
 
   const WAE_PAGE_SIZE = 200;
@@ -1865,7 +1853,7 @@
     const variant = `${forReview ? 'review-' : ''}${imported ? 'imported' : 'email'}`;
     if (WAE_MARKER_ICON[variant]) return WAE_MARKER_ICON[variant];
     const a = waeLoadAppearance();
-    const markerSize = a.markerSize + (forReview ? WAE_REVIEW_MARKER_SIZE_BONUS : 0); // v1.67.0
+    const markerSize = a.markerSize + (forReview ? WAE_REVIEW_MARKER_SIZE_BONUS : 0);
     // Kept as a distinct X glyph (not the same filled-circle look as a
     // regular Wayspot/Pok\u00e9stop/Gym marker) so an abuse-report location
     // still reads as "a problem here", not just another POI dot -- only
@@ -1947,7 +1935,7 @@
   //
   // BUGFIX (not upstream): the VISIBLE div lives in the overlayLayer
   // pane (matching pulse-layer.js's own choice), not overlayMouseTarget
-  // -- v1.38.0 originally used overlayMouseTarget, which put every
+  // -- overlayMouseTarget would put every
   // cross/cluster visually ABOVE real markers (MapPanes' documented
   // stacking order is mapPane < overlayLayer < markerLayer <
   // overlayMouseTarget < floatPane -- native Wayspot/Pok\u00e9stop/Gym/
@@ -1958,7 +1946,7 @@
   // reported on. overlayLayer sits below markerLayer, so real markers
   // now stay visually on top.
   //
-  // BUGFIX (not upstream), v1.50.2: that move to overlayLayer was
+  // Follow-up: moving to overlayLayer alone was
   // believed to keep the div clickable in its own uncovered area (CSS
   // pointer-events on a specific element overrides an ancestor pane's
   // own default, so the reasoning went) -- reported back as simply not
@@ -2157,7 +2145,7 @@
         });
         this.div = div;
         this.applyToDiv();
-        // v1.67.0: markerLayer, the pane Google's own markers render in,
+        // MarkerLayer, the pane Google's own markers render in,
         // with a top-most z-index (.wae-pulse-review) -- NOT overlayLayer
         // like the map-view crosses: that pane sits beneath the markers,
         // which left these hidden behind the Wayspots they mark. Safe to
@@ -2210,7 +2198,7 @@
         this.applyToDiv();
         this.draw();
       }
-      // v1.65.1: a Marked Wayspot (abuse draft entry) drawn by this very
+      // A Marked Wayspot (abuse draft entry) drawn by this very
       // class -- same div/CSS class, same pane (overlayLayer), same
       // positioning and click-through behavior as the report crosses
       // above, so it renders exactly like them; the only differences are
@@ -2458,7 +2446,7 @@
     }
     WAE_REVIEW_PULSES.markersById.clear();
     if (WAE_REVIEW_PULSES.infoWindow) WAE_REVIEW_PULSES.infoWindow.close();
-    waeClearReviewDraftMarkers(); // v1.65.1: toggle Off, map detached, route left -- the draft markers go with them
+    waeClearReviewDraftMarkers(); // Toggle Off, map detached, route left -- the draft markers go with them
   }
 
   function waeClearReviewDraftMarkers() {
@@ -2468,7 +2456,7 @@
     WAE_REVIEW_PULSES.draftsById.clear();
   }
 
-  // v1.65.1: the Marked Wayspots (abuse draft) on the review map, drawn
+  // The Marked Wayspots (abuse draft) on the review map, drawn
   // with the report markers' own overlay class (see setDraftItem() in
   // WaeReviewPulseOverlayCtor) so they render the same way, and on the
   // same switch: the "Abuse report markers" toggle under the map. Never
@@ -2477,6 +2465,7 @@
   // waeRenderMarkedWayspotMarkers()), and a problem here must not be able
   // to get in the way of either.
   function waeRenderReviewDraftMarkers() {
+    waeReviewIwSchedule(); // The draft list changed -- the nearby pictures' markers follow
     try {
       const map = WAE_REVIEW_PULSES.map;
       const drafts = WAE_REVIEW_PULSES.draftsById;
@@ -2519,9 +2508,8 @@
   // zoom 1 through 8, they should render at every zoom level up to and
   // including the highest one." Crosses/clusters now always show
   // regardless of zoom, on every surface -- matching how the
-  // submit-Wayspot page already behaved (see v1.26.0/v1.33.0's own
-  // history with that page for why zoom-gating there specifically was
-  // already recognized as wrong). Clustering (see waeComputeClusters())
+  // submit-Wayspot page already behaved (zoom-gating there
+  // was already recognized as wrong). Clustering (see waeComputeClusters())
   // still keeps a fully zoomed-out view from turning into hundreds of
   // individual markers -- nearby reports still collapse into one circle
   // with a count, this just stopped hiding that circle outright below a
@@ -2537,9 +2525,8 @@
   }
 
   // Rebuilds the marker set from whatever's currently in waeAllRecords --
-  // NOT from IndexedDB (see v1.13.0 changelog note: that used to be the
-  // actual cause of a different slowdown, fixed by reading from this
-  // already-fetched cache instead). Clusters nearby records together at
+  // NOT from IndexedDB (reading from this already-fetched
+  // cache avoids a slowdown). Clusters nearby records together at
   // the current zoom (see v1.19.0 changelog note) rather than rendering
   // one marker per record unconditionally -- that was the remaining
   // performance ceiling once a real dataset grew into the hundreds, since
@@ -2550,7 +2537,7 @@
   // (e.g. after a scan that didn't change anything) doesn't recreate
   // markers needlessly -- only a genuine zoom change or data change does.
   // BUGFIX (not upstream): even after the zoom-debounce and cached-
-  // projection fixes (v1.29.0), zoom could still be slow with a large
+  // projection fixes, zoom could still be slow with a large
   // dataset -- every recompute was still clustering/diffing markers for
   // EVERY record with coordinates, worldwide, regardless of how small a
   // slice of the map was actually visible. Zoomed into one city out of a
@@ -2677,6 +2664,7 @@
   // wired through WFMM.layers, so it can never touch the Settings
   // side-panel list the way WAE_LAYER_ID does.
   function waeRefreshReviewPulses() {
+    waeReviewIwSchedule(); // The markers on the nearby pictures follow the same data
     const map = WAE_REVIEW_PULSES.map;
     if (!map) return;
     if (!waeReviewPulsesEnabled()) {
@@ -2714,7 +2702,7 @@
         console.warn('[Wayfarer Map Mods - Abuse Reports] Skipped rendering one review cluster:', e);
       }
     }
-    waeRenderReviewDraftMarkers(); // v1.65.1: last, so the report markers above never depend on it
+    waeRenderReviewDraftMarkers(); // Last, so the report markers above never depend on it
   }
 
   // Same 'projection_changed' wait as waeSafeRefreshPulses() above, for
@@ -2900,8 +2888,7 @@
   // BUGFIX (not upstream): "Show on Map" left toggled on from a previous
   // session didn't reliably re-show its markers on a fresh page load --
   // needed a manual toggle off/on to actually appear. Root cause: this
-  // plugin now runs at document-start (see the header's own v1.26.1
-  // changelog note), so waeResyncMapIfVisible()'s very first
+  // plugin now runs at document-start , so waeResyncMapIfVisible()'s very first
   // WFMM.map.refresh() call can genuinely race ahead of Angular/Google
   // Maps finishing initialization -- confirmed against the real source
   // (src/core/map/service.js): refresh() already retries internally (80
@@ -3010,8 +2997,7 @@
   // WFMM.layers/attachSettingsActions() are never touched by anything in
   // this section, and nothing above ever touches WAE_REVIEW_PULSES or
   // WAE_REVIEW_TOGGLE_KEY either. That separation is the point, not an
-  // accident -- an earlier attempt at review-page support (reverted in
-  // v1.40.0, see that changelog entry) tangled review handling into the
+  // accident -- an earlier attempt at review-page support (reverted) tangled review handling into the
   // same map/route tracking this plugin already used for mapview/submit,
   // and the "Abuse Report Extractor" entry disappearing from the Settings
   // side-panel list on every page load was never actually root-caused
@@ -3040,8 +3026,7 @@
   // directly. waeFindReviewMapOnce() below is this plugin's own from-
   // scratch version of that same technique (the file used to have a
   // comparable hand-rolled __ngContext__ reflection for mapview/submit
-  // too, before WFMM.map replaced it in v1.26.0 -- see that changelog
-  // entry) -- deliberately NOT narrowed to one specific review mode
+  // too, before WFMM.map replaced it) -- deliberately NOT narrowed to one specific review mode
   // (duplicates-check vs edit-location vs edit-info vs photo): it just
   // checks every <nia-map> currently in the DOM and uses whichever one
   // actually yields a map object, which is simpler and more robust to
@@ -3049,7 +3034,7 @@
   // branching would be, at the cost of harmlessly checking one or two
   // extra elements when only one is really present.
   const WAE_REVIEW_TOGGLE_KEY = 'wae_review_pulses_visible';
-  // The list icon on the Abuse Reports panel's header, and (v1.69.0) the
+  // The list icon on the Abuse Reports panel's header, and the
   // same one on the toggle bar under the review map -- both open the
   // Marked Wayspots list (waeOpenMarkedWayspotListModal()).
   const WAE_LIST_ICON_SVG = '<svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"></line><line x1="8" y1="12" x2="21" y2="12"></line><line x1="8" y1="18" x2="21" y2="18"></line><line x1="3" y1="6" x2="3.01" y2="6"></line><line x1="3" y1="12" x2="3.01" y2="12"></line><line x1="3" y1="18" x2="3.01" y2="18"></line></svg>';
@@ -3116,13 +3101,23 @@
     return Array.from(document.querySelectorAll('nia-map'));
   }
 
-  // v2.0.1: the redesigned review page no longer has <nia-map> / Angular
+  // The redesigned review page no longer has <nia-map> / Angular
   // contexts to dig the map out of. Two framework-independent ways in:
   //  (1) google.maps.Map.prototype is patched (as soon as the Maps API
   //      exists) so every map the page touches registers itself here;
   //  (2) failing that, the map is searched for in whatever framework state
   //      (Angular __ngContext__, React fiber) hangs off the ancestors of a
   //      rendered .gm-style element.
+  // Classic google.maps.Marker objects the page creates (Wayfarer's
+  // own nearby-Wayspot markers among them), kept weakly so the nearby search
+  // can fire the marker's own click -- which opens Wayfarer's native window.
+  const waeTrackedMarkers = [];
+  function waeTrackMarker(m) {
+    try {
+      waeTrackedMarkers.push(new WeakRef(m));
+      if (waeTrackedMarkers.length > 6000) waeTrackedMarkers.splice(0, 2000);
+    } catch (e) { /* no WeakRef: no tracking */ }
+  }
   const waeCapturedMaps = new Set();
   function waeCaptureMap(m) {
     if (m && !waeCapturedMaps.has(m) && waeReviewLooksLikeGoogleMap(m)) waeCapturedMaps.add(m);
@@ -3164,6 +3159,19 @@
               cp[name] = function () { const r = orig.apply(this, arguments); waeCaptureMap(r); return r; };
             }
             try { Object.defineProperty(cp, '__waePatched', { value: true }); } catch (e) { /* ignore */ }
+          }
+          // Remember every Marker the page constructs
+          if (!gm.__waeMarkerCtorWrapped && typeof gm.Marker === 'function') {
+            try {
+              gm.Marker = new Proxy(gm.Marker, {
+                construct(target, args, newTarget) {
+                  const inst = Reflect.construct(target, args, newTarget);
+                  waeTrackMarker(inst);
+                  return inst;
+                },
+              });
+              gm.__waeMarkerCtorWrapped = true;
+            } catch (e) { /* read-only: the nearby search falls back to its own window */ }
           }
           // google.maps.event.addListener(instance, ...) and friends
           if (gm.event && !gm.event.__waePatched) {
@@ -3212,7 +3220,7 @@
     return null;
   }
 
-  // v2.0.2: the bar no longer waits for the map object. As soon as a map is
+  // The bar no longer waits for the map object. As soon as a map is
   // on screen the bar is placed under it (the list button works right away);
   // once the map object is found it takes over the same bar.
   function waeEnsureReviewBarFallback() {
@@ -3265,8 +3273,8 @@
   let waeReviewMapSearchAttempts = 0;
   // /new/review is a single route across every ticket a reviewer works
   // through, the same "one route, map swapped out underneath it"
-  // situation v1.29.3 already had to add a periodic safety-net refresh
-  // for on the submit-Wayspot page (see WAE_MAP_PERIODIC_RECHECK_MS
+  // situation the submit-Wayspot page already needed a periodic safety-net
+  // refresh for (see WAE_MAP_PERIODIC_RECHECK_MS
   // above) -- nothing here would otherwise notice the review map going
   // stale between one ticket and the next, since that's not a route
   // change and there's no WFMM.map staleness check backing this surface.
@@ -3277,7 +3285,7 @@
 
   function waeReviewIsOnRoute() {
     try { if (wfmmWindow.WFMM.routes.is('review')) return true; } catch (e) { /* fall through to the URL check */ }
-    // v2.0.1: the redesigned review page may not be recognised by Map Mods' router
+    // The redesigned review page may not be recognised by Map Mods' router
     return /\/review(\/|$)/.test(location.pathname);
   }
 
@@ -3347,7 +3355,7 @@
       if (!hadMap) waeEnsureReviewBarFallback();
       waeScheduleReviewMapSearch();
     } else if (WAE_REVIEW_PULSES.host && !document.getElementById(WAE_REVIEW_TOGGLE_ID)) {
-      waeInjectReviewToggle(WAE_REVIEW_PULSES.host); // v2.0.1: a re-render removed the bar
+      waeInjectReviewToggle(WAE_REVIEW_PULSES.host); // A re-render removed the bar
     }
   }
 
@@ -3394,17 +3402,14 @@
   // and reflows with the page instead of a script re-synchronizing a
   // floating copy against it a frame later.
   //
-  // v1.43.0's original version of this (host.parentElement.insertBefore
-  // (bar, host)) broke on review cards where the map's immediate parent
-  // turned out to be a flex/grid ROW (map + photo carousel side by
-  // side, confirmed in the field via screenshot) rather than a simple
-  // stacked column -- inserting a second child there just became
-  // another item in that row. v1.47.0 sidestepped that with
-  // position:fixed on document.body, which fixed the placement but
-  // introduced the floating/lagging look. v1.50.0 tried forcing the
-  // existing row to wrap (flex-wrap:wrap/grid-column:1/-1 on the bar
-  // itself) instead -- reported back still landing beside the map,
-  // confirming that guessing at and overriding the SITE'S OWN row/grid
+  // A plain host.parentElement.insertBefore(bar, host) breaks on review
+  // cards where the map's immediate parent is a flex/grid ROW (map +
+  // photo carousel side by side) rather than a simple stacked column --
+  // inserting a second child there just becomes another item in that row.
+  // position:fixed on document.body fixes the placement but gives a
+  // floating/lagging look, and forcing the existing row to wrap
+  // (flex-wrap:wrap/grid-column:1/-1 on the bar itself) still lands beside
+  // the map: guessing at and overriding the SITE'S OWN row/grid
   // settings from outside isn't reliable (Wayfarer's own layout code
   // can simply re-apply whatever it was already doing).
   //
@@ -3446,7 +3451,7 @@
         waeSafeRefreshReviewPulses();
         waeReviewIwSchedule(); // also adds/removes the add-to-draft controls in open info windows
       });
-      // v1.69.0: the Marked Wayspots list is reachable from here too (the
+      // The Marked Wayspots list is reachable from here too (the
       // panel it normally lives behind isn't on the review page). Same
       // icon as the panel header's list button; sits next to On/Off so
       // the label can keep truncating on its own at the left.
@@ -3464,13 +3469,13 @@
       const actions = document.createElement('span');
       actions.className = 'wae-review-toggle-actions';
       actions.append(listBtn, btn);
-      // v2.0.8: no text label any more (more room for the note field);
+      // No text label any more (more room for the note field);
       // the toggle button carries the marker cross + On/Off instead
       bar.appendChild(actions);
     }
     waeReviewToggleHost = host;
     waePlaceReviewToggle(host, bar);
-    // v2.0.6: the review's abuse controls (note, copy, add, auto-fill,
+    // The review's abuse controls (note, copy, add, auto-fill,
     // form, Sightengine) live in this bar, on a second line
     if (waeCurrentReviewRow && waeCurrentReviewRow.parentElement !== bar) bar.appendChild(waeCurrentReviewRow);
     // Back to living inside Wayfarer's own app tree (a genuine DOM
@@ -3510,7 +3515,7 @@
   // recreated -- checking parentElement's id on every call re-wraps a
   // host that came back outside our old wrapper, and is a cheap no-op
   // for one that's still inside it.
-  // v1.69.1: 'width' is no longer in this list. getComputedStyle().width
+  // 'width' is no longer in this list. getComputedStyle().width
   // is the USED width in px at that instant (e.g. "612px", even when the
   // site's own rule was just "fill the column"), and it was frozen onto
   // the wrapper once, when the wrapper was created. Whenever the column
@@ -3545,7 +3550,7 @@
   }
   function waePlaceReviewToggle(host, bar) {
     if (host.tagName !== 'NIA-MAP') {
-      // v2.0.1: redesigned page. Don't re-parent the framework's own map
+      // Redesigned page. Don't re-parent the framework's own map
       // element (that can crash its re-rendering) -- put the bar right
       // after it, full width.
       // natural height, never grows or shrinks (a column parent would
@@ -3555,14 +3560,14 @@
       bar.style.height = 'auto';
       bar.style.width = '100%';
       bar.style.boxSizing = 'border-box';
-      // v2.0.3: the map sits in Wayfarer's [data-testid="base-map-root"]
+      // The map sits in Wayfarer's [data-testid="base-map-root"]
       // box (fixed height, rounded, overflow hidden) -- a bar placed inside
       // it gets clipped away. Place it after that whole box instead (the
       // same element Map Mods uses as the map's host).
       let anchor = host.closest('[data-testid="base-map-root"]')
         || host.querySelector('[data-testid="base-map-root"]')
         || host;
-      // v2.0.4: not every page carries that attribute. Climb out of any
+      // Not every page carries that attribute. Climb out of any
       // ancestor that clips its content (overflow hidden/clip, like the
       // rounded fixed-height map box) or is just the map's own size, and
       // stop at the first roomier one (the card around map + photos).
@@ -3575,7 +3580,7 @@
         if (!clips && !mapSized) break;
         anchor = parent;
       }
-      // v2.0.12: never sit beside things in a row layout (photo review puts
+      // Never sit beside things in a row layout (photo review puts
       // the Wayspot title and the map side by side; a full-width bar there
       // squeezes the title to one letter per line). Climb out of any row.
       for (let i = 0; i < 5; i += 1) {
@@ -3618,7 +3623,7 @@
 
   let waeReviewToggleHost = null;
 
-  // v2.1.3: any CSS color (rgb, rgba, oklch, color(srgb ...), lab ...) as sRGB + alpha. The redesigned
+  // Any CSS color (rgb, rgba, oklch, color(srgb ...), lab ...) as sRGB + alpha. The redesigned
   // site paints its backgrounds in modern color formats, which a plain rgb() regex cannot read.
   let waeColorCtx = null;
   function waeCssColorToRgba(css) {
@@ -3652,7 +3657,7 @@
   }
   const waeColorLuma = (c) => (0.299 * c.r + 0.587 * c.g + 0.114 * c.b) / 255;
 
-  // v2.0.11: follow the PAGE's theme -- never the OS setting. v2.1.3: when there is no .dark class /
+  // Follow the PAGE's theme -- never the OS setting. When there is no .dark class /
   // data-theme, look at the first background that is really painted behind the toolbar (walking up
   // from the toolbar's own wrapper, not the map and not <body>, which is often transparent), then at
   // the text color, then at color-scheme.
@@ -3742,7 +3747,7 @@
     waeReviewRouteEnterUnsub = WFMM.routes.onEnter('review', waeReviewOnRouteEnter);
     waeReviewRouteLeaveUnsub = WFMM.routes.onLeave('review', waeReviewOnRouteLeave);
     if (waeReviewIsOnRoute()) waeReviewOnRouteEnter(); // this version can load while already sitting on /new/review
-    // v2.0.1: watchdog for when Map Mods' route events don't fire on the redesigned page
+    // Watchdog for when Map Mods' route events don't fire on the redesigned page
     if (!waeReviewWatchdog) {
       let wasOn = waeReviewIsOnRoute();
       waeReviewWatchdog = setInterval(() => {
@@ -3782,7 +3787,7 @@
   let waeReviewAbuseInsertToken = 0;
 
   const WAE_COPY_ICON_SVG = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"></rect><path d="M5 15V6a2 2 0 0 1 2-2h9"></path></svg>';
-  // v1.76.0: the review-page row's other icons -- same 16px outline style
+  // The review-page row's other icons -- same 16px outline style
   // as the copy/check icons. Flag with a plus = add to the abuse report
   // draft, wand = auto-fill the abuse form, page with an exclamation mark
   // = open the abuse form (wand and page are Lucide's "wand" and
@@ -3792,12 +3797,12 @@
   const WAE_WAND_ICON_SVG = waeIconSvg('<path d="M15 4V2"></path><path d="M15 16v-2"></path><path d="M8 9h2"></path><path d="M20 9h2"></path><path d="M17.8 11.8 19 13"></path><path d="M15 9h.01"></path><path d="M17.8 6.2 19 5"></path><path d="m3 21 9-9"></path><path d="M12.2 6.2 11 5"></path>');
   const WAE_FILE_ALERT_ICON_SVG = waeIconSvg('<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"></path><path d="M14 2v4a2 2 0 0 0 2 2h4"></path><path d="M12 9v4"></path><path d="M12 17h.01"></path>');
   const WAE_X_ICON_SVG = waeIconSvg('<path d="M6 6l12 12M18 6 6 18"></path>');
-  // v1.78.0, for the Marked Wayspots list modal (Lucide "trash-2" and "clipboard-check")
+  // For the Marked Wayspots list modal (Lucide "trash-2" and "clipboard-check")
   const WAE_TRASH_ICON_SVG = waeIconSvg('<path d="M3 6h18"></path><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"></path><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><path d="M10 11v6M14 11v6"></path>');
   const WAE_CLIPBOARD_CHECK_ICON_SVG = waeIconSvg('<rect width="8" height="4" x="8" y="2" rx="1" ry="1"></rect><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path><path d="m9 14 2 2 4-4"></path>');
-  // v1.89.0, for the review row's Sightengine button (Lucide \"scan-search\")
+  // For the review row's Sightengine button (Lucide \"scan-search\")
   const WAE_SCAN_SEARCH_ICON_SVG = waeIconSvg('<path d=\"M3 7V5a2 2 0 0 1 2-2h2\"></path><path d=\"M17 3h2a2 2 0 0 1 2 2v2\"></path><path d=\"M21 17v2a2 2 0 0 1-2 2h-2\"></path><path d=\"M7 21H5a2 2 0 0 1-2-2v-2\"></path><circle cx=\"12\" cy=\"12\" r=\"3\"></circle><path d=\"m16 16-1.9-1.9\"></path>');
-  // v1.82.0, for the Marked Wayspots list's Deselect all button (Lucide "square-minus")
+  // For the Marked Wayspots list's Deselect all button (Lucide "square-minus")
   const WAE_DESELECT_ICON_SVG = waeIconSvg('<rect width="18" height="18" x="3" y="3" rx="2"></rect><path d="M8 12h8"></path>');
 
   // An icon-only button for the suite's own modals (ui.button() underneath,
@@ -3844,12 +3849,242 @@
     });
   }
 
-  function waeRemoveReviewAbuseRows() {
-    waeCurrentReviewRow = null;
-    document.querySelectorAll('.wae-review-abuse-row').forEach((el) => el.remove());
+  // The info window opened from the nearby search list
+  let waeNearbySearchIw = null;
+  let waeNearbySearchIwOpen = false;
+  let waeNearbySearchIwOpenedAt = 0;
+  function waeCloseNearbySearchIw() {
+    waeNearbySearchIwOpen = false;
+    if (waeNearbySearchIw) { try { waeNearbySearchIw.close(); } catch (e) { /* ignore */ } }
+  }
+  // Same look and structure as Wayfarer's own nearby windows (.wf-duplicate-iw-content
+  // with a .font-medium title and the photo), so the note field + add button
+  // (waeReviewIwSyncNow()) are added to it the same way.
+  const WAE_NATIVE_IW_SEL = '.agm-info-window-content, .wf-duplicate-iw-content, .wfmm-review-owned-info-window';
+  // Wayfarer's own windows (a manual click on a nearby Wayspot): close them
+  // through their own close button, so only one window shows.
+  function waeCloseNativeIws() {
+    try {
+      for (const own of document.querySelectorAll(WAE_NATIVE_IW_SEL)) {
+        const bubble = own.closest('.gm-style-iw-c, .gm-style-iw');
+        const closeBtn = bubble && (bubble.querySelector('button.gm-ui-hover-effect') || bubble.parentElement?.querySelector('button.gm-ui-hover-effect'));
+        if (closeBtn) closeBtn.click();
+      }
+    } catch (e) { /* ignore */ }
+  }
+  function waeNativeIwTitles() {
+    const out = [];
+    for (const own of document.querySelectorAll(WAE_NATIVE_IW_SEL)) {
+      const t = own.querySelector('.wfmm-review-owned-info-window__title, .font-medium');
+      out.push(waeReviewIwNormalizeText(t?.textContent).toLowerCase());
+    }
+    return out;
+  }
+  const waeNearbySleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  let waeNearbyOpenToken = 0;
+
+  // Tries to open Wayfarer's OWN window for this Wayspot, by firing
+  // the click of its map marker -- first via the marker objects tracked
+  // above, otherwise by clicking the marker element at the map's center
+  // (the map has just been centered on it). Only counts as success when a
+  // native window with this Wayspot's title shows up; a wrong one is closed
+  // again. Resolves false when nothing worked (the caller then opens its
+  // own window, waeOpenNearbySearchIw()).
+  async function waeTryOpenNativeNearbyIw(portal, token) {
+    const map = WAE_REVIEW_PULSES.map;
+    if (!map || !portal.titleKey || typeof google === 'undefined' || !google.maps?.event) return false;
+    let fired = false;
+    // (1) tracked markers
+    for (const ref of waeTrackedMarkers) {
+      const m = ref.deref();
+      if (!m) continue;
+      try {
+        const pos = m.getPosition && m.getPosition();
+        if (!pos || Math.abs(pos.lat() - portal.lat) > 1e-5 || Math.abs(pos.lng() - portal.lng) > 1e-5) continue;
+        if (m.getMap && m.getMap() !== map) continue;
+        google.maps.event.trigger(m, 'click', { latLng: pos, domEvent: new MouseEvent('click') });
+        fired = true;
+        break;
+      } catch (e) { /* try the next one */ }
+    }
+    // (2) the marker element at the map's center
+    if (!fired) {
+      await waeNearbySleep(350); // let the re-center / zoom settle
+      if (token !== waeNearbyOpenToken) return true; // superseded by a newer click
+      try {
+        const div = map.getDiv();
+        const rect = div.getBoundingClientRect();
+        const cx = rect.left + rect.width / 2;
+        for (const dy of [0, -10, -20, 10, -30]) {
+          const hit = document.elementsFromPoint(cx, rect.top + rect.height / 2 + dy)
+            .map((el) => (div.contains(el) ? el.closest('[role="button"], gmp-advanced-marker, area') : null))
+            .find((el) => el && !el.closest('.wae-pulse-marker, .gm-style-iw, .gmnoprint, .gm-bundled-control, .wae-review-toggle-bar'));
+          if (!hit) continue;
+          hit.click();
+          if (hit.tagName === 'GMP-ADVANCED-MARKER') hit.dispatchEvent(new Event('gmp-click', { bubbles: true }));
+          fired = true;
+          break;
+        }
+      } catch (e) { /* fall back */ }
+    }
+    if (!fired) return false;
+    for (let i = 0; i < 8; i += 1) {
+      await waeNearbySleep(100);
+      if (token !== waeNearbyOpenToken) return true;
+      const titles = waeNativeIwTitles();
+      if (!titles.length) continue;
+      if (titles.includes(portal.titleKey)) return true;
+      waeCloseNativeIws(); // some other Wayspot's window: not what was asked for
+      return false;
+    }
+    return false;
   }
 
-  // v1.91.0: the addresses of the review's photos, from the review response,
+  async function waeOpenNearbyPortalWindow(portal) {
+    const token = ++waeNearbyOpenToken;
+    waeCloseNearbySearchIw();
+    waeCloseNativeIws();
+    await waeNearbySleep(50); // the close buttons act before anything is looked for
+    if (token !== waeNearbyOpenToken) return;
+    let native = false;
+    try { native = await waeTryOpenNativeNearbyIw(portal, token); } catch (e) { native = false; }
+    if (token !== waeNearbyOpenToken) return;
+    if (native) {
+      waeNearbySearchIwOpen = false;
+      return;
+    }
+    waeOpenNearbySearchIw(portal);
+  }
+
+  function waeOpenNearbySearchIw(portal) {
+    const map = WAE_REVIEW_PULSES.map;
+    if (!map || typeof google === 'undefined' || !google.maps?.InfoWindow) return;
+    waeCloseNativeIws();
+    // Own class (not one of the three above): the info window observer
+    // (waeReviewIwSyncNow()) only handles Wayfarer's/the suite's windows, and
+    // the controls are added right here, since the Wayspot is already known.
+    const content = document.createElement('div');
+    content.className = 'wae-nearby-iw';
+    content.style.cssText = 'color:#111827;font-size:13px;line-height:1.35;width:190px;max-width:100%;box-sizing:border-box;padding:0;text-align:center;';
+    const title = document.createElement('div');
+    title.className = 'font-medium';
+    title.style.fontWeight = '500';
+    title.style.padding = '0 14px';
+    title.textContent = portal.name || 'Untitled Wayspot';
+    content.append(title);
+    if (portal.rawImageUrl) {
+      const img = document.createElement('img');
+      img.src = portal.rawImageUrl;
+      img.alt = '';
+      img.style.cssText = 'display:block;width:72px;height:auto;max-width:100%;margin:6px auto 0;border-radius:2px;';
+      content.append(img);
+    }
+    if (waeReviewMapControlsEnabled()) {
+      const poi = {
+        name: portal.name, lat: portal.lat, lng: portal.lng,
+        photoUrl: waeReviewIwFullSizePhotoUrl(portal.rawImageUrl),
+      };
+      const controls = waeReviewIwBuildControls(poi, `${portal.lat.toFixed(6)},${portal.lng.toFixed(6)}|${portal.name}`);
+      controls.style.cssText = 'width:100%;min-width:0;max-width:none;margin:6px 0 0;';
+      content.append(controls);
+    }
+    if (!waeNearbySearchIw) {
+      waeNearbySearchIw = new google.maps.InfoWindow();
+      waeNearbySearchIw.addListener('closeclick', () => { waeNearbySearchIwOpen = false; });
+    }
+    waeNearbySearchIwOpen = true;
+    waeNearbySearchIwOpenedAt = Date.now();
+    waeNearbySearchIw.setContent(content);
+    waeNearbySearchIw.setPosition(new google.maps.LatLng(portal.lat, portal.lng));
+    waeNearbySearchIw.open(map);
+  }
+
+  function waeRemoveReviewAbuseRows() {
+    waeCloseNearbySearchIw();
+    waeCurrentReviewRow = null;
+    document.querySelectorAll('.wae-review-abuse-row, .wae-review-nearby-search').forEach((el) => el.remove());
+  }
+
+  // Search box for the nearby Wayspots of the open review (review
+  // page only -- it is built next to the review row, which only exists
+  // there). Searches the titles of the nearby Wayspots in the review
+  // response (waeReviewNearbyPortals); picking one centers the review map
+  // on it. Diacritics and case are ignored.
+  function waeNearbyNormalize(value) {
+    return String(value || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+  }
+  function waeBuildReviewNearbySearch() {
+    const wrap = document.createElement('div');
+    wrap.className = 'wae-review-nearby-search';
+    const input = document.createElement('input');
+    input.type = 'search';
+    input.className = 'wae-detail-mark-note';
+    input.placeholder = 'Search nearby Wayspots\u2026';
+    input.autocomplete = 'off';
+    input.setAttribute('aria-label', 'Search the titles of the nearby Wayspots');
+    // The matching titles are listed right below the field, in the
+    // bar itself (no floating menu), each one a button that centers the
+    // review map on that Wayspot.
+    const list = document.createElement('div');
+    list.className = 'wae-nearby-list';
+    list.hidden = true;
+    wrap.append(input, list);
+
+    // Centers the review map on the Wayspot AND opens its info
+    // window; the list stays open (and marks the one that is showing).
+    const goTo = (portal) => {
+      const map = WAE_REVIEW_PULSES.map;
+      if (map) {
+        map.setCenter(new google.maps.LatLng(portal.lat, portal.lng));
+        const z = map.getZoom();
+        if (typeof z === 'number' && z < 18) map.setZoom(18);
+      }
+      waeOpenNearbyPortalWindow(portal);
+      for (const el of list.querySelectorAll('.wae-nearby-list-item')) {
+        el.classList.toggle('wae-active', el.__waePortal === portal);
+      }
+    };
+    const matches = () => {
+      const q = waeNearbyNormalize(input.value);
+      if (!q) return [];
+      return waeReviewNearbyPortals.filter((pt) => pt.name && waeNearbyNormalize(pt.name).includes(q));
+    };
+    const note = (text) => {
+      const el = document.createElement('div');
+      el.className = 'wae-nearby-list-empty';
+      el.textContent = text;
+      list.append(el);
+    };
+    const render = () => {
+      list.textContent = '';
+      if (!waeNearbyNormalize(input.value)) { list.hidden = true; return; }
+      list.hidden = false;
+      if (!waeReviewNearbyPortals.length) { note('No nearby Wayspots in this review'); return; }
+      const found = matches();
+      if (!found.length) { note('No nearby Wayspot with that title'); return; }
+      for (const portal of found) {
+        const item = document.createElement('button');
+        item.type = 'button';
+        item.className = 'wae-nearby-list-item';
+        item.textContent = portal.name;
+        item.title = `Go to ${portal.name} on the map (${portal.lat.toFixed(6)}, ${portal.lng.toFixed(6)})`;
+        item.__waePortal = portal;
+        item.addEventListener('click', (ev) => { ev.preventDefault(); ev.stopPropagation(); goTo(portal); });
+        list.append(item);
+      }
+    };
+    input.addEventListener('input', render);
+    input.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Escape') { input.value = ''; render(); waeCloseNearbySearchIw(); return; }
+      if (ev.key !== 'Enter') return;
+      ev.preventDefault();
+      const found = matches();
+      if (found.length) goTo(found[0]);
+    });
+    return wrap;
+  }
+
+  // The addresses of the review's photos, from the review response,
   // at full size (\"=s0\", as Image Mods' magnifier opens them): the new
   // Wayspot's `imageUrl`, its `supportingImageUrls`, and the `newPhotos` of
   // a photo review. Only Google-hosted addresses are taken; unusable
@@ -3869,7 +4104,7 @@
     };
   }
 
-  // v2.0.13: the Sightengine check itself, shared by the review row's button
+  // The Sightengine check itself, shared by the review row's button
   // (waeBuildReviewAbuseRow()) and the one in the review map's info windows
   // (waeReviewIwBuildControls()). Opens Sightengine with `photoUrl` loaded;
   // with the "start the auto-fill on an AI verdict" setting on (the
@@ -3879,7 +4114,7 @@
   // `noteInput` is read when the verdict arrives, so a note typed meanwhile
   // is included.
   function waeStartSightengineCheck({ photoUrl, name, lat, lng, noteInput, btn, idleIcon, idleTitle, onAi }) {
-    // v2.0.15: onAi 'draft' (the main map's details panel) adds the Wayspot to the
+    // OnAi 'draft' (the main map's details panel) adds the Wayspot to the
     // Marked Wayspots draft list on an AI verdict instead of starting the abuse
     // form auto-fill (the default, 'form').
     const toDraft = onAi === 'draft';
@@ -3922,7 +4157,7 @@
           }
           // A moment to see the verdict, then this Wayspot (and the note
           // beside it, as read now) goes into the abuse form in the same
-          // tab. v1.93.0: this workflow fills the form its own way: the
+          // tab. This workflow fills the form its own way: the
           // issue is always "Photo Issues"; the report details are the note
           // (when there is one) and the verdict, and nothing else (not the
           // settings' default text); the location field only has the
@@ -3939,7 +4174,7 @@
                 locationNotes: false,
               },
             }), undefined, popup, () => {
-              // v1.94.0: once the form is submitted the Wayspot goes straight into the
+              // Once the form is submitted the Wayspot goes straight into the
               // abuse reports table as a "Reported" row (the note and the verdict as its
               // comment); the next scan that finds its ticket email replaces it.
               waeAddReportedRecords([{ name, lat, lng, note: [noteNow, aiNote].filter(Boolean).join('; ') }])
@@ -3959,7 +4194,7 @@
     }, 1500);
   }
 
-  // v2.0.14: the Sightengine button for a Wayspot whose photo address is
+  // The Sightengine button for a Wayspot whose photo address is
   // known -- used by the review map's info windows and the main map's
   // details panel. (The review row builds its own, which also has a
   // disabled state for reviews without a photo address.)
@@ -4028,7 +4263,7 @@
     formLink.target = '_blank';
     formLink.rel = 'noopener noreferrer';
 
-    // v1.75.0: opens the abuse form and fills it in for THIS review only --
+    // Opens the abuse form and fills it in for THIS review only --
     // just this Wayspot and the note typed in the field beside it, not the
     // Marked Wayspots list (and nothing is added to that list). The note is
     // read when the Help Center tab asks for the data, so one typed or
@@ -4045,7 +4280,7 @@
     fillBtn.addEventListener('click', (ev) => {
       ev.preventDefault();
       ev.stopPropagation();
-      // v2.1.9: a note typed beside the button REPLACES the settings'
+      // A note typed beside the button REPLACES the settings'
       // default report details text (instead of the default being used
       // and the note only appearing in the location field); the location
       // field then only has the name and coordinates. Without a
@@ -4073,7 +4308,7 @@
       }, 1500);
     });
 
-    // v1.89.0 / v1.91.0: opens Sightengine's AI-image check with this
+    // Opens Sightengine's AI-image check with this
     // review's photo already loaded (see the Sightengine companion near the
     // top of this file): the new Wayspot's photo, or the first photo of a
     // photo review. Edits have no photo, so they get no button; a review
@@ -4102,7 +4337,7 @@
       });
     }
 
-    // v1.79.1: the note field first, then all the icon buttons to its right
+    // The note field first, then all the icon buttons to its right
     row.append(noteInput, copyBtn, markBtn, fillBtn, formLink);
     if (seBtn) row.append(seBtn);
     return row;
@@ -4113,7 +4348,7 @@
   // card. Waits for the element (the response can land before Angular
   // has rendered the card); a newer candidate arriving while waiting
   // supersedes this one via the token.
-  // v2.0.1: the redesigned review page has no .mt-2 / .review-edit-info.
+  // The redesigned review page has no .mt-2 / .review-edit-info.
   // Anchor on the first card heading instead ("Title and Description" on
   // new nominations, the nearest equivalent on other review types).
   function waeFindNewLayoutAnchor() {
@@ -4133,7 +4368,7 @@
     if (!waePluginActive) return;
     const token = ++waeReviewAbuseInsertToken;
     const isEdit = candidate.type === 'EDIT';
-    // v2.0.6: the row goes into the toggle bar under the map, so all the
+    // The row goes into the toggle bar under the map, so all the
     // abuse report controls sit in one place. Give the bar a moment to
     // appear; if there is no map/bar on this review, fall back to the card.
     let bar = null;
@@ -4154,8 +4389,10 @@
     if (!row) return;
     waeRemoveReviewAbuseRows(); // drop the previous candidate's row
     waeCurrentReviewRow = row;
+    const nearbySearch = waeBuildReviewNearbySearch(); // Placed right after the row below
     if (bar) {
       bar.appendChild(row);
+      row.after(nearbySearch);
       return;
     }
     if (target.__waeNewLayoutAnchor) {
@@ -4166,6 +4403,7 @@
     } else {
       target.parentNode.insertBefore(row, target);
     }
+    row.after(nearbySearch);
   }
 
   function waeOnReviewResponse() {
@@ -4207,7 +4445,7 @@
   }
   waeInstallReviewCandidateHook();
 
-  // v2.0.1: the redesigned page may load the review with fetch() instead of XHR
+  // The redesigned page may load the review with fetch() instead of XHR
   (function waeInstallReviewFetchHook() {
     const w = wfmmWindow;
     if (!w.fetch || w.__waeReviewFetchHooked) return;
@@ -4228,7 +4466,7 @@
   })();
 
   // ---------------------------------------------------------------------
-  // Abuse draft controls inside the review map's info windows (v1.64.0).
+  // Abuse draft controls inside the review map's info windows.
   // The same note field + "+ add to abuse report draft" button the side
   // panel and the review-page row above already have, added to the info
   // window that opens when you click a nearby Wayspot on the review map
@@ -4311,13 +4549,13 @@
     }).filter((p) => waeIsValidLatLng(p.lat, p.lng));
   }
 
-  // The window's photo element (v2.0.9: redesigned page's windows too)
+  // The window's photo element (also in the redesigned page's windows)
   function waeReviewIwImage(content) {
     return content.querySelector('img.wf-image-modal') || content.querySelector('img[wf-image-modal]')
       || content.querySelector(':scope > button > img') || content.querySelector('img');
   }
 
-  // v2.0.13: full-size address of a window's photo for Sightengine: any
+  // Full-size address of a window's photo for Sightengine: any
   // size suffix (=s180, =w400-h300-c, ...) swapped for "=s0" as the review
   // row does; '' when it isn't a Google-hosted address.
   function waeReviewIwFullSizePhotoUrl(raw) {
@@ -4367,7 +4605,7 @@
       ? content.querySelector('.wfmm-review-owned-info-window__title')
       : (content.querySelector(':scope > div > .font-medium') || content.querySelector(':scope > .font-medium') || content.querySelector('.font-medium'));
     const domTitle = waeReviewIwNormalizeText(titleEl?.textContent);
-    // v2.0.13: the photo shown in the window, for its Sightengine button
+    // The photo shown in the window, for its Sightengine button
     const domImg = waeReviewIwImage(content);
     const domPhoto = waeReviewIwFullSizePhotoUrl(domImg?.currentSrc || domImg?.src);
     if (!owned) {
@@ -4395,7 +4633,7 @@
     wrap.dataset.waeKey = key;
     const { noteInput, markBtn } = waeBuildMarkControls({ name: poi.name, lat: poi.lat, lng: poi.lng, iconOnly: true });
     wrap.append(noteInput, markBtn);
-    // v2.0.13: the review row's Sightengine check, for the Wayspot this
+    // The review row's Sightengine check, for the Wayspot this
     // window is about (its photo as shown here); no photo address, no button.
     if (poi.photoUrl) {
       wrap.append(waeBuildSightengineButton({ photoUrl: poi.photoUrl, name: poi.name, lat: poi.lat, lng: poi.lng, noteInput }));
@@ -4408,14 +4646,146 @@
     return wrap;
   }
 
+
+  // ---------------------------------------------------------------------
+  // Abuse markers on the nearby Wayspot pictures (the picture
+  // carousel under the review map). A picture whose Wayspot sits exactly on
+  // (WAE_CAROUSEL_MATCH_METERS) an extracted/imported abuse report gets
+  // the report cross (the email or imported color); one that is on the
+  // Marked Wayspots draft list gets the draft cross (the Marked Wayspot
+  // color) -- the same crosses and colors as on the map. Both when both.
+  // The pictures are found by their address: the nearby Wayspots of the
+  // review response (waeReviewNearbyPortals) carry theirs. Runs from the
+  // info window observer (waeReviewIwSyncNow()), idempotent, review page
+  // only. Follows the \"Abuse report markers\" toggle under the map.
+  // ---------------------------------------------------------------------
+  const WAE_CAROUSEL_BADGE_CLASS = 'wae-carousel-badges';
+  const WAE_CAROUSEL_BADGE_SIZE = 32;
+  // An exact match, not the 20 m of the ticket check: the report /
+  // draft entry must sit on the picture's Wayspot itself. 1 m only absorbs
+  // the rounding of copied coordinates.
+  const WAE_CAROUSEL_MATCH_METERS = 1;
+  function waeCarouselBaseUrl(raw) {
+    let url = String(raw || '').trim();
+    if (!url) return '';
+    if (url.startsWith('http://')) url = `https://${url.slice('http://'.length)}`;
+    return url.replace(/=[^=/?#]*$/, '');
+  }
+  function waeRecordsNear(lat, lng, maxMeters) {
+    const out = [];
+    const buckets = waeGetTicketIndexBuckets();
+    const cellLat = Math.floor(lat / WAE_GRID_DEG);
+    const cellLon = Math.floor(lng / WAE_GRID_DEG);
+    for (let dLat = -1; dLat <= 1; dLat++) {
+      for (let dLon = -1; dLon <= 1; dLon++) {
+        const bucket = buckets.get(`${cellLat + dLat}:${cellLon + dLon}`);
+        if (!bucket) continue;
+        for (const r of bucket) {
+          if (waeHaversineMeters(lat, lng, r.latitude, r.longitude) <= maxMeters) out.push(r);
+        }
+      }
+    }
+    return out;
+  }
+  function waeCarouselCrossSvg(color) {
+    return `<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" width=\"${WAE_CAROUSEL_BADGE_SIZE}\" height=\"${WAE_CAROUSEL_BADGE_SIZE}\" style=\"display:block\">`
+      + '<line x1=\"4.5\" y1=\"4.5\" x2=\"19.5\" y2=\"19.5\" stroke=\"#fff\" stroke-width=\"9\" stroke-linecap=\"round\"/>'
+      + '<line x1=\"19.5\" y1=\"4.5\" x2=\"4.5\" y2=\"19.5\" stroke=\"#fff\" stroke-width=\"9\" stroke-linecap=\"round\"/>'
+      + `<line x1=\"4.5\" y1=\"4.5\" x2=\"19.5\" y2=\"19.5\" stroke=\"${color}\" stroke-width=\"5.5\" stroke-linecap=\"round\"/>`
+      + `<line x1=\"19.5\" y1=\"4.5\" x2=\"4.5\" y2=\"19.5\" stroke=\"${color}\" stroke-width=\"5.5\" stroke-linecap=\"round\"/>`
+      + '</svg>';
+  }
+  // -> [{ color, title }] for this Wayspot: report cross first, draft cross second
+  function waeCarouselMarksFor(portal, appearance, drafts) {
+    const marks = [];
+    const records = waeRecordsNear(portal.lat, portal.lng, WAE_CAROUSEL_MATCH_METERS);
+    if (records.length) {
+      const imported = records.every(waeIsImportedRecord);
+      const tickets = Array.from(new Set(records.map((r) => r.conversationId).filter(Boolean)));
+      marks.push({
+        color: imported ? (appearance.importColor || appearance.fillColor) : appearance.fillColor,
+        title: tickets.length ? `In your abuse reports (ticket ${tickets.join(', ')})` : 'In your abuse reports',
+      });
+    }
+    if (drafts.some((d) => Number.isFinite(d.lat) && Number.isFinite(d.lng)
+      && waeHaversineMeters(portal.lat, portal.lng, d.lat, d.lng) <= WAE_CAROUSEL_MATCH_METERS)) {
+      marks.push({ color: appearance.markColor, title: 'On your abuse report draft list' });
+    }
+    return marks;
+  }
+  function waeCarouselMarkersSync() {
+    const stale = (badge) => !badge.__waeImg || !badge.__waeImg.isConnected || badge.__waeImg.parentElement !== badge.parentElement;
+    const wanted = new Map(); // img -> { marks, key }
+    if (waeReviewPulsesEnabled() && waeReviewNearbyPortals.length) {
+      const byBase = new Map();
+      for (const portal of waeReviewNearbyPortals) {
+        const base = waeCarouselBaseUrl(portal.rawImageUrl);
+        if (!base) continue;
+        byBase.set(base, byBase.has(base) ? null : portal); // two Wayspots, one picture address: ambiguous, skipped
+      }
+      const appearance = waeLoadAppearance();
+      const drafts = waeLoadMarkedWayspots();
+      for (const img of document.querySelectorAll('img')) {
+        if (img.closest('.gm-style, .gm-style-iw, .wae-review-iw-abuse, .wae-nearby-iw, .wae-review-toggle-bar, .wae-dialog')) continue;
+        const portal = byBase.get(waeCarouselBaseUrl(img.currentSrc || img.src));
+        if (!portal) continue;
+        const marks = waeCarouselMarksFor(portal, appearance, drafts);
+        if (marks.length) wanted.set(img, { marks, key: marks.map((m) => `${m.color}|${m.title}`).join(';') });
+      }
+    }
+    // drop badges that are out of date (a different picture in the same slot, a changed list, ...)
+    for (const badge of document.querySelectorAll(`.${WAE_CAROUSEL_BADGE_CLASS}`)) {
+      const want = stale(badge) ? null : wanted.get(badge.__waeImg);
+      if (!want || want.key !== badge.dataset.waeKey) badge.remove();
+    }
+    for (const [img, want] of wanted) {
+      const parent = img.parentElement;
+      if (!parent) continue;
+      let badge = null;
+      for (const el of parent.children) { if (el.classList.contains(WAE_CAROUSEL_BADGE_CLASS) && el.__waeImg === img) badge = el; }
+      if (!badge) {
+        if (getComputedStyle(parent).position === 'static') parent.style.position = 'relative';
+        badge = document.createElement('div');
+        badge.className = WAE_CAROUSEL_BADGE_CLASS;
+        badge.dataset.waeKey = want.key;
+        badge.__waeImg = img;
+        badge.title = want.marks.map((m) => m.title).join('\n');
+        for (const m of want.marks) {
+          const cell = document.createElement('span');
+          cell.innerHTML = waeCarouselCrossSvg(m.color);
+          badge.append(cell);
+        }
+        parent.append(badge);
+        if (!img.__waeLoadHook) {
+          img.__waeLoadHook = true;
+          img.addEventListener('load', waeReviewIwSchedule);
+        }
+      }
+      // top-right corner of the picture itself
+      const width = want.marks.length * WAE_CAROUSEL_BADGE_SIZE + (want.marks.length - 1) * 2;
+      const left = `${Math.max(0, img.offsetLeft + img.offsetWidth - width - 4)}px`;
+      const top = `${img.offsetTop + 3}px`;
+      if (badge.style.left !== left) badge.style.left = left;
+      if (badge.style.top !== top) badge.style.top = top;
+    }
+  }
+
   function waeReviewIwSyncNow() {
     waeReviewIwQueued = false;
     if (!waeReviewIwObserver) return;
+    try { waeCarouselMarkersSync(); } catch (e) { console.warn('[Wayfarer Map Mods - Abuse Reports] Nearby picture markers failed:', e); }
     const enabled = waeReviewMapControlsEnabled();
-    // v2.0.9: the redesigned page has no .agm-info-window-content. Wayfarer's own
+    // The redesigned page has no .agm-info-window-content. Wayfarer's own
     // nearby windows are .wf-duplicate-iw-content, the suite's are
     // .wfmm-review-owned-info-window; the old class is kept for the old page.
     const IW_SEL = '.agm-info-window-content, .wf-duplicate-iw-content, .wfmm-review-owned-info-window';
+    // Clicking a Wayspot on the map yourself replaces the window
+    // opened from the nearby search list (short grace period so closing
+    // Wayfarer's window when the list opens ours can't close ours again).
+    if (waeNearbySearchIwOpen && Date.now() - waeNearbySearchIwOpenedAt > 400 && document.querySelector(IW_SEL)) {
+      waeCloseNearbySearchIw();
+      document.querySelectorAll('.wae-nearby-list-item.wae-active').forEach((el) => el.classList.remove('wae-active'));
+    }
     for (const content of document.querySelectorAll(IW_SEL)) {
       if (content.querySelector(IW_SEL)) continue; // nested matches: the innermost one (where the title/photo live) gets the controls
       const existing = content.querySelector(`:scope > .${WAE_REVIEW_IW_CLASS}`);
@@ -4443,7 +4813,7 @@
   function waeReviewIwStart() {
     if (waeReviewIwObserver) return;
     waeReviewIwObserver = new MutationObserver(waeReviewIwSchedule);
-    waeReviewIwObserver.observe(document.documentElement, { childList: true, subtree: true });
+    waeReviewIwObserver.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'srcset'] });
     waeReviewIwSchedule();
   }
 
@@ -4452,7 +4822,7 @@
     waeReviewIwObserver = null;
     waeReviewIwQueued = false;
     waeReviewNearbyPortals = [];
-    document.querySelectorAll(`.${WAE_REVIEW_IW_CLASS}`).forEach((el) => el.remove());
+    document.querySelectorAll(`.${WAE_REVIEW_IW_CLASS}, .wae-carousel-badges`).forEach((el) => el.remove());
   }
   // ---- end of the review map info window controls ----
 
@@ -4538,8 +4908,7 @@
     return Array.from(seen.entries()).map(([ticket, lastResponseAt]) => ({ ticket, lastResponseAt }));
   }
 
-  // v1.53.6: spelled back out from the terser "+ Add" (v1.52.0's own
-  // shortening, once the note field moved into this same row) -- kept as
+  // Label of the add button (the note field sits in the same row) -- kept as
   // one constant since the label's set in two places below (the button's
   // initial text, and the post-"\u2713 Added"/"\u2713 Updated" reset).
   const WAE_MARK_BTN_LABEL = '+ add to abuse report draft';
@@ -4594,7 +4963,7 @@
   // waeAddMarkedWayspot()). Returns the two elements unattached; each
   // caller decides where they go.
   //
-  // v1.62.3: draftKey (side panel only) keeps a half-typed note alive when
+  // DraftKey (side panel only) keeps a half-typed note alive when
   // Base rebuilds the details slot for the SAME Wayspot -- which it does
   // once the map finishes loading after a zoom, replacing this whole row
   // (and the input with it) mid-typing. The in-progress text, plus whether
@@ -4703,7 +5072,7 @@
     return { noteInput, markBtn };
   }
 
-  // v2.0.14: full-size address of the photo shown in the main map's details
+  // Full-size address of the photo shown in the main map's details
   // panel: the first <img> in the slot with a Google-hosted address, else a
   // CSS background-image of one of its elements. '' when there is none.
   function waeDetailSlotPhotoUrl(slot) {
@@ -4767,7 +5136,7 @@
         });
       }
 
-      // v1.81.2: Map Mods 4.9.0 turned .wfmapmods-detail-coords into a
+      // Map Mods 4.9.0 turned .wfmapmods-detail-coords into a
       // CONTAINER of .wfmapmods-detail-coords-row children (one per
       // coordinate: a struck-through "previous" row when the Wayspot was
       // recently moved, then the "current" one), and moved data-lat/
@@ -4833,7 +5202,7 @@
       // Note field + the add-to-draft button come from
       // waeBuildMarkControls() (shared with the review-page row, see
       // waeBuildReviewAbuseRow()) rather than being built inline here.
-      // v1.77.0: the button is the flag-plus icon here too, like the
+      // The button is the flag-plus icon here too, like the
       // review-page row. It also stays in the row beside the note field now:
       // this function used to insert it a second time, straight into the
       // panel, which pulled it out of the row onto a line of its own.
@@ -4843,7 +5212,7 @@
       statusRow.parentNode.insertBefore(markRow, statusRow);
       waeRestoreNoteFocus(noteInput, draftKey);
 
-      // v2.0.14: the review row's Sightengine check for the selected
+      // The review row's Sightengine check for the selected
       // Wayspot, with the photo the panel shows. Base can render the photo a
       // moment after the panel itself, so look for it a few times (the
       // slot is rebuilt on every selection, which ends the polling).
@@ -4906,7 +5275,7 @@
   // to build for it to show up there with a working toggle. This is now
   // the single source of truth for on/off, backed by WFMM's own settings
   // persistence rather than this plugin's own. This plugin's own "Show
-  // on Map" button was removed entirely in v1.33.0 once it became purely
+  // on Map" button was removed entirely once it became purely
   // redundant with that native checkbox -- the checkbox is the only way
   // to toggle this now, and this function is just reading whatever it's
   // currently set to.
@@ -4916,9 +5285,8 @@
 
   // The one place that actually reacts to the layer's on/off state
   // changing -- registered as the layer's own onChange in startPlugin().
-  // The only way to toggle this is the native Layers menu now (v1.33.0
-  // removed this plugin's own "Show on Map"/"Hide from Map" button,
-  // since it was entirely redundant with that menu once the layer was
+  // The only way to toggle this is the native Layers menu now (this plugin's own "Show on Map"/"Hide from Map" button was
+  // removed, since it was entirely redundant with that menu once the layer was
   // registered there -- see WAE_LAYER_ID's own comment) -- no button of
   // this plugin's own left to show a transient "Attaching to map..."
   // state on, or to disable/re-enable around the attach.
@@ -4934,7 +5302,7 @@
         // has real data to draw from.
         await waeEnsureRecordsLoaded().catch(() => {}); // best-effort -- still try to draw with whatever's cached (likely []) rather than leave the layer on with a silent failure
         waeSafeRefreshPulses();
-        // v1.53.4: Marked Wayspots' dots are gated on isMapPulsesEnabled()
+        // Marked Wayspots' dots are gated on isMapPulsesEnabled()
         // now (see waeRenderMarkedWayspotMarkers()'s own comment), but
         // re-ticking this checkbox reuses the SAME map instance as before
         // (WAE_PULSES.map already pointed at it) -- waeSetCurrentMap()'s
@@ -4952,7 +5320,7 @@
       }
     } else {
       waeClearPulses();
-      // v1.53.4: hide Marked Wayspots' dots the instant the box is
+      // Hide Marked Wayspots' dots the instant the box is
       // unticked, rather than leaving them up until the next list
       // mutation happens to call waeRenderMarkedWayspotMarkers() again --
       // isMapPulsesEnabled() already reflects the new (disabled) state by
@@ -5030,7 +5398,7 @@
     // a duplicate) even when the edit changed the coordinates.
     // CSV-imported rows are already carried above, so they're excluded.
     const editedRecords = previousRecords.filter((r) => r.edited && r.source !== 'csv' && r.source !== 'reported');
-    // v1.84.0: Wayspots reported from the draft (see waeAddReportedRecords()) -- no email behind them yet, so carried along like the CSV rows
+    // Wayspots reported from the draft (see waeAddReportedRecords()) -- no email behind them yet, so carried along like the CSV rows
     const reportedRecords = previousRecords.filter((r) => r.source === 'reported');
 
     const { extracted: scannedAll, ticketDetails } = await scanImportedEmails(onProgress);
@@ -5058,7 +5426,7 @@
         if (starredKeys.has(waeStarredKey(r))) r.starred = true;
       }
     }
-    // v1.84.0: a reported placeholder whose ticket this scan found is
+    // A reported placeholder whose ticket this scan found is
     // replaced by that ticket's own row (its star carries over); the rest wait
     // for a later scan.
     const reportedKept = [];
@@ -5088,7 +5456,7 @@
       // refreshPanel() would otherwise have done exactly this -- see its
       // own comment on why that's nested under an early `if (!waeUI)
       // return` -- so it's repeated here for the panel-closed case.
-      // v1.84.0: with fresh rows too -- the cached ones are from before this scan.
+      // With fresh rows too -- the cached ones are from before this scan.
       try {
         waeAllRecords = await getAllExtractedRecords();
         waeRecordsById = new Map(waeAllRecords.map((r) => [r.id, r]));
@@ -5097,7 +5465,7 @@
       if (WAE_PULSES.map && isMapPulsesEnabled()) waeSafeRefreshPulses();
       if (WAE_REVIEW_PULSES.map) waeSafeRefreshReviewPulses();
     }
-    waeMarkListRenderHook?.(); // v1.85.0: an open draft list re-checks its "already reported" flags
+    waeMarkListRenderHook?.(); // An open draft list re-checks its "already reported" flags
     return { extractedCount: extracted.length + editedRecords.length, ticketCount, missingCoords };
   }
 
@@ -5189,8 +5557,7 @@
 
       // issueType/locationDetails/reportDetails are per-TICKET, not
       // per-location -- written once here rather than duplicated onto
-      // every location row below (see the v1.21.0 changelog note on
-      // EXTRACT_DB_VERSION for why: a 12-location ticket used to store
+      // every location row below (a 12-location ticket would otherwise store
       // the same ~2.4KB of raw text 12 times).
       ticketDetails.push({
         id: idBase,
@@ -5258,8 +5625,7 @@
   }
 
   // BUGFIX (not upstream): issueType/locationDetails/reportDetails are
-  // genuinely per-TICKET data (see the v1.21.0 changelog note on
-  // EXTRACT_DB_VERSION) -- they're stored just once per ticket, in the
+  // genuinely per-TICKET data (see EXTRACT_DB_VERSION) -- they're stored just once per ticket, in the
   // separate ticketDetails object store, precisely so a 12-location
   // ticket doesn't pay for 12 copies of the same raw text at rest.
   // getAllExtractedRecords() then transparently HYDRATES that one stored
@@ -5273,7 +5639,7 @@
   // repeated once per Wayspot the ticket reported -- reported as "many
   // duplicated texts" in the export (and, from the outside, easy to
   // mistake for the storage itself being duplicated, even though that
-  // part was already fixed in v1.21.0). This keeps the raw ticket-level
+  // part is already fixed). This keeps the raw ticket-level
   // text on only the FIRST row for a given ticketKey and blanks it on
   // every later row of that same ticket, purely for the exported file --
   // waeAllRecords / the on-screen table / getAllExtractedRecords() are
@@ -5557,7 +5923,7 @@
     .wae-pulse-marker{ position:absolute; transform:translate(-50%, -50%); pointer-events:none; line-height:0; }
     .wae-pulse-marker.wae-pulse-clickable{ pointer-events:auto; cursor:pointer; }
     .wae-pulse-marker svg{ display:block; }
-    /* v1.67.0: the review maps' crosses live in Google's markerLayer (see
+    /* The review maps' crosses live in Google's markerLayer (see
        WaeReviewPulseOverlayCtor.onAdd()) and must out-stack the Wayspot
        markers there; an abuse draft cross sits just above a report cross
        at the same spot. Both are click-through, so this blocks nothing. */
@@ -5603,7 +5969,7 @@
       border:1px solid #c7d2fe; border-radius:5px; box-sizing:border-box;
       /* Explicit, not inherited: Wayfarer's dark theme hands inputs a
          light-grey text color while the field's own background stays
-         white, which made typed notes nearly unreadable (v1.64.1).
+         white, which made typed notes nearly unreadable.
          !important because the host page's own input rules can be
          more specific than a single class selector. */
       color:#111827 !important; background:#fff !important;
@@ -5619,16 +5985,34 @@
     /* Review-page row (copy icon + note + add button) -- see
        waeBuildReviewAbuseRow(). Reuses the side panel's note/button
        styles above; only the row layout and the copy icon are new. */
-    /* v1.79.1: one row, never wrapped: the note field takes all the width
+    /* One row, never wrapped: the note field takes all the width
        the icon buttons to its right leave over (it shrinks, they don't). */
     .wae-review-abuse-row{ display:flex; align-items:center; gap:6px; flex-wrap:nowrap; width:100%; box-sizing:border-box; margin:4px 0; }
     .wae-review-abuse-row .wae-detail-mark-note{ flex:1 1 0; min-width:0; }
-    /* v2.0.7: one line -- label | note + action icons | list + On/Off.
+    /* One line -- label | note + action icons | list + On/Off.
        Only wraps (row drops to its own line) when the bar gets too narrow. */
     .wae-review-toggle-bar{ flex-wrap:wrap; row-gap:6px; column-gap:10px; }
     .wae-review-toggle-bar .wae-review-toggle-label{ order:1; flex:0 0 auto; }
     .wae-review-toggle-bar > .wae-review-abuse-row{ order:2; flex:1 1 300px; min-width:0; width:auto; margin:0; }
     .wae-review-toggle-bar .wae-review-toggle-actions{ order:3; }
+    /* Nearby Wayspot title search on its own line below the note
+       bar, with the matching titles listed under it */
+    .wae-review-nearby-search{ display:flex; flex-direction:column; gap:4px; box-sizing:border-box; margin:4px 0; }
+    .wae-review-nearby-search .wae-detail-mark-note{ width:100%; }
+    .wae-review-toggle-bar > .wae-review-nearby-search{ order:4; flex:1 1 100%; min-width:0; margin:0; }
+    .wae-nearby-list{ display:flex; flex-direction:column; max-height:160px; overflow-y:auto; box-sizing:border-box;
+      border:1px solid rgba(128,128,128,0.5); border-radius:6px; padding:2px; }
+    .wae-nearby-list[hidden]{ display:none; }
+    .wae-nearby-list-item{
+      display:block; width:100%; text-align:left; padding:4px 8px; margin:0; border:0; border-radius:4px;
+      background:transparent; color:inherit; font:12px Roboto, Arial, sans-serif; cursor:pointer;
+      white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+    }
+    .wae-nearby-list-item:hover, .wae-nearby-list-item:focus{ background:rgba(128,128,128,0.22); outline:none; }
+    .wae-carousel-badges{ position:absolute; z-index:3; display:flex; gap:2px; line-height:0; }
+    .wae-carousel-badges > span{ display:block; line-height:0; filter:drop-shadow(0 1px 3px rgba(0,0,0,.75)); }
+    .wae-nearby-list-item.wae-active{ background:rgba(99,102,241,0.28); }
+    .wae-nearby-list-empty{ padding:4px 8px; font:12px Roboto, Arial, sans-serif; opacity:.7; }
     /* one look for every icon in the bar: 28px squares, outlined, text colour */
     .wae-review-toggle-bar .wae-review-copy-btn,
     .wae-review-toggle-bar .wae-review-form-link,
@@ -5657,7 +6041,7 @@
       border:1px solid #c7d2fe; border-radius:5px; cursor:pointer;
     }
     .wae-review-copy-btn:hover{ background:#e0e7ff; }
-    /* v1.76.0/1.77.0: the review row's buttons and the side panel's add
+    /* The review row's buttons and the side panel's add
        button are all icons now and share one look. */
     .wae-review-form-link,
     .wae-review-fill-btn,
@@ -5675,7 +6059,7 @@
        waeReviewIwSyncNow()). Stacked and sized to line up with the
        180px photo the suite's own windows show; reuses the side
        panel's field/button styles above. */
-    /* v2.0.10: note + icon button on ONE line */
+    /* Note + icon button on ONE line */
     .wae-review-iw-abuse{ display:flex; flex-direction:row; align-items:center; gap:6px; box-sizing:border-box; width:100%; min-width:180px; max-width:220px; margin:6px auto 0; }
     .wae-review-iw-abuse .wae-detail-mark-note{ flex:1 1 0; min-width:0; width:auto; height:28px; padding:0 8px; font-size:12px; }
     .wae-review-iw-abuse .wae-detail-mark-btn,
@@ -5683,7 +6067,7 @@
     /* Google fixes the popup's height when it opens; let it grow for the controls added afterwards */
     .gm-style-iw-c:has(.wae-review-iw-abuse){ max-height:none !important; }
     .gm-style-iw-d:has(.wae-review-iw-abuse){ max-height:none !important; overflow:visible !important; }
-    /* v2.1.5: tidy Google's info window bubble around our content. Google reserves a ~30px header row for the
+    /* Tidy Google's info window bubble around our content. Google reserves a ~30px header row for the
        close button (the empty strip above the text) and the page's dark theme can leave the close icon
        invisible on the white bubble. The header collapses, the button floats in the top-right corner and is
        drawn dark. Only bubbles that contain our content (.wae-iw) are touched. */
@@ -5730,14 +6114,14 @@
       padding:2px 4px; border:1px solid #9ca3af; border-radius:4px; background:#fff; color:#111827;
     }
     .wae-edit-input + .wae-edit-input{ margin-top:3px; }
-    /* v1.87.1: the Wayspot Name cell of an unlocked row holds the name input
+    /* The Wayspot Name cell of an unlocked row holds the name input
        and the note input. It used to be a .wae-edit-cell, whose nowrap put
        the two inputs side by side, so the note ended up cut off past the
        column's right edge. A column keeps them stacked at any column width. */
     .wae-edit-stack{ display:flex; flex-direction:column; gap:3px; min-width:0; }
     .wae-edit-stack .wae-edit-input + .wae-edit-input{ margin-top:0; }
     .wae-edit-input.wae-invalid{ border-color:#dc2626; background:#fef2f2; }
-    /* BUGFIX v1.25.0: WFMM.ui.table()'s own base CSS (.wfmm-table) has no
+    /* WFMM.ui.table()'s own base CSS (.wfmm-table) has no
        table-layout:fixed and no per-cell max-width/overflow -- columns
        size purely to content, so one long unbroken string (e.g. a URL)
        could blow a column out wide enough to push Status/the nearby-flag
@@ -5747,9 +6131,8 @@
        switched to WFMM.ui.table() -- fixed widths per column below (by
        position, since table() has no per-column width option) restore
        it.
-       BUGFIX v1.29.2: percentages below were tuned for 7 columns and
-       never revisited when the "Last Response" column was added
-       (v1.28.0), landing it and Status (both real content -- a status
+       Percentages below were tuned for 7 columns and
+       never revisited when the "Last Response" column was added, landing it and Status (both real content -- a status
        pill, and a date + sort-arrow header -- not filler) too narrow for
        what they actually render. Only columns 1-2 had overflow:hidden at
        the time (the two free-text columns, the original overflow risk),
@@ -5828,8 +6211,8 @@
        and waePlaceReviewToggle()'s own comments for the full history.
        Lives in the page's own normal flow, directly under host inside
        waePlaceReviewToggle()'s own wrapper div (no position:fixed, no
-       JS-computed top/left) -- v1.47.0's fixed-on-document.body version
-       fixed a real placement bug but left the bar visibly floating a
+       JS-computed top/left) -- a fixed-on-document.body version
+       fixes a placement bug but left the bar visibly floating a
        frame behind the page during scroll/resize; the wrapper's flex
        column keeps it pinned directly under the map without that.
        Kept its own opaque background/border/shadow even though it's
@@ -5871,13 +6254,13 @@
     }
     .wae-review-toggle-icon-btn:hover{ background:#f3f4f6; }
     .wae-review-toggle-icon-btn svg{ display:block; pointer-events:none; }
-    /* v2.0.11: light is the default; dark only when the PAGE is dark (.wae-review-dark), not when the OS is */
+    /* Light is the default; dark only when the PAGE is dark (.wae-review-dark), not when the OS is */
     .wae-review-toggle-bar.wae-review-dark{ background:#1f2937; color:#f9fafb; border-color:#4b5563; box-shadow:0 2px 6px rgba(0,0,0,0.5); }
     .wae-review-toggle-bar.wae-review-dark .wae-review-toggle-btn{ color:#f9fafb; }
     .wae-review-toggle-bar.wae-review-dark .wae-review-toggle-icon-btn{ color:#f9fafb; border-color:#4b5563; }
     .wae-review-toggle-bar.wae-review-dark .wae-review-toggle-icon-btn:hover{ background:#374151; }
     .wae-review-toggle-bar.wae-review-dark .wae-review-toggle-btn.wae-review-toggle-on{ background:#22c55e; color:#052e16; border-color:#16a34a; }
-    /* v2.1.3: the note field and the icon buttons follow the dark bar too (the field used to stay bright white) */
+    /* The note field and the icon buttons follow the dark bar too (the field used to stay bright white) */
     .wae-review-toggle-bar.wae-review-dark .wae-detail-mark-note{ background:#111827 !important; color:#f9fafb !important; border-color:#4b5563; }
     .wae-review-toggle-bar.wae-review-dark .wae-detail-mark-note::placeholder{ color:#9ca3af !important; opacity:1; }
     .wae-review-toggle-bar.wae-review-dark .wae-detail-mark-note:focus{ outline:none; border-color:#818cf8; box-shadow:0 0 0 2px rgba(129,140,248,0.35); }
@@ -5908,7 +6291,7 @@
   // those three canned replies (a custom reply, the reporter's own
   // follow-up being the newest message, etc.).
   const WAE_STATUS_BADGES = {
-    // v1.84.0: reported from the draft, ticket not scanned yet (see waeAddReportedRecords())
+    // Reported from the draft, ticket not scanned yet (see waeAddReportedRecords())
     REPORTED_PENDING: { label: 'Reported', color: '#0891b2' },
     ABUSE_REPORT_RECEIVED: { label: 'Received', color: '#2563eb' },
     ABUSE_REPORT_PENDING: { label: 'Pending Review', color: '#b45309' },
@@ -5948,10 +6331,9 @@
     });
   }
 
-  // v2.1.8: date display format, a Settings choice (Marker Style modal >
+  // Date display format, a Settings choice (Marker Style modal >
   // Display). Each value is a BCP-47 locale handed to toLocaleDateString()
-  // / toLocaleString(); '' means the browser's own default (what the
-  // script did before v2.1.7).
+  // / toLocaleString(); '' means the browser's own default.
   const WAE_DATE_FORMATS = [
     { value: 'nl-NL', label: 'DD-MM-YYYY (e.g. 17-11-2026)' },
     { value: 'en-GB', label: 'DD/MM/YYYY (e.g. 17/11/2026)' },
@@ -6355,8 +6737,8 @@
   }
 
   // Builds the table (or an empty-state) for the current page, using
-  // WFMM.ui.table()/pager()/emptyState() instead of an innerHTML string --
-  // see the v1.22.0 changelog note. table()'s own onRowClick fires for
+  // WFMM.ui.table()/pager()/emptyState() instead of an innerHTML string.
+  // table()'s own onRowClick fires for
   // ANY click on a row, so the nearby-flag trigger has to be special-cased
   // inside it (checked via event.target.closest()) rather than getting
   // its own listener the way the old delegated click handler on
@@ -6588,7 +6970,7 @@
       },
     });
 
-    wrap.classList.add('wae-table-scroll'); // v1.68.0: what waeFitTableToPanel() resizes
+    wrap.classList.add('wae-table-scroll'); // What waeFitTableToPanel() resizes
 
     // table() has no per-row className/title option -- applied directly
     // to the rendered <tr> elements afterward instead, matched back up to
@@ -6730,7 +7112,7 @@
   }
 
   // ---------------------------------------------------------------------
-  // v1.68.0: the table follows the panel's size. Its height used to be a
+  // The table follows the panel's size. Its height used to be a
   // fixed 260px (the max-height passed to ui.table() in
   // buildTableSection()), so resizing the panel taller just left empty
   // space under it, and smaller made the whole panel body scroll instead.
@@ -6811,7 +7193,7 @@
     waePanelFit = null;
   }
 
-  // v1.87.0: the scrollable ancestor of `el` (the panel body when it is
+  // The scrollable ancestor of `el` (the panel body when it is
   // taller than the dialog), or null.
   function waeScrollParent(el) {
     for (let n = el.parentElement; n; n = n.parentElement) {
@@ -6832,7 +7214,7 @@
     const q = waeSearchQuery.trim().toLowerCase();
     const sorted = waeGetFilteredSorted();
 
-    // v1.87.0: remember where the table (and the panel body around it) is
+    // Remember where the table (and the panel body around it) is
     // scrolled to -- drawing a fresh table resets both
     const oldScroller = waeUI.tableContainer.querySelector('.wae-table-scroll');
     const bodyScroller = waeScrollParent(waeUI.tableContainer);
@@ -6844,7 +7226,7 @@
 
     waeUiApi.empty(waeUI.tableContainer);
     waeUI.tableContainer.appendChild(buildTableSection(sorted, !!q, waeNearbyMap));
-    waeFitTableToPanel(); // v1.68.0: the fresh table starts at the stock height
+    waeFitTableToPanel(); // The fresh table starts at the stock height
 
     const view = `${waeCurrentPage}|${waeSortKey}|${waeSortDirection}|${q}`;
     if (view === waeLastRenderView) {
@@ -6869,7 +7251,7 @@
   // Cheap "did the underlying record set change" check -- count alone
   // would miss a rescan that happens to produce the same number of rows,
   // but the scan handler always clears and rewrites the whole store with
-  // a fresh Date.now() scannedAt on every row (see its own v1.4.0 note),
+  // a fresh Date.now() scannedAt on every row,
   // so the latest scannedAt changes on every real scan even when the
   // count doesn't.
   function waeRecordsFingerprint(records) {
@@ -7015,7 +7397,7 @@
   let waeMarkListRenderHook = null;
 
   // ---------------------------------------------------------------------
-  // v1.84.0: Wayspots reported from the draft. They become rows of the
+  // Wayspots reported from the draft. They become rows of the
   // abuse reports table itself (source 'reported', status "Reported", no
   // ticket number yet) -- and ONLY the "Clear them" answer to the
   // after-submit question (see waeRenderMarkedWayspotListSection()) puts
@@ -7028,7 +7410,7 @@
   // ---------------------------------------------------------------------
   // The ticket dates are parsed without a time zone, hence a day of slack.
   const WAE_REPORTED_LINK_SLACK_MS = 24 * 60 * 60 * 1000;
-  // v1.83.0 kept these in a separate history list in the settings; moved
+  // These used to be a separate history list in the settings; moved
   // into the table by waeMigrateReportedHistory().
   const WAE_REPORTED_SETTINGS_KEY = 'reportedWayspots';
 
@@ -7096,7 +7478,7 @@
     waeMarkListRenderHook?.();
   }
 
-  // One-off: the separate "Reported History" list v1.83.0 kept in the
+  // One-off: the separate "Reported History" list that used to be kept in the
   // settings becomes table rows. Entries that already found their ticket
   // are dropped -- that ticket's own row is in the table.
   async function waeMigrateReportedHistory() {
@@ -7220,8 +7602,7 @@
   // overlayMouseTarget: there's no "stay visually under real Wayspot
   // markers" requirement for these the way there is for abuse-report
   // crosses (see THAT class's own comment for why it's split there), so
-  // nothing here needs to trade away reliable clicks (see v1.50.2's own
-  // changelog entry) to get it.
+  // nothing here needs to trade away reliable clicks to get it.
   // ---------------------------------------------------------------------
 
   // Feature request: an "X" cross, same glyph as waeGetMarkerSvgMarkup()'s
@@ -7249,7 +7630,7 @@
   // one more place waeSaveAppearance() has to remember to reach into.
   let WAE_MARK_ICON = { color: null, markerSize: null, svg: null };
   function waeGetMarkedWayspotSvgMarkup(color, forReview) {
-    const markerSize = waeLoadAppearance().markerSize + (forReview ? WAE_REVIEW_MARKER_SIZE_BONUS : 0); // v1.67.0
+    const markerSize = waeLoadAppearance().markerSize + (forReview ? WAE_REVIEW_MARKER_SIZE_BONUS : 0);
     if (WAE_MARK_ICON.color === color && WAE_MARK_ICON.markerSize === markerSize) {
       return WAE_MARK_ICON.svg;
     }
@@ -7289,7 +7670,7 @@
   // waeGoToLocation()'s waeShowPulseInfoWindow().
   async function waeGoToMarkedWayspot(item) {
     if (!Number.isFinite(item.lat) || !Number.isFinite(item.lng)) return;
-    // v1.69.0: the list can now be opened from the review page too (the
+    // The list can now be opened from the review page too (the
     // button on the toggle bar under the review map). There the map is the
     // review map, which waeAttachToMapIfNeeded() below can't find (it
     // looks for the map view's / submit map), so a row click did nothing.
@@ -7338,8 +7719,7 @@
         // overlayMouseTarget, not overlayLayer -- see this section's own
         // top comment: unlike WaePulseOverlayCtor's crosses, there's no
         // "must not visually cover a real marker" requirement to trade
-        // against reliable clicks here (see v1.50.2's own changelog
-        // entry for why overlayLayer alone can't ever deliver those).
+        // against reliable clicks here (overlayLayer alone can't ever deliver those).
         this.getPanes().overlayMouseTarget.appendChild(div);
         this.applyToDiv();
         this.draw();
@@ -7393,12 +7773,11 @@
   // realistically never large enough that redrawing the whole thing on
   // every one of those triggers is worth debouncing against a map pan.
   function waeRenderMarkedWayspotMarkers() {
-    waeRenderReviewDraftMarkers(); // v1.65.1: the review map shows the same list -- every caller of this refreshes both
+    waeRenderReviewDraftMarkers(); // The review map shows the same list -- every caller of this refreshes both
     const map = WAE_PULSES.map;
     // Gated on isMapPulsesEnabled() (the "Abuse Report Crosses" Layers-menu
-    // checkbox) same as the abuse-report crosses/clusters themselves --
-    // added in v1.53.4, see that changelog entry for why this was missing
-    // up to v1.53.3. Centralizing the check here, rather than at each of
+    // checkbox) same as the abuse-report crosses/clusters themselves.
+    // Centralizing the check here, rather than at each of
     // this function's call sites, is what makes every one of them --
     // add/edit/delete/clear-list, marker-style changes, a fresh map
     // attach -- respect the toggle without having to touch them individually.
@@ -7457,7 +7836,7 @@
   }
 
   // ---------------------------------------------------------------------
-  // Abuse form auto-fill, Wayfarer side (v1.70.0) -- see the comment block
+  // Abuse form auto-fill, Wayfarer side -- see the comment block
   // at the very top of this file for the whole picture. Opens the Help
   // Center article with a one-time session id in the URL hash and answers
   // that tab's request for data (waeHandleAbuseFormMessage(), installed in
@@ -7467,7 +7846,7 @@
   // copying" choice, as Copy All -- that is what the form's location
   // parser (opr-email-lib.js) reads back out of the ticket email later.
   // ---------------------------------------------------------------------
-  // v1.92.0: Sightengine checks opened from the review row that are waiting for
+  // Sightengine checks opened from the review row that are waiting for
   // their verdict: sessionId -> { popup, createdAt, onResult(score|null) }
   const waeSeChecks = new Map();
 
@@ -7483,7 +7862,7 @@
   }
 
   const waeAbuseFormSessions = new Map(); // sessionId -> { popup, getSource, kind, itemIds, createdAt, expiresAt, submitted }
-  // v1.81.0: the "clear the draft list?" question after a submitted form.
+  // The "clear the draft list?" question after a submitted form.
   // waeShowClearPromptHook is set by the open list modal (shows the question
   // in it); when the modal isn't open the ids wait in waePendingClear and
   // the modal, opened for the purpose, picks them up when it builds.
@@ -7509,14 +7888,14 @@
       issueType: String(s.get(PLUGIN_ID, 'reporterIssueType', WAE_DEFAULT_ISSUE_TYPE) || '').trim(),
       reportDetails: String(s.get(PLUGIN_ID, 'reporterReportDetails', '') || '').trim(),
       abuser: String(s.get(PLUGIN_ID, 'reporterAbuser', '') || '').trim(),
-      // v1.88.0: the list goes into the report details too, with the notes
+      // The list goes into the report details too, with the notes
       listInDetails: s.get(PLUGIN_ID, 'reporterListInDetails', false) === true,
-      // v1.92.0: a Sightengine verdict over 90% AI-generated starts the auto-fill
+      // A Sightengine verdict over 90% AI-generated starts the auto-fill
       sightengineAutoStart: s.get(PLUGIN_ID, 'sightengineAutoStart', true) !== false,
     };
   }
 
-  // v1.82.0: the Marked Wayspots entries an action should work on -- just the
+  // The Marked Wayspots entries an action should work on -- just the
   // ones with these ids (the ticked rows of the list modal), or the whole
   // list when no ids are given. Always read fresh from storage, so a note
   // edited after the ids were picked is still what gets sent.
@@ -7536,12 +7915,12 @@
     const includeNotes = source.includeNotes;
     const contact = waeGetReporterContact();
     const linesOf = (withNotes) => list.map((item) => waeFormatMarkedWayspotLine(item, withNotes)).join('\n');
-    // v1.88.0: with the "list in the report details" option the location
+    // With the "list in the report details" option the location
     // field gets the list WITHOUT notes (whatever "Include notes when
     // copying" says) and the report details get it WITH notes. The default
-    // report details text from the settings is NOT used then (v1.88.1).
+    // report details text from the settings is NOT used then.
     const listInDetails = contact.listInDetails;
-    // v1.93.0: a workflow can pin parts of the form (the Sightengine one
+    // A workflow can pin parts of the form (the Sightengine one
     // does) with `source.overrides`: issueType, reportDetails (instead of the
     // settings' default text and of the list-in-details option) and
     // locationNotes: false (the location field then only has name + coordinates).
@@ -7562,12 +7941,12 @@
 
   // 'opened' | 'empty' | 'blocked'. Must run straight from a click, or the
   // browser's popup blocker will refuse the window.open() call -- unless
-  // `existingPopup` is given (v1.92.0): then that tab, one this tab opened
+  // `existingPopup` is given: then that tab, one this tab opened
   // earlier (the Sightengine check), is sent to the form instead of a new
   // one being opened, which needs no click.
   // `onlyIds` (optional, list mode only) limits the form to those Marked
   // Wayspots (the ticked rows); without it the whole list is sent.
-  // `onSubmitted` (optional, v1.94.0) runs once when the form tab reports the
+  // `onSubmitted` (optional) runs once when the form tab reports the
   // form as submitted (only happens with the \"After the form is submitted\"
   // setting on).
   function waeOpenAbuseFormAutofill(getSource, onlyIds, existingPopup, onSubmitted) {
@@ -7680,11 +8059,11 @@
   // Favorite Users rows' own. The selection lives in that section's
   // closure, not on the stored entry: it is a this-modal-session thing,
   // not something to persist.
-  // v1.86.0: the total line under the abuse reports table, the draft list
+  // The total line under the abuse reports table, the draft list
   // and the Favorite Users list. `shown` is what is on the list right now,
   // `total` everything behind it (they only differ while the table's search
   // box is filtering). `noun` is [singular, plural]: "reported Wayspot",
-  // "draft report Wayspot" or "favorite user" (v1.86.1).
+  // "draft report Wayspot" or "favorite user".
   function waeRowTotalText(shown, total, noun) {
     if (shown === total) return `${total} ${noun[total === 1 ? 0 : 1]}`;
     return `${shown} of ${total} ${noun[1]}`;
@@ -7693,7 +8072,7 @@
   const WAE_TOTAL_NOUN_DRAFT = ['draft report Wayspot', 'draft report Wayspots'];
   const WAE_TOTAL_NOUN_FAVORITE = ['favorite user', 'favorite users'];
 
-  // v1.85.0: abuse report rows (tickets, and Wayspots reported from the draft
+  // Abuse report rows (tickets, and Wayspots reported from the draft
   // that are still waiting for their ticket) at EXACTLY these coordinates --
   // same lat/lng to 6 decimals, the precision the draft list itself dedupes
   // on, NOT the 20 m "nearby" check used elsewhere. Returns a Map of
@@ -7819,17 +8198,17 @@
 
   function waeRenderMarkedWayspotListSection(ui, body) {
     const listContainer = ui.createElement('div', { className: 'wae-mark-list' });
-    const countEl = ui.createElement('div', { className: 'wae-sub wae-row-total' }); // v1.86.0
+    const countEl = ui.createElement('div', { className: 'wae-sub wae-row-total' });
     const emptyEl = ui.createElement('div', {
       className: 'wae-sub',
       text: 'Your abuse report draft is empty -- use the + button on the main panel, then click a Wayspot on the map.',
     });
-    // v1.80.0: says what this list IS: the draft of the next abuse report.
+    // Says what this list IS: the draft of the next abuse report.
     const draftHint = ui.createElement('div', {
       className: 'wae-sub wae-draft-hint',
       text: 'This is your abuse report draft: the Wayspots you marked to report. It is only saved in this browser and nothing is sent from here. Copy it, or auto-fill the abuse form with it, then check the form and submit it yourself. Tick rows to limit auto-fill and the trash button to just those; with nothing ticked they work on the whole list.',
     });
-    // v1.81.0: after a submitted abuse form (setting "After submitting"):
+    // After a submitted abuse form (setting "After submitting"):
     // asks whether to clear the Wayspots that were just sent. Hidden until
     // waeShowClearPromptHook() fires. Only the Wayspots that were in the form
     // are cleared -- anything marked since stays.
@@ -7851,7 +8230,7 @@
     clearPromptYes.addEventListener('click', () => {
       const gone = new Set(promptIds);
       const draft = waeLoadMarkedWayspots();
-      // v1.84.0: the only place that puts Wayspots into the abuse reports list as "Reported"
+      // The only place that puts Wayspots into the abuse reports list as "Reported"
       const moved = draft.filter((item) => gone.has(item.id));
       waeSaveMarkedWayspots(draft.filter((item) => !gone.has(item.id)));
       waeAddReportedRecords(moved).catch((e) => console.warn('[Wayfarer Map Mods - Abuse Reports] Could not add the reported Wayspots to the list:', e));
@@ -7870,11 +8249,11 @@
     const copyTitle = 'Copy all Wayspots (name, coordinates and notes) to the clipboard';
     const fillTitle = 'Auto-fill the abuse form from this list (opens a new tab)';
     const copyAllBtn = waeIconButton(ui, { icon: WAE_COPY_ICON_SVG, title: copyTitle, disabled: true });
-    // v1.70.0: opens the Help Center abuse form and fills its location
+    // Opens the Help Center abuse form and fills its location
     // field with the same text Copy All would copy -- see
     // waeOpenAbuseFormAutofill().
     const fillFormBtn = waeIconButton(ui, { icon: WAE_WAND_ICON_SVG, title: fillTitle, disabled: true });
-    // v1.78.0: the quick link to Niantic's \"Reporting Abuse in Wayfarer\"
+    // The quick link to Niantic's \"Reporting Abuse in Wayfarer\"
     // article (where the entries get copied TO) is an icon button in the
     // row too now, instead of a line of text above it.
     const formLinkEl = ui.createElement('a', {
@@ -7889,14 +8268,14 @@
       },
     });
     const clearAllBtn = waeIconButton(ui, { icon: WAE_TRASH_ICON_SVG, title: 'Clear the whole draft list', variant: 'danger', disabled: true });
-    // v1.79.0: tick boxes on the rows + a Copy selected button, like the
+    // Tick boxes on the rows + a Copy selected button, like the
     // Favorite Users list's -- copies only the ticked Wayspots, in list
     // order, in the same format as Copy All (so the "Include notes when
     // copying" checkbox applies to both). The count shows beside the icon
     // and in the tooltip.
     const copySelectedTitle = 'Copy the ticked Wayspots (name, coordinates and notes) to the clipboard';
     const copySelectedBtn = waeIconButton(ui, { icon: WAE_CLIPBOARD_CHECK_ICON_SVG, title: copySelectedTitle, disabled: true });
-    // v1.82.0: unticks every row at once.
+    // Unticks every row at once.
     const deselectTitle = 'Deselect all ticked Wayspots';
     const deselectAllBtn = waeIconButton(ui, { icon: WAE_DESELECT_ICON_SVG, title: deselectTitle, disabled: true });
     const clearAllTitle = 'Clear the whole draft list';
@@ -7905,7 +8284,7 @@
     const selectedTitle = () => (selectedIds.size
       ? `Copy the ${selectedIds.size} ticked Wayspot${selectedIds.size === 1 ? '' : 's'} (name, coordinates and notes) to the clipboard`
       : copySelectedTitle);
-    // v1.82.0: auto-fill and the trash button act on the ticked rows when
+    // Auto-fill and the trash button act on the ticked rows when
     // there are any, otherwise on the whole list -- their tooltips say which.
     const fillTitleNow = () => (selectedIds.size
       ? `Auto-fill the abuse form with the ${selectedIds.size} ticked Wayspot${selectedIds.size === 1 ? '' : 's'} (opens a new tab)`
@@ -8000,7 +8379,7 @@
     clearAllBtn.addEventListener('click', () => {
       const list = waeLoadMarkedWayspots();
       if (!list.length) return;
-      // v1.82.0: with rows ticked this removes just those, otherwise everything
+      // With rows ticked this removes just those, otherwise everything
       const ticked = list.filter((item) => selectedIds.has(item.id));
       if (ticked.length) {
         const n = ticked.length;
@@ -8018,7 +8397,7 @@
 
     body.append(clearPrompt, draftHint, buttonRow, copyNotesToggle.row, listContainer, countEl);
     render();
-    // v1.85.0: the "already reported" flags need the extracted rows; load them if nothing has yet this session
+    // The "already reported" flags need the extracted rows; load them if nothing has yet this session
     if (!waeRecordsLoadPromise) waeEnsureRecordsLoaded().then(() => { if (waeMarkListRenderHook === render) render(); }).catch(() => {});
     waeMarkListRenderHook = render;
     waeShowClearPromptHook = showClearPrompt;
@@ -8131,7 +8510,7 @@
 
   function waeRenderFavoriteUsersSection(ui, body) {
     const listContainer = ui.createElement('div', { className: 'wae-favorite-user-list' });
-    const countEl = ui.createElement('div', { className: 'wae-sub wae-row-total' }); // v1.86.0
+    const countEl = ui.createElement('div', { className: 'wae-sub wae-row-total' });
     const emptyEl = ui.createElement('div', {
       className: 'wae-sub',
       text: 'No favorite users yet -- click a username in the Wayfarer side panel to add one.',
@@ -8388,9 +8767,8 @@
       checked: initialAppearance.clickable,
       onChange: (checked) => updateAppearance({ clickable: checked }),
     });
-    // v1.64.0, moved here in v1.67.1 from the Marked Wayspots list (it is a
-    // general setting, not part of the draft list): the review map's
-    // info-window controls. Not part of the marker appearance, so "Reset
+    // The review map's info-window controls (a general setting, not part of
+    // the draft list). Not part of the marker appearance, so "Reset
     // to default" below deliberately leaves it alone. Applied straight
     // away (adds the controls to / removes them from any window that is
     // already open).
@@ -8448,7 +8826,7 @@
         ui.buttonRow([resetStyleBtn]),
       ],
     });
-    // v1.71.0/1.72.0: what the abuse form auto-fill (the button in the
+    // What the abuse form auto-fill (the button in the
     // Marked Wayspots list) enters besides the location list.
     const contact = waeGetReporterContact();
     const reporterNameInput = ui.textInput({
@@ -8465,8 +8843,8 @@
       onInput: (v) => wfmmWindow.WFMM.settings.set(PLUGIN_ID, 'reporterEmail', v.trim()),
     });
     // A menu of the form's own options, so the exact title is always right.
-    // A title saved earlier that isn't one of them (typed by hand in
-    // v1.72) stays selectable instead of silently changing.
+    // A title saved earlier that isn't one of them (typed by hand
+    // earlier) stays selectable instead of silently changing.
     const issueChoices = [{ value: '', label: 'Don\u2019t select \u2014 I\u2019ll choose' }]
       .concat(WAE_ISSUE_TYPE_OPTIONS.map((t) => ({ value: t, label: t })));
     if (contact.issueType && !WAE_ISSUE_TYPE_OPTIONS.includes(contact.issueType)) {
@@ -8538,7 +8916,7 @@
         afterSubmitToggle.row,
       ],
     });
-    // v2.1.8: how dates are displayed. Saved on change; the open table (if
+    // How dates are displayed. Saved on change; the open table (if
     // any) is redrawn so the new format shows straight away.
     const onDateFormatChange = (v) => {
       wfmmWindow.WFMM.settings.set(PLUGIN_ID, 'dateFormat', String(v == null ? '' : v));
@@ -8738,7 +9116,7 @@
     modal.body.append(panelHeaderRow, buttonRowEl, csvHint, csvFileInput, progressEl, searchWrap, autoCloseToggle.row, tableContainer, logEl);
 
     waeUI = { countEl, tableContainer, logEl, scanBtn, exportBtn, clearBtn, searchInput };
-    waeStartPanelFit(modal, tableContainer); // v1.68.0
+    waeStartPanelFit(modal, tableContainer);
 
     let waeSearchDebounceTimer = null;
     searchInput.addEventListener('input', () => {
@@ -8845,7 +9223,7 @@
       // apply to rows it doesn't actually cover.
       const allBefore = await getAllExtractedRecords();
       const hasCsvRows = allBefore.some((r) => r.source === 'csv');
-      // v1.84.0: Wayspots reported from the draft, still waiting for their ticket, have no email behind them either
+      // Wayspots reported from the draft, still waiting for their ticket, have no email behind them either
       const hasReportedRows = allBefore.some((r) => r.source === 'reported');
       const csvWarning = (hasCsvRows || hasReportedRows)
         ? ` This will ALSO permanently delete any ${[hasCsvRows && 'CSV-imported', hasReportedRows && 'reported-from-draft'].filter(Boolean).join(' and ')} location(s) -- unlike scanned data, those cannot be recovered by re-scanning.`
@@ -8998,7 +9376,7 @@
     // same cached promise itself before its own first draw.
     waeEnsureRecordsLoaded();
     // One-time migration from the old raw-localStorage keys (removed
-    // from this file as of v1.37.0, see WAE_SETTINGS_DEFAULTS' own
+    // from this file, see WAE_SETTINGS_DEFAULTS' own
     // comment) into WFMM.settings -- only runs if this plugin id has
     // genuinely never been registered with WFMM.settings before (get()
     // with no fallback comes back undefined only in that case;
@@ -9051,8 +9429,8 @@
       // Only the six fields normalizeResolvedStyle() (marker-appearance.js)
       // actually reads from style.generic -- clickable isn't a WFMM
       // marker-appearance concept, so it's left out here even though
-      // waeLoadAppearance() itself carries it (see the v1.23.1 changelog
-      // note up top).
+      // waeLoadAppearance() itself carries it (see the marker appearance
+      // comment up top).
       resolve: () => {
         const { markerSize, fillColor, fillOpacity, borderColor, borderWidth, borderOpacity } = waeLoadAppearance();
         return { markerType: 'generic', generic: { markerSize, fillColor, fillOpacity, borderColor, borderWidth, borderOpacity } };
