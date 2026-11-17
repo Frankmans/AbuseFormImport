@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      2.1.6
+// @version      2.1.10
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV. Can also auto-fill the Help Center abuse form from the Marked Wayspots list, and send a review's photo to Sightengine's AI-image check.
 // @author       Frankmans
 // @grant        none
@@ -1726,6 +1726,10 @@
     // v1.81.0: close the Help Center tab after the form is submitted and
     // offer to clear the draft list. Off unless switched on.
     afterSubmitCleanup: false,
+    // v2.1.8: how dates are shown (Last Response column, ticket dates in
+    // the info windows / side panel, "reported ..." text) -- one of the
+    // WAE_DATE_FORMATS values. See waeDateLocale().
+    dateFormat: 'nl-NL',
   });
   // Set once at startPlugin() (WFMM.markerAppearance.registerStyle()'s
   // return value) and called at stopPlugin() -- registerStyle() throws
@@ -4041,10 +4045,24 @@
     fillBtn.addEventListener('click', (ev) => {
       ev.preventDefault();
       ev.stopPropagation();
-      const result = waeOpenAbuseFormAutofill(() => ({
-        items: [{ name, lat, lng, note: noteInput.value.trim() }],
-        includeNotes: true,
-      }));
+      // v2.1.9: a note typed beside the button REPLACES the settings'
+      // default report details text (instead of the default being used
+      // and the note only appearing in the location field); the location
+      // field then only has the name and coordinates. Without a
+      // note the default text is used as before; with \"list in the
+      // report details\" on, the details already hold the list with its
+      // notes, so that option keeps priority.
+      const result = waeOpenAbuseFormAutofill(() => {
+        const note = noteInput.value.trim();
+        const source = {
+          items: [{ name, lat, lng, note }],
+          includeNotes: true,
+        };
+        if (note && !waeGetReporterContact().listInDetails) {
+          source.overrides = { reportDetails: note, locationNotes: false };
+        }
+        return source;
+      });
       const opened = result === 'opened';
       fillBtn.innerHTML = opened ? WAE_CHECK_ICON_SVG : WAE_X_ICON_SVG;
       fillBtn.title = opened ? 'Opened' : 'Popup blocked';
@@ -5930,6 +5948,26 @@
     });
   }
 
+  // v2.1.8: date display format, a Settings choice (Marker Style modal >
+  // Display). Each value is a BCP-47 locale handed to toLocaleDateString()
+  // / toLocaleString(); '' means the browser's own default (what the
+  // script did before v2.1.7).
+  const WAE_DATE_FORMATS = [
+    { value: 'nl-NL', label: 'DD-MM-YYYY (e.g. 17-11-2026)' },
+    { value: 'en-GB', label: 'DD/MM/YYYY (e.g. 17/11/2026)' },
+    { value: 'sv-SE', label: 'YYYY-MM-DD (e.g. 2026-11-17)' },
+    { value: 'en-US', label: 'MM/DD/YYYY (e.g. 11/17/2026)' },
+    { value: '', label: 'Browser default' },
+  ];
+  function waeDateLocale() {
+    let v = 'nl-NL';
+    try { v = wfmmWindow.WFMM.settings.get(PLUGIN_ID, 'dateFormat', 'nl-NL'); } catch (e) { /* settings not ready: use the default */ }
+    return WAE_DATE_FORMATS.some((o) => o.value === v) ? (v || undefined) : 'nl-NL';
+  }
+  function waeFormatDate(ms) {
+    return new Date(ms).toLocaleDateString(waeDateLocale());
+  }
+
   // "Last Response" column -- the ticket's lastResponseAt (see
   // scanImportedEmails()'s own comment on where that comes from), shown
   // as a locale-formatted date/time. toLocaleDateString() alone for the
@@ -5941,7 +5979,8 @@
   function waeFormatLastResponse(ms) {
     if (!Number.isFinite(ms)) return null;
     const d = new Date(ms);
-    return { short: d.toLocaleDateString(), full: d.toLocaleString() };
+    const loc = waeDateLocale();
+    return { short: d.toLocaleDateString(loc), full: d.toLocaleString(loc) };
   }
 
   // Identity key for carrying a starred flag across a re-scan -- NOT the
@@ -7680,7 +7719,7 @@
       if (seen.has(ref)) continue;
       seen.add(ref);
       if (r.conversationId) parts.push({ text: `#${r.conversationId} (${waeStatusLabel(r.ticketStatus)})`, last: r.lastResponseAt });
-      else if (r.source === 'reported') parts.push({ text: `reported ${new Date(r.reportedAt || r.lastResponseAt || 0).toLocaleDateString()}`, last: r.lastResponseAt });
+      else if (r.source === 'reported') parts.push({ text: `reported ${waeFormatDate(r.reportedAt || r.lastResponseAt || 0)}`, last: r.lastResponseAt });
       else parts.push({ text: 'in your abuse reports list', last: r.lastResponseAt });
     }
     return parts;
@@ -8499,7 +8538,42 @@
         afterSubmitToggle.row,
       ],
     });
-    body.append(styleSection, autofillSection);
+    // v2.1.8: how dates are displayed. Saved on change; the open table (if
+    // any) is redrawn so the new format shows straight away.
+    const onDateFormatChange = (v) => {
+      wfmmWindow.WFMM.settings.set(PLUGIN_ID, 'dateFormat', String(v == null ? '' : v));
+      try { waeRenderFilteredTable(); } catch (e) { /* panel closed or mid-render: next open uses the new format */ }
+    };
+    const currentDateFormat = (() => {
+      const v = wfmmWindow.WFMM.settings.get(PLUGIN_ID, 'dateFormat', 'nl-NL');
+      return WAE_DATE_FORMATS.some((o) => o.value === v) ? v : 'nl-NL';
+    })();
+    let dateFormatInput;
+    if (typeof ui.selectInput === 'function') {
+      dateFormatInput = ui.selectInput({
+        options: WAE_DATE_FORMATS.map((o) => ({ value: o.value, label: o.label })),
+        value: currentDateFormat,
+        onChange: onDateFormatChange,
+      });
+    } else {
+      dateFormatInput = document.createElement('select');
+      for (const o of WAE_DATE_FORMATS) {
+        const opt = document.createElement('option');
+        opt.value = o.value;
+        opt.textContent = o.label;
+        dateFormatInput.append(opt);
+      }
+      dateFormatInput.value = currentDateFormat;
+      dateFormatInput.addEventListener('change', () => onDateFormatChange(dateFormatInput.value));
+    }
+    const displaySection = ui.section({
+      title: 'Display',
+      hint: 'How dates are shown in the Last Response column, the info windows, the side panel and the \u201creported\u201d text. Saved with this plugin\u2019s settings, so it is included in WFMM\u2019s settings backups. CSV exports keep their fixed ISO format.',
+      children: [
+        ui.fieldRow({ label: 'Date format', input: dateFormatInput }),
+      ],
+    });
+    body.append(styleSection, displaySection, autofillSection);
     return {
       onOk() { return true; }, // no-op -- every control above already saved on its own onInput/onChange
     };
