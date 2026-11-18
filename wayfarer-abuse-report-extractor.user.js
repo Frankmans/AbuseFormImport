@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      2.2.0
+// @version      2.2.5
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV. Can also auto-fill the Help Center abuse form from the Marked Wayspots list, and send a review's photo to Sightengine's AI-image check.
 // @author       Frankmans
 // @grant        none
@@ -2181,7 +2181,7 @@
         this.latLng = new google.maps.LatLng(cluster.lat, cluster.lng);
         const isClusterMarker = cluster.records.length > 1;
         const imported = waeIsImportedCluster(cluster);
-        const shapeSvg = isClusterMarker ? waeGetClusterSvgMarkup(isExpanded, imported) : waeGetMarkerSvgMarkup(imported, true); // true: review maps draw 3px larger (v1.67.0)
+        const shapeSvg = isClusterMarker ? waeGetClusterSvgMarkup(isExpanded, imported) : waeGetMarkerSvgMarkup(imported, true); // true: review maps draw 3px larger
         this._html = isClusterMarker ? `${shapeSvg}<span class="wae-pulse-count">${cluster.records.length}</span>` : shapeSvg;
         this._title = isClusterMarker ? `${cluster.records.length} reports` : (cluster.records[0].wayspotName || '(unnamed report)');
         // BUGFIX (not upstream, feature request): always false here,
@@ -2209,7 +2209,7 @@
         this.cluster = null;
         this._isDraft = true; // stacked just above the report crosses, see .wae-pulse-draft
         this.latLng = new google.maps.LatLng(item.lat, item.lng);
-        this._html = waeGetMarkedWayspotSvgMarkup(color, true); // true: review maps draw 3px larger (v1.67.0)
+        this._html = waeGetMarkedWayspotSvgMarkup(color, true); // true: review maps draw 3px larger
         this._title = item.name || '(unnamed)';
         this._clickable = false;
         this.applyToDiv();
@@ -2527,7 +2527,7 @@
   // Rebuilds the marker set from whatever's currently in waeAllRecords --
   // NOT from IndexedDB (reading from this already-fetched
   // cache avoids a slowdown). Clusters nearby records together at
-  // the current zoom (see v1.19.0 changelog note) rather than rendering
+  // the current zoom rather than rendering
   // one marker per record unconditionally -- that was the remaining
   // performance ceiling once a real dataset grew into the hundreds, since
   // each individually-rendered Marker has real linear overhead
@@ -2888,7 +2888,7 @@
   // BUGFIX (not upstream): "Show on Map" left toggled on from a previous
   // session didn't reliably re-show its markers on a fresh page load --
   // needed a manual toggle off/on to actually appear. Root cause: this
-  // plugin now runs at document-start , so waeResyncMapIfVisible()'s very first
+  // plugin now runs at document-start, so waeResyncMapIfVisible()'s very first
   // WFMM.map.refresh() call can genuinely race ahead of Angular/Google
   // Maps finishing initialization -- confirmed against the real source
   // (src/core/map/service.js): refresh() already retries internally (80
@@ -4032,6 +4032,8 @@
 
     // Centers the review map on the Wayspot AND opens its info
     // window; the list stays open (and marks the one that is showing).
+    let activePortal = null;
+    let lastSig = '';
     const goTo = (portal) => {
       const map = WAE_REVIEW_PULSES.map;
       if (map) {
@@ -4040,14 +4042,20 @@
         if (typeof z === 'number' && z < 18) map.setZoom(18);
       }
       waeOpenNearbyPortalWindow(portal);
+      activePortal = portal;
       for (const el of list.querySelectorAll('.wae-nearby-list-item')) {
         el.classList.toggle('wae-active', el.__waePortal === portal);
       }
     };
+    // Empty field: the whole list (alphabetical) once the field is clicked / focused,
+    // until a click outside the search or Escape.
+    let open = false;
     const matches = () => {
       const q = waeNearbyNormalize(input.value);
-      if (!q) return [];
-      return waeReviewNearbyPortals.filter((pt) => pt.name && waeNearbyNormalize(pt.name).includes(q));
+      if (!q && !open) return [];
+      return waeReviewNearbyPortals
+        .filter((pt) => pt.name && (!q || waeNearbyNormalize(pt.name).includes(q)))
+        .sort((a, b) => a.name.localeCompare(b.name));
     };
     const note = (text) => {
       const el = document.createElement('div');
@@ -4055,29 +4063,70 @@
       el.textContent = text;
       list.append(el);
     };
+    // Each title carries the same crosses as the map and the picture
+    // carousel (an exact match with an abuse report / the draft list). Also
+    // re-run from waeCarouselMarkersSync(), so the crosses follow changes
+    // to the lists; nothing is rebuilt while the result is the same.
     const render = () => {
+      const q = waeNearbyNormalize(input.value);
+      const showAll = !q && open;
+      const found = (q || showAll) && waeReviewNearbyPortals.length ? matches() : [];
+      const marksOf = new Map();
+      if (found.length && waeReviewPulsesEnabled()) {
+        const appearance = waeLoadAppearance();
+        const drafts = waeLoadMarkedWayspots();
+        for (const portal of found) marksOf.set(portal, waeCarouselMarksFor(portal, appearance, drafts));
+      }
+      const sig = `${q}|${showAll}|${waeReviewNearbyPortals.length}|${found.map((pt) => `${pt.name}@${pt.lat},${pt.lng}:${(marksOf.get(pt) || []).map((m) => m.color + m.title).join('+')}`).join(';')}`;
+      if (sig === lastSig) return;
+      lastSig = sig;
       list.textContent = '';
-      if (!waeNearbyNormalize(input.value)) { list.hidden = true; return; }
+      if (!q && !showAll) { list.hidden = true; return; }
       list.hidden = false;
       if (!waeReviewNearbyPortals.length) { note('No nearby Wayspots in this review'); return; }
-      const found = matches();
       if (!found.length) { note('No nearby Wayspot with that title'); return; }
+      // the crosses come before the title; every row reserves the width of the
+      // widest set, so the titles stay aligned
+      const widest = Math.max(0, ...found.map((pt) => (marksOf.get(pt) || []).length));
       for (const portal of found) {
         const item = document.createElement('button');
         item.type = 'button';
         item.className = 'wae-nearby-list-item';
-        item.textContent = portal.name;
-        item.title = `Go to ${portal.name} on the map (${portal.lat.toFixed(6)}, ${portal.lng.toFixed(6)})`;
+        item.classList.toggle('wae-active', portal === activePortal);
+        const marks = marksOf.get(portal) || [];
+        if (widest) {
+          const box = document.createElement('span');
+          box.className = 'wae-nearby-list-marks';
+          box.style.width = `${widest * 18 + (widest - 1) * 2}px`;
+          box.innerHTML = marks.map((m) => waeCarouselCrossSvg(m.color, 18)).join('');
+          item.append(box);
+        }
+        const title = document.createElement('span');
+        title.className = 'wae-nearby-list-title';
+        title.textContent = portal.name;
+        item.append(title);
+        item.title = `Go to ${portal.name} on the map (${portal.lat.toFixed(6)}, ${portal.lng.toFixed(6)})${marks.length ? `\n${marks.map((m) => m.title).join('\n')}` : ''}`;
         item.__waePortal = portal;
         item.addEventListener('click', (ev) => { ev.preventDefault(); ev.stopPropagation(); goTo(portal); });
         list.append(item);
       }
     };
-    input.addEventListener('input', render);
+    wrap.__waeRefresh = render;
+    wrap.__waeClearActive = () => { activePortal = null; };
+    input.addEventListener('input', () => render());
+    const openAll = () => { if (!open) { open = true; render(); } };
+    input.addEventListener('focus', openAll);
+    input.addEventListener('click', openAll);
+    const onOutside = (ev) => {
+      if (!wrap.isConnected) { document.removeEventListener('mousedown', onOutside, true); return; }
+      if (open && !wrap.contains(ev.target)) { open = false; render(); }
+    };
+    document.addEventListener('mousedown', onOutside, true);
     input.addEventListener('keydown', (ev) => {
-      if (ev.key === 'Escape') { input.value = ''; render(); waeCloseNearbySearchIw(); return; }
+      if (ev.key === 'Escape') { input.value = ''; activePortal = null; open = false; render(); waeCloseNearbySearchIw(); return; }
       if (ev.key !== 'Enter') return;
       ev.preventDefault();
+      if (!waeNearbyNormalize(input.value)) return; // Enter on the full list picks nothing
       const found = matches();
       if (found.length) goTo(found[0]);
     });
@@ -4542,7 +4591,7 @@
         name,
         titleKey: waeReviewIwNormalizeText(name).toLowerCase(),
         imageUrl: waeReviewIwNormalizeImageUrl(p?.imageUrl),
-        rawImageUrl: typeof p?.imageUrl === 'string' ? p.imageUrl : '', // v2.0.13: for the window's Sightengine button
+        rawImageUrl: typeof p?.imageUrl === 'string' ? p.imageUrl : '', // For the window's Sightengine button
         lat: Number(p?.lat),
         lng: Number(p?.lng),
       };
@@ -4687,8 +4736,8 @@
     }
     return out;
   }
-  function waeCarouselCrossSvg(color) {
-    return `<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" width=\"${WAE_CAROUSEL_BADGE_SIZE}\" height=\"${WAE_CAROUSEL_BADGE_SIZE}\" style=\"display:block\">`
+  function waeCarouselCrossSvg(color, size = WAE_CAROUSEL_BADGE_SIZE) {
+    return `<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" width=\"${size}\" height=\"${size}\" style=\"display:block\">`
       + '<line x1=\"4.5\" y1=\"4.5\" x2=\"19.5\" y2=\"19.5\" stroke=\"#fff\" stroke-width=\"9\" stroke-linecap=\"round\"/>'
       + '<line x1=\"19.5\" y1=\"4.5\" x2=\"4.5\" y2=\"19.5\" stroke=\"#fff\" stroke-width=\"9\" stroke-linecap=\"round\"/>'
       + `<line x1=\"4.5\" y1=\"4.5\" x2=\"19.5\" y2=\"19.5\" stroke=\"${color}\" stroke-width=\"5.5\" stroke-linecap=\"round\"/>`
@@ -4714,14 +4763,24 @@
     return marks;
   }
   function waeCarouselMarkersSync() {
+    document.querySelector('.wae-review-nearby-search')?.__waeRefresh?.(); // the crosses in the search list
     const stale = (badge) => !badge.__waeImg || !badge.__waeImg.isConnected || badge.__waeImg.parentElement !== badge.parentElement;
     const wanted = new Map(); // img -> { marks, key }
-    if (waeReviewPulsesEnabled() && waeReviewNearbyPortals.length) {
+    const candidate = waeLatestReviewCandidate;
+    if (waeReviewPulsesEnabled() && (waeReviewNearbyPortals.length || candidate)) {
       const byBase = new Map();
       for (const portal of waeReviewNearbyPortals) {
         const base = waeCarouselBaseUrl(portal.rawImageUrl);
         if (!base) continue;
         byBase.set(base, byBase.has(base) ? null : portal); // two Wayspots, one picture address: ambiguous, skipped
+      }
+      // The Wayspot under review: its own photo(s) get the cross too
+      if (candidate && Number.isFinite(candidate.lat) && Number.isFinite(candidate.lng) && candidate.photos) {
+        const own = { lat: candidate.lat, lng: candidate.lng };
+        const urls = [candidate.photos.main, ...(candidate.photos.supporting || []), ...(candidate.photos.photos || [])];
+        for (const base of new Set(urls.map(waeCarouselBaseUrl).filter(Boolean))) {
+          byBase.set(base, byBase.has(base) ? null : own);
+        }
       }
       const appearance = waeLoadAppearance();
       const drafts = waeLoadMarkedWayspots();
@@ -4785,6 +4844,7 @@
     if (waeNearbySearchIwOpen && Date.now() - waeNearbySearchIwOpenedAt > 400 && document.querySelector(IW_SEL)) {
       waeCloseNearbySearchIw();
       document.querySelectorAll('.wae-nearby-list-item.wae-active').forEach((el) => el.classList.remove('wae-active'));
+      document.querySelector('.wae-review-nearby-search')?.__waeClearActive?.();
     }
     for (const content of document.querySelectorAll(IW_SEL)) {
       if (content.querySelector(IW_SEL)) continue; // nested matches: the innermost one (where the title/photo live) gets the controls
@@ -4986,6 +5046,8 @@
     noteInput.type = 'text';
     noteInput.className = 'wae-detail-mark-note';
     noteInput.placeholder = 'Note (optional)';
+    noteInput.setAttribute('list', WAE_QUICK_NOTES_DATALIST_ID); // the 5 most used notes
+    waeSyncQuickNoteDatalist();
     // Feature request: raised from 300 -- the list's own edit textarea
     // (wae-mark-row-note-input, see waeBuildMarkedWayspotRow()) has never
     // had a cap of its own, so this field's cap was the only place a note
@@ -6004,10 +6066,11 @@
       border:1px solid rgba(128,128,128,0.5); border-radius:6px; padding:2px; }
     .wae-nearby-list[hidden]{ display:none; }
     .wae-nearby-list-item{
-      display:block; width:100%; text-align:left; padding:4px 8px; margin:0; border:0; border-radius:4px;
+      display:flex; align-items:center; gap:8px; width:100%; text-align:left; padding:4px 8px; margin:0; border:0; border-radius:4px;
       background:transparent; color:inherit; font:12px Roboto, Arial, sans-serif; cursor:pointer;
-      white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
     }
+    .wae-nearby-list-title{ flex:1 1 auto; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .wae-nearby-list-marks{ flex:none; display:flex; gap:2px; line-height:0; min-height:18px; }
     .wae-nearby-list-item:hover, .wae-nearby-list-item:focus{ background:rgba(128,128,128,0.22); outline:none; }
     .wae-carousel-badges{ position:absolute; z-index:3; display:flex; gap:2px; line-height:0; }
     .wae-carousel-badges > span{ display:block; line-height:0; filter:drop-shadow(0 1px 3px rgba(0,0,0,.75)); }
@@ -7346,6 +7409,80 @@
     } catch (e) { /* ignore -- next mutation attempt will just try again */ }
   }
 
+  // ---------------------------------------------------------------------
+  // Quick notes: the 5 notes used most often on Wayspots. Every note that
+  // is saved with a Wayspot (waeAddMarkedWayspot()) is counted, and the top
+  // 5 are offered as suggestions in every note field (review row, review
+  // map windows, side panel) through one shared <datalist> -- click or focus
+  // the empty field and pick one. The counts outlive the draft list (which
+  // is emptied after submitting); first use seeds them from the notes
+  // already on the draft list. Sightengine's auto-generated notes (their
+  // percentage differs every time) are not counted.
+  // ---------------------------------------------------------------------
+  const WAE_QUICK_NOTES_KEY = 'quickNotes';
+  const WAE_QUICK_NOTES_LIMIT = 5;
+  const WAE_QUICK_NOTES_KEEP = 40;
+  const WAE_QUICK_NOTES_DATALIST_ID = 'wae-quick-notes';
+
+  function waeLoadQuickNotes() {
+    try {
+      const stored = wfmmWindow.WFMM.settings.get(PLUGIN_ID, WAE_QUICK_NOTES_KEY, null);
+      if (Array.isArray(stored)) return stored.filter((n) => n && typeof n.text === 'string' && n.text);
+      const seeded = new Map();
+      for (const item of waeLoadMarkedWayspots()) {
+        const text = String(item.note || '').trim();
+        if (!text || /Sightengine estimates/i.test(text)) continue;
+        const entry = seeded.get(text) || { text, count: 0, last: 0 };
+        entry.count += 1;
+        entry.last = Math.max(entry.last, Number(item.markedAt) || 0);
+        seeded.set(text, entry);
+      }
+      return Array.from(seeded.values());
+    } catch (e) {
+      return [];
+    }
+  }
+  function waeTopQuickNotes() {
+    return waeLoadQuickNotes()
+      .sort((a, b) => (b.count - a.count) || (b.last - a.last))
+      .slice(0, WAE_QUICK_NOTES_LIMIT)
+      .map((n) => n.text);
+  }
+  function waeRecordQuickNote(note) {
+    const text = String(note || '').trim();
+    if (!text || /Sightengine estimates/i.test(text)) return;
+    try {
+      const list = waeLoadQuickNotes();
+      const entry = list.find((n) => n.text === text);
+      if (entry) {
+        entry.count += 1;
+        entry.last = Date.now();
+      } else {
+        list.push({ text, count: 1, last: Date.now() });
+      }
+      list.sort((a, b) => (b.count - a.count) || (b.last - a.last));
+      wfmmWindow.WFMM.settings.set(PLUGIN_ID, WAE_QUICK_NOTES_KEY, list.slice(0, WAE_QUICK_NOTES_KEEP));
+    } catch (e) { /* ignore -- the next note tries again */ }
+    waeSyncQuickNoteDatalist();
+  }
+  // Creates the shared <datalist> when needed and fills it with the top 5
+  function waeSyncQuickNoteDatalist() {
+    let dl = document.getElementById(WAE_QUICK_NOTES_DATALIST_ID);
+    if (!dl) {
+      dl = document.createElement('datalist');
+      dl.id = WAE_QUICK_NOTES_DATALIST_ID;
+      (document.body || document.documentElement).appendChild(dl);
+    }
+    const top = waeTopQuickNotes();
+    if (Array.from(dl.children).map((o) => o.value).join('\n') === top.join('\n')) return;
+    dl.textContent = '';
+    for (const text of top) {
+      const option = document.createElement('option');
+      option.value = text;
+      dl.append(option);
+    }
+  }
+
   function waeAddMarkedWayspot({ name, lat, lng, note }) {
     const list = waeLoadMarkedWayspots();
     // Feature request: adding a Wayspot that's already on this list --
@@ -7384,6 +7521,7 @@
       result = 'added';
     }
     waeSaveMarkedWayspots(list);
+    waeRecordQuickNote(note);
     waeMarkListRenderHook?.();
     waeRenderMarkedWayspotMarkers();
     return result;
