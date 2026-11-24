@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      2.2.10
+// @version      2.2.14
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV. Can also auto-fill the Help Center abuse form from the Marked Wayspots list, and send a review's photo to Sightengine's AI-image check.
 // @author       Frankmans
 // @grant        none
@@ -2359,12 +2359,34 @@
     return { text: ` \u2014 ${escapeHtml(lr.short)}`, title: escapeHtml(lr.full) };
   }
 
-  // The Wayspot name in the main map's popups is a link that opens
-  // Wayfarer's own side panel for that Wayspot, as if its map marker had been
-  // clicked. The marker's own click is fired (tracked google.maps.Marker
-  // objects first, then the marker element at the map's center); each try is
-  // only believed once the side panel really changes (WFMM's
-  // DETAILS_CHANGED event). One delegated click handler serves every popup.
+  // The Wayspot name in the main map's popups is a link that opens Wayfarer's
+  // side panel for that Wayspot (see waeOpenWayspotSidePanel()). One delegated
+  // click handler serves every popup.
+  // Where the side panel exists (not the review page): the attributes that turn
+  // a name element in a table/list into a side panel link, or none.
+  function waeSidePanelLinkProps(lat, lng) {
+    if (WAE_REVIEW_PULSES.map || !Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+    return { className: 'wae-iw-name', dataset: { lat: String(lat), lng: String(lng) }, attrs: { title: 'Open this Wayspot in the side panel' } };
+  }
+  // A ticket number in a map popup: opens the abuse reports table with that
+  // ticket number as the search term (see waeShowTicketInTable()).
+  function waeTicketLinkHtml(ticket) {
+    const text = escapeHtml(String(ticket));
+    return `<span role="link" class="wae-iw-ticket" data-ticket="${text}" title="Show this ticket in the abuse reports table" tabindex="-1" style="color:#1a56db;text-decoration:underline;cursor:pointer;outline:none;box-shadow:none;">${text}</span>`;
+  }
+  function waeShowTicketInTable(ticket) {
+    const text = String(ticket || '').trim();
+    if (!text) return;
+    waeSearchQuery = text;
+    waeCurrentPage = 1;
+    if (waePanelController && waeUI) {
+      waeUI.searchInput.value = text;
+      if (waeUI.searchInput.parentElement) waeUI.searchInput.parentElement.classList.add('wae-has-text');
+      waeRenderFilteredTable();
+    } else {
+      openPanel(); // opens with the search term already filled in
+    }
+  }
   function waeNameLinkHtml(escapedName, lat, lng) {
     if (!Number.isFinite(lat) || !Number.isFinite(lng)) return escapedName;
     return `<span role="link" class="wae-iw-name" data-lat="${lat}" data-lng="${lng}" title="Open this Wayspot in the side panel" tabindex="-1" style="color:#1a56db;text-decoration:underline;cursor:pointer;outline:none;box-shadow:none;">${escapedName}</span>`;
@@ -2386,158 +2408,103 @@
       }
     });
   }
-  // Map Mods' own selection API first (WFMM.pois.list()/select()): finds the
-  // Wayspot by its coordinates (a few meters of slack, since a report's
-  // coordinates are often slightly off) and selects it, which is what clicking
-  // its marker does. The argument shape of select() is not documented, so it
-  // is tried as the Wayspot's id and as the Wayspot object, and each try is
-  // only believed once the selection / the side panel really changed.
-  // Returns true when it worked, else false (and the marker clicking below
-  // takes over); notes what it saw in the console.
-  const waeApiNote = { poiCount: 0, sampleKeys: [], candidates: 0, selectError: '' };
-  async function waeSelectWayspotViaWfmm(lat, lng, name) {
+  const waeToArray = (v) => (v instanceof Map ? Array.from(v.values()) : Array.isArray(v) ? v : (v && typeof v === 'object' ? Object.values(v) : []));
+
+  // Opens the side panel for the Wayspot at these coordinates through Map Mods'
+  // own selection API. The Wayspot is looked up in WFMM.pois.list() (a report's
+  // coordinates are often a few meters off, so 12 m of slack; a matching title
+  // first, then the nearest). Then, until the side panel really changes:
+  //   1. mapEntities.select(key) -- what clicking the Wayspot's marker runs
+  //   2. selection.select({type: 'poi', ...}) + pois.select(guid) + a details refresh
+  //   3. pois.select(guid) + a details refresh
+  // Resolves true when the panel changed, 'none' when no Wayspot was found
+  // near there, false when one was found but nothing worked, null when Map
+  // Mods' API is not available.
+  async function waeSelectWayspotOnce(lat, lng, name) {
     const WFMM = wfmmWindow.WFMM;
-    if (!WFMM || !WFMM.pois || typeof WFMM.pois.list !== 'function' || typeof WFMM.pois.select !== 'function') return false;
-    let list;
-    try { list = WFMM.pois.list(); } catch (e) { return false; }
-    if (list instanceof Map) list = Array.from(list.values());
-    else if (!Array.isArray(list)) list = list && typeof list === 'object' ? Object.values(list) : [];
-    waeApiNote.poiCount = list.length;
-    waeApiNote.sampleKeys = list[0] && typeof list[0] === 'object' ? Object.keys(list[0]).slice(0, 25) : [];
-    const num = (...vals) => { for (const v of vals) { const n = Number(v); if (v !== null && v !== undefined && v !== '' && Number.isFinite(n)) return n; } return NaN; };
-    const idOf = (poi) => poi && (poi.guid ?? poi.id ?? poi.poiId ?? poi.poiGuid ?? poi.key);
-    const wanted = waeNearbyNormalize(name);
-    const cands = [];
-    for (const poi of list) {
-      if (!poi || typeof poi !== 'object') continue;
-      const pLat = num(poi.lat, poi.latitude, poi.location && poi.location.lat, poi.location && poi.location.latitude, poi.position && poi.position.lat);
-      const pLng = num(poi.lng, poi.lon, poi.longitude, poi.location && (poi.location.lng ?? poi.location.lon ?? poi.location.longitude), poi.position && (poi.position.lng ?? poi.position.lon));
-      if (!Number.isFinite(pLat) || !Number.isFinite(pLng)) continue;
-      const d = waeHaversineMeters(lat, lng, pLat, pLng);
-      if (d > 12 || idOf(poi) === undefined) continue;
-      cands.push({ poi, id: idOf(poi), d, named: !!wanted && waeNearbyNormalize(poi.title ?? poi.name) === wanted });
-    }
-    cands.sort((a, b) => (Number(b.named) - Number(a.named)) || (a.d - b.d));
-    waeApiNote.candidates = cands.length;
-    const selectedIs = (id) => {
-      try {
-        let sel = WFMM.pois.selected;
-        if (typeof sel === 'function') sel = sel.call(WFMM.pois);
-        const selId = sel && typeof sel === 'object' ? idOf(sel) : sel;
-        const detailsId = WFMM.wayspotDetails && WFMM.wayspotDetails.getSelectedPoiGuid && WFMM.wayspotDetails.getSelectedPoiGuid();
-        return String(selId) === String(id) || String(detailsId) === String(id);
-      } catch (e) { return false; }
-    };
-    // What is now known of these functions: pois.select(guid) only records the
-    // guid and emits an event; selection.select({type, id, item}) records a
-    // generic selection; mapEntities.select(key) runs what a marker click runs
-    // (its provider's own handler). So: the marker's map entity first, then the
-    // generic selection + the guid selection, then the guid alone. A try is only
-    // believed once the side panel itself changes -- a recorded selection alone
-    // proves nothing.
-    let entities = [];
-    try {
-      if (WFMM.mapEntities && typeof WFMM.mapEntities.list === 'function') {
-        const raw = WFMM.mapEntities.list();
-        entities = raw instanceof Map ? Array.from(raw.values()) : (Array.isArray(raw) ? raw : (raw && typeof raw === 'object' ? Object.values(raw) : []));
+    if (!WFMM || !WFMM.pois || typeof WFMM.pois.list !== 'function' || typeof WFMM.pois.select !== 'function') return null;
+    const num = (...vals) => {
+      for (const v of vals) {
+        const n = Number(v);
+        if (v !== null && v !== undefined && v !== '' && Number.isFinite(n)) return n;
       }
-    } catch (e) { entities = []; }
-    waeApiNote.entityCount = entities.length;
-    waeApiNote.entitySampleKeys = entities[0] && typeof entities[0] === 'object' ? Object.keys(entities[0]).slice(0, 25) : [];
-    const entitiesOf = (poi, id) => entities.filter((en) => {
-      if (!en || typeof en !== 'object' || en.key === undefined) return false;
-      const holder = [en, en.poi, en.item, en.payload, en.data].filter((o) => o && typeof o === 'object');
-      return holder.some((o) => [o.guid, o.id, o.poiGuid, o.entityId].some((v) => v !== undefined && String(v) === String(id)))
-        || String(en.key).includes(String(id));
-    });
-    const attempt = async (label, id, fn) => {
-      const waiting = waeWaitSidePanelDetails(700);
-      let result;
-      try { result = await fn(); } catch (e) { waeApiNote.selectError = `${label}: ${String((e && e.message) || e)}`; }
-      const ok = await waiting;
-      console.info('[Wayfarer Map Mods - Abuse Reports] Wayspot selection tried:', { route: label, id, sidePanelChanged: ok, selectedNow: selectedIs(id), result: typeof result === 'object' ? undefined : result, error: waeApiNote.selectError || undefined });
-      return ok === true;
+      return NaN;
     };
-    for (const { poi, id } of cands.slice(0, 3)) {
-      for (const en of entitiesOf(poi, id).slice(0, 3)) {
-        if (await attempt('mapEntities.select', id, () => WFMM.mapEntities.select(en.key))) return true;
+    const wanted = waeNearbyNormalize(name);
+    const candidates = [];
+    for (const poi of waeToArray(WFMM.pois.list())) {
+      if (!poi || typeof poi !== 'object') continue;
+      const guid = poi.guid ?? poi.id;
+      const poiLat = num(poi.lat, poi.latitude);
+      const poiLng = num(poi.lng, poi.lon, poi.longitude);
+      if (guid === undefined || !Number.isFinite(poiLat) || !Number.isFinite(poiLng)) continue;
+      const distance = waeHaversineMeters(lat, lng, poiLat, poiLng);
+      if (distance > 12) continue;
+      candidates.push({ poi, guid, distance, named: !!wanted && waeNearbyNormalize(poi.title ?? poi.name) === wanted });
+    }
+    candidates.sort((a, b) => (Number(b.named) - Number(a.named)) || (a.distance - b.distance));
+
+    let entities = [];
+    try { entities = waeToArray(WFMM.mapEntities && WFMM.mapEntities.list && WFMM.mapEntities.list()); } catch (e) { /* none */ }
+    const entitiesOf = (guid) => entities.filter((en) => en && typeof en === 'object' && en.key !== undefined
+      && ([en, en.poi, en.item, en.payload, en.data].some((o) => o && typeof o === 'object'
+        && [o.guid, o.id, o.poiGuid, o.entityId].some((v) => v !== undefined && String(v) === String(guid)))
+        || String(en.key).includes(String(guid))));
+    const refreshDetails = async () => {
+      if (WFMM.wayspotDetails && typeof WFMM.wayspotDetails.refresh === 'function') await WFMM.wayspotDetails.refresh();
+    };
+    const attempt = async (run) => {
+      const changed = waeWaitSidePanelDetails(700);
+      try { await run(); } catch (e) { /* this route does not work here */ }
+      return (await changed) === true;
+    };
+
+    for (const { poi, guid } of candidates.slice(0, 3)) {
+      for (const entity of entitiesOf(guid).slice(0, 3)) {
+        if (await attempt(() => WFMM.mapEntities.select(entity.key))) return true;
       }
       if (WFMM.selection && typeof WFMM.selection.select === 'function') {
         const viaSelection = async () => {
-          WFMM.selection.select({ type: 'poi', id: String(id), item: poi, sourcePluginId: PLUGIN_ID });
-          await WFMM.pois.select(id);
-          if (WFMM.wayspotDetails && typeof WFMM.wayspotDetails.refresh === 'function') await WFMM.wayspotDetails.refresh();
+          WFMM.selection.select({ type: 'poi', id: String(guid), item: poi, sourcePluginId: PLUGIN_ID });
+          await WFMM.pois.select(guid);
+          await refreshDetails();
         };
-        if (await attempt('selection.select + pois.select', id, viaSelection)) return true;
+        if (await attempt(viaSelection)) return true;
       }
-      const viaGuid = async () => {
-        await WFMM.pois.select(id);
-        if (WFMM.wayspotDetails && typeof WFMM.wayspotDetails.refresh === 'function') await WFMM.wayspotDetails.refresh();
-      };
-      if (await attempt('pois.select + wayspotDetails.refresh', id, viaGuid)) return true;
+      if (await attempt(async () => { await WFMM.pois.select(guid); await refreshDetails(); })) return true;
     }
-    return false;
+    return candidates.length ? false : 'none';
   }
+
+  // Map Mods only has the Wayspots (and their markers) of the area the map is
+  // showing, and none at all when zoomed far out. So when the Wayspot is not
+  // there (yet), the map goes to it first -- centered, zoomed in to at least
+  // 17, like a row click -- and the lookup is repeated while the data loads.
   async function waeOpenWayspotSidePanel(lat, lng, name) {
-    try { if (await waeSelectWayspotViaWfmm(lat, lng, name)) return true; } catch (e) { waeApiNote.selectError = String((e && e.message) || e); }
+    let result = await waeSelectWayspotOnce(lat, lng, name);
+    if (result === true || result === null) return result;
     const map = WAE_PULSES.map;
-    if (!map || typeof google === 'undefined' || !google.maps?.event) return null;
-    // (1) tracked markers around this spot (a report's coordinates are often a
-    // few meters off the Wayspot itself): the ones whose title is this name
-    // first, then nearest first -- a few tries, in case one is not Wayfarer's own
-    const wanted = waeNearbyNormalize(name);
-    const near = [];
-    let trackedCount = 0;
-    for (const ref of waeTrackedMarkers) {
-      const m = ref.deref();
-      if (!m) continue;
-      trackedCount += 1;
-      try {
-        const pos = m.getPosition && m.getPosition();
-        if (!pos) continue;
-        const d = waeHaversineMeters(lat, lng, pos.lat(), pos.lng());
-        if (d > 12) continue;
-        const title = waeNearbyNormalize(m.getTitle && m.getTitle());
-        near.push({ m, pos, d, named: !!wanted && title === wanted });
-      } catch (e) { /* skip */ }
+    if (!map || typeof google === 'undefined' || !google.maps) return false;
+    map.setCenter(new google.maps.LatLng(lat, lng));
+    const zoom = map.getZoom();
+    if (typeof zoom === 'number' && zoom < 17) map.setZoom(17);
+    let failedTries = 0;
+    for (let poll = 0; poll < 8; poll += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 450));
+      result = await waeSelectWayspotOnce(lat, lng, name);
+      if (result === true || result === null) return result;
+      if (result === false && (failedTries += 1) >= 2) break; // found, but its marker does not react
     }
-    near.sort((a, b) => (Number(b.named) - Number(a.named)) || (a.d - b.d));
-    for (const { m, pos } of near.slice(0, 5)) {
-      const waiting = waeWaitSidePanelDetails(700);
-      try { google.maps.event.trigger(m, 'click', { latLng: pos, domEvent: new MouseEvent('click') }); } catch (e) { /* next */ }
-      const ok = await waiting;
-      if (ok !== false) return ok;
-    }
-    // (2) the marker element at the center of the map, after centering on it
-    try {
-      map.setCenter(new google.maps.LatLng(lat, lng));
-      await new Promise((resolve) => setTimeout(resolve, 350));
-      const div = map.getDiv();
-      const rect = div.getBoundingClientRect();
-      const cx = rect.left + rect.width / 2;
-      for (const dy of [0, -10, -20, 10]) {
-        const hit = document.elementsFromPoint(cx, rect.top + rect.height / 2 + dy)
-          .map((el) => (div.contains(el) ? el.closest('[role="button"], gmp-advanced-marker, area') : null))
-          .find((el) => el && !el.closest('.wae-pulse-marker, .gm-style-iw, .gmnoprint, .gm-bundled-control'));
-        if (!hit) continue;
-        const waiting = waeWaitSidePanelDetails(900);
-        hit.click();
-        if (hit.tagName === 'GMP-ADVANCED-MARKER') hit.dispatchEvent(new Event('gmp-click', { bubbles: true }));
-        const ok = await waiting;
-        if (ok !== false) return ok;
-      }
-    } catch (e) { /* fall through */ }
-    // For troubleshooting: what was available to click
-    try {
-      const rect = map.getDiv().getBoundingClientRect();
-      const stack = document.elementsFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2)
-        .slice(0, 8).map((el) => `${el.tagName.toLowerCase()}${el.className && typeof el.className === 'string' ? `.${el.className.trim().split(/\s+/).join('.')}` : ''}${el.getAttribute('role') ? `[role=${el.getAttribute('role')}]` : ''}`);
-      console.info('[Wayfarer Map Mods - Abuse Reports] Open in side panel found nothing to click:',
-        { lat, lng, name, wfmmPois: waeApiNote, trackedMarkers: trackedCount, markersWithin12m: near.length, elementsAtMapCenter: stack });
-    } catch (e) { /* ignore */ }
     return false;
   }
   document.addEventListener('click', (ev) => {
+    const ticketLink = ev.target && ev.target.closest && ev.target.closest('.wae-iw-ticket');
+    if (ticketLink) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      waeShowTicketInTable(ticketLink.dataset.ticket);
+      return;
+    }
     const link = ev.target && ev.target.closest && ev.target.closest('.wae-iw-name');
     if (!link) return;
     ev.preventDefault();
@@ -2546,6 +2513,8 @@
     const lng = Number(link.dataset.lng);
     if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
     waeOpenWayspotSidePanel(lat, lng, link.textContent).then((ok) => {
+      // From the reports table in the panel: close the panel like a row click does, to show the map
+      if (ok === true && link.closest('.wae-name-cell') && waeAutoCloseOnNavigateEnabled()) closePanel();
       if (ok !== false || !link.isConnected) return;
       let note = link.parentElement && link.parentElement.parentElement && link.parentElement.parentElement.querySelector('.wae-iw-name-note');
       if (!note) {
@@ -2568,7 +2537,7 @@
     if (record.conversationId) {
       const dateSuffix = waeFormatTicketDateSuffix(record.lastResponseAt);
       const titleAttr = dateSuffix ? ` title="${dateSuffix.title}"` : '';
-      parts.push(`<div style="margin-top:4px;color:#4b5563;"${titleAttr}>Ticket ${escapeHtml(record.conversationId)}${dateSuffix ? dateSuffix.text : ''}</div>`);
+      parts.push(`<div style="margin-top:4px;color:#4b5563;"${titleAttr}>Ticket ${waeTicketLinkHtml(record.conversationId)}${dateSuffix ? dateSuffix.text : ''}</div>`);
     }
     parts.push('</div>');
     WAE_PULSES.infoWindow.setContent(parts.join(''));
@@ -2601,7 +2570,7 @@
       const name = escapeHtml(record.wayspotName || '(unnamed report)');
       const dateSuffix = waeFormatTicketDateSuffix(record.lastResponseAt);
       const titleAttr = dateSuffix ? ` title="${dateSuffix.title}"` : '';
-      parts.push(`<li style="margin-bottom:2px;"${titleAttr}>${escapeHtml(String(ticket))} \u2014 ${waeNameLinkHtml(name, record.latitude, record.longitude)}${dateSuffix ? dateSuffix.text : ''}</li>`);
+      parts.push(`<li style="margin-bottom:2px;"${titleAttr}>${waeTicketLinkHtml(ticket)} \u2014 ${waeNameLinkHtml(name, record.latitude, record.longitude)}${dateSuffix ? dateSuffix.text : ''}</li>`);
     }
     parts.push('</ul></div>');
     WAE_PULSES.infoWindow.setContent(parts.join(''));
@@ -6445,6 +6414,8 @@
        overflow:hidden with no sub-layout of its own. */
     .wae-name-cell{ display:flex; align-items:center; gap:4px; min-width:0; }
     .wae-name-text{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; }
+    .wae-name-text.wae-iw-name, .wae-mark-row-name.wae-iw-name{ cursor:pointer; text-decoration:underline dotted; text-underline-offset:2px; }
+    .wae-name-text.wae-iw-name:hover, .wae-mark-row-name.wae-iw-name:hover{ text-decoration-style:solid; }
     .wae-nearby-trigger{ flex-shrink:0; cursor:help; }
     .wae-status-badge{
       display:inline-block; border:1px solid; border-radius:9999px;
@@ -7077,9 +7048,11 @@
             className: 'wae-name-cell',
             attrs: { title: titleParts.join('\n\n') },
           });
+          const link = waeSidePanelLinkProps(r.latitude, r.longitude);
           cell.appendChild(waeUiApi.createElement('span', {
-            className: r.wayspotName ? 'wae-name-text' : 'wae-name-text wae-missing',
+            className: `${r.wayspotName ? 'wae-name-text' : 'wae-name-text wae-missing'}${link ? ` ${link.className}` : ''}`,
             text: name,
+            ...(link ? { dataset: link.dataset } : {}),
           }));
           const nearby = nearbyMap && nearbyMap.get(r.id);
           if (nearby && nearby.length) {
@@ -8447,7 +8420,12 @@
       className: 'wae-mark-row-main',
       attrs: { title: 'Click to show this Wayspot on the map' },
     });
-    const nameEl = ui.createElement('span', { className: 'wae-mark-row-name', text: item.name || '(unnamed)' });
+    const sidePanelLink = waeSidePanelLinkProps(Number(item.lat), Number(item.lng));
+    const nameEl = ui.createElement('span', {
+      className: `wae-mark-row-name${sidePanelLink ? ` ${sidePanelLink.className}` : ''}`,
+      text: item.name || '(unnamed)',
+      ...(sidePanelLink ? { dataset: sidePanelLink.dataset, attrs: sidePanelLink.attrs } : {}),
+    });
     const coordEl = ui.createElement('span', { className: 'wae-mark-row-coord', text: `${Number(item.lat).toFixed(6)}, ${Number(item.lng).toFixed(6)}` });
     const deleteBtn = ui.createElement('button', { className: 'wae-mark-row-delete', text: '\u00d7', attrs: { type: 'button', title: 'Remove from list' } });
     if (selection) {
