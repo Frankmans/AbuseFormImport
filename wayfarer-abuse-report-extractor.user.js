@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      2.2.14
+// @version      2.2.15
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV. Can also auto-fill the Help Center abuse form from the Marked Wayspots list, and send a review's photo to Sightengine's AI-image check.
 // @author       Frankmans
 // @grant        none
@@ -5399,13 +5399,24 @@
         // waeFormatTicketDateSuffix() (this file's own InfoWindow
         // functions use the exact same helper) for the same short-in-the-
         // line/full-on-hover formatting everywhere this shows up.
-        const ticketText = tickets.map((t) => `#${t.ticket}`).join(', ');
         const latest = tickets.reduce((max, t) => (
           Number.isFinite(t.lastResponseAt) && (max === null || t.lastResponseAt > max) ? t.lastResponseAt : max
         ), null);
         const dateSuffix = waeFormatTicketDateSuffix(latest);
-        line.textContent = dateSuffix ? `${ticketText}${dateSuffix.text}` : ticketText;
-        if (dateSuffix) line.title = dateSuffix.title;
+        // Each ticket number is a link: shows that ticket in the abuse reports
+        // table (the same click handler as the map popups' ticket numbers).
+        tickets.forEach((t, i) => {
+          if (i) line.append(', ');
+          const ticketLink = document.createElement('span');
+          ticketLink.className = 'wae-iw-ticket';
+          ticketLink.dataset.ticket = String(t.ticket);
+          ticketLink.textContent = `#${t.ticket}`;
+          line.append(ticketLink);
+        });
+        if (dateSuffix) {
+          line.append(dateSuffix.text);
+          line.title = dateSuffix.title;
+        }
         statusRow.parentNode.insertBefore(line, statusRow);
       }
 
@@ -6414,6 +6425,8 @@
        overflow:hidden with no sub-layout of its own. */
     .wae-name-cell{ display:flex; align-items:center; gap:4px; min-width:0; }
     .wae-name-text{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; }
+    .wae-detail-ticket-line .wae-iw-ticket{ cursor:pointer; text-decoration:underline dotted; text-underline-offset:2px; }
+    .wae-detail-ticket-line .wae-iw-ticket:hover{ text-decoration-style:solid; }
     .wae-name-text.wae-iw-name, .wae-mark-row-name.wae-iw-name{ cursor:pointer; text-decoration:underline dotted; text-underline-offset:2px; }
     .wae-name-text.wae-iw-name:hover, .wae-mark-row-name.wae-iw-name:hover{ text-decoration-style:solid; }
     .wae-nearby-trigger{ flex-shrink:0; cursor:help; }
