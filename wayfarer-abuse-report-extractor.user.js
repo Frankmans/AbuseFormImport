@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Abuse Reports
 // @namespace    https://github.com/Frankmans/AbuseFormImport
-// @version      2.2.15
+// @version      2.2.17
 // @description  Scans emails already imported by Wayfarer Abuse Email Importer for Niantic Support "Reporting Abuse" tickets, extracts every reported Wayspot's name + coordinates (a ticket can report several, across the original submission and later replies), stores them locally, plots them on the Wayfarer map and the review page's duplicate-check map, and exports as CSV. Can also auto-fill the Help Center abuse form from the Marked Wayspots list, and send a review's photo to Sightengine's AI-image check.
 // @author       Frankmans
 // @grant        none
@@ -2420,7 +2420,7 @@
   // Resolves true when the panel changed, 'none' when no Wayspot was found
   // near there, false when one was found but nothing worked, null when Map
   // Mods' API is not available.
-  async function waeSelectWayspotOnce(lat, lng, name) {
+  async function waeSelectWayspotOnce(lat, lng, name, deadline) {
     const WFMM = wfmmWindow.WFMM;
     if (!WFMM || !WFMM.pois || typeof WFMM.pois.list !== 'function' || typeof WFMM.pois.select !== 'function') return null;
     const num = (...vals) => {
@@ -2454,7 +2454,9 @@
       if (WFMM.wayspotDetails && typeof WFMM.wayspotDetails.refresh === 'function') await WFMM.wayspotDetails.refresh();
     };
     const attempt = async (run) => {
-      const changed = waeWaitSidePanelDetails(700);
+      const left = deadline - Date.now();
+      if (left <= 0) return false; // out of time
+      const changed = waeWaitSidePanelDetails(Math.min(700, Math.max(300, left)));
       try { await run(); } catch (e) { /* this route does not work here */ }
       return (await changed) === true;
     };
@@ -2480,20 +2482,21 @@
   // showing, and none at all when zoomed far out. So when the Wayspot is not
   // there (yet), the map goes to it first -- centered, zoomed in to at least
   // 17, like a row click -- and the lookup is repeated while the data loads.
+  // The whole search gets WAE_SIDE_PANEL_SEARCH_MS from the click.
+  const WAE_SIDE_PANEL_SEARCH_MS = 1500;
   async function waeOpenWayspotSidePanel(lat, lng, name) {
-    let result = await waeSelectWayspotOnce(lat, lng, name);
+    const deadline = Date.now() + WAE_SIDE_PANEL_SEARCH_MS;
+    let result = await waeSelectWayspotOnce(lat, lng, name, deadline);
     if (result === true || result === null) return result;
     const map = WAE_PULSES.map;
     if (!map || typeof google === 'undefined' || !google.maps) return false;
     map.setCenter(new google.maps.LatLng(lat, lng));
     const zoom = map.getZoom();
     if (typeof zoom === 'number' && zoom < 17) map.setZoom(17);
-    let failedTries = 0;
-    for (let poll = 0; poll < 8; poll += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 450));
-      result = await waeSelectWayspotOnce(lat, lng, name);
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, Math.min(250, Math.max(0, deadline - Date.now()))));
+      result = await waeSelectWayspotOnce(lat, lng, name, deadline);
       if (result === true || result === null) return result;
-      if (result === false && (failedTries += 1) >= 2) break; // found, but its marker does not react
     }
     return false;
   }
@@ -6425,6 +6428,8 @@
        overflow:hidden with no sub-layout of its own. */
     .wae-name-cell{ display:flex; align-items:center; gap:4px; min-width:0; }
     .wae-name-text{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; }
+    .wae-ticket-link{ cursor:pointer; text-decoration:underline dotted; text-underline-offset:2px; }
+    .wae-ticket-link:hover{ text-decoration-style:solid; }
     .wae-detail-ticket-line .wae-iw-ticket{ cursor:pointer; text-decoration:underline dotted; text-underline-offset:2px; }
     .wae-detail-ticket-line .wae-iw-ticket:hover{ text-decoration-style:solid; }
     .wae-name-text.wae-iw-name, .wae-mark-row-name.wae-iw-name{ cursor:pointer; text-decoration:underline dotted; text-underline-offset:2px; }
@@ -7032,6 +7037,16 @@
         render: (r) => {
           if (waeEditingId === r.id) return waeBuildEditInput('conversationId', { placeholder: 'Conversation ID' });
           const v = r.conversationId || r.sourceEmailId;
+          // A real ticket number is a link: shows only that ticket in this table
+          // (searches for it, like the ticket numbers in the map popups)
+          if (r.conversationId) {
+            return waeUiApi.createElement('span', {
+              className: 'wae-iw-ticket wae-ticket-link',
+              text: v,
+              attrs: { title: 'Show only this ticket' },
+              dataset: { ticket: String(r.conversationId) },
+            });
+          }
           return waeUiApi.createElement('span', { text: v, attrs: { title: v } });
         },
       },
